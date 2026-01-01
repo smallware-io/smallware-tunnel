@@ -335,7 +335,8 @@ impl TunnelListener {
         let (recycle_sink_tx, recycle_sink_rx) = flume::bounded::<TunnelSinkEol>(1);
 
         let stream = TunnelStream::new(ws_rx, recycle_stream_tx);
-        // TODO: set_client_ip not yet implemented
+        // TODO: _client_ip is parsed from CONNECT messages for future use (e.g., logging, access control)
+        // but is not yet exposed in the public API
         let sink = TunnelSink::new(ws_tx2, recycle_sink_tx);
         let recycle_tx = self.recycle_tx.clone();
         let shutdown_rx = self.shutdown_rx.clone();

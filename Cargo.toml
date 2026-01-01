@@ -6,6 +6,7 @@ description = "Client library and CLI for establishing tunnels to Smallware tunn
 license = "MIT"
 keywords = ["tunnel", "websocket", "proxy", "smallware"]
 categories = ["network-programming", "development-tools"]
+repository = "https://github.com/smallware-io/smallware-tunnel"
 
 [lib]
 name = "smallware_tunnel"
