@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Configs
+.env
+.env.local
+
+# Debug symbols
+*.pdb
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# SSL certificates (don't commit private keys!)
+certs/*.pem
+certs/*.key
+
+# Logs
+*.log
