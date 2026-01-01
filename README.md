@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smallware-tunnel = { path = "../smallware-tunnel" }
+smallware-tunnel = "0.1"
 ```
 
 ## CLI Usage
@@ -34,9 +34,6 @@ smallware-tunnel --key YOUR_API_KEY www-abc-xyz.t00.smallware.io 8080
 # Using environment variable for key
 export SMALLWARE_KEY=your-api-key
 smallware-tunnel www-abc-xyz.t00.smallware.io 8080
-
-# With options
-smallware-tunnel --key YOUR_KEY --pool-size 5 -v www-abc-xyz.t00.smallware.io 3000
 ```
 
 ### CLI Options
@@ -45,8 +42,8 @@ smallware-tunnel --key YOUR_KEY --pool-size 5 -v www-abc-xyz.t00.smallware.io 30
 |--------|-------|-------------|
 | `--key` | `-k` | API key (also via `SMALLWARE_KEY` env var) |
 | `--key-id` | | Key ID for JWT signing (default: "default") |
-| `--pool-size` | `-n` | Number of waiting connections (default: 3) |
 | `--server` | | Custom tunnel server URL |
+| `--trust-ca` | | Path to PEM file with CA certificate to trust |
 | `--verbose` | `-v` | Enable verbose logging |
 
 ## Library Usage
@@ -54,7 +51,8 @@ smallware-tunnel --key YOUR_KEY --pool-size 5 -v www-abc-xyz.t00.smallware.io 30
 ### Basic Example
 
 ```rust
-use smallware_tunnel::{TunnelListener, TunnelConfig};
+use smallware_tunnel::{TunnelListener, TunnelConfig, TunnelError};
+use futures::{SinkExt, StreamExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,54 +62,68 @@ async fn main() -> anyhow::Result<()> {
         "www-abc-xyz.t00.smallware.io".to_string(),
     );
 
-    // Create a listener with 3 waiting connections
-    let mut listener = TunnelListener::bind(config, 3).await?;
+    // Create a listener
+    let listener = TunnelListener::new(config)?;
 
     // Accept incoming connections
-    while let Some(stream) = listener.accept().await? {
-        tokio::spawn(async move {
-            // Handle the connection
-            // `stream` implements AsyncRead + AsyncWrite
-        });
+    loop {
+        match listener.accept().await {
+            Ok((sink, stream)) => {
+                tokio::spawn(async move {
+                    // `sink` implements futures::Sink<Bytes>
+                    // `stream` implements futures::Stream<Item = Result<Bytes, TunnelError>>
+                });
+            }
+            Err(TunnelError::ListenerClosed) => break,
+            Err(e) => eprintln!("Error: {}", e),
+        }
     }
 
     Ok(())
 }
 ```
 
-### Connection Recycling
+### Forwarding to Local Services
 
-For better efficiency, connections can be recycled after clean completion:
+The most common use case is forwarding tunnel traffic to a local TCP port:
 
 ```rust
-while let Some(stream) = listener.accept().await? {
-    // Process the request...
+use smallware_tunnel::{TunnelListener, TunnelConfig, forward_tunnel_tcp};
+use std::net::SocketAddr;
 
-    // If the stream completed cleanly, recycle it
-    if stream.is_clean_completion() {
-        listener.recycle(stream).await;
-    }
+let listener = TunnelListener::new(config)?;
+let local_addr: SocketAddr = "127.0.0.1:8080".parse()?;
+
+loop {
+    let (sink, stream) = listener.accept().await?;
+    tokio::spawn(async move {
+        if let Err(e) = forward_tunnel_tcp(sink, stream, local_addr).await {
+            eprintln!("Forward error: {}", e);
+        }
+    });
 }
 ```
 
 ### Custom Configuration
 
 ```rust
+use std::path::PathBuf;
+
 let config = TunnelConfig::new(key, domain)
     .with_key_id("my-custom-key-id".to_string())
-    .with_server_url("wss://custom-server.example.com/tunnels".to_string());
+    .with_server_url("wss://custom-server.example.com/tunnels".to_string())
+    .with_trust_ca(PathBuf::from("/path/to/ca.pem"));
 ```
 
 ## Architecture
 
-### Connection Pool
+### Connection Recycling
 
-The `TunnelListener` maintains a pool of WebSocket connections to the tunnel server:
+The `TunnelListener` automatically manages WebSocket connection lifecycle:
 
-1. **Target pool size (N)**: Specified when creating the listener
-2. **Auto-refill**: When a connection is used, new ones are created to maintain N waiting
-3. **Recycling**: Clean connections can be returned for reuse
-4. **Excess cleanup**: Connections above N are allowed to drain naturally
+1. **On-demand connections**: Each `accept()` call establishes a new WebSocket connection or reuses a recycled one
+2. **Automatic recycling**: When both `TunnelSink` and `TunnelStream` complete cleanly (graceful EOF), the underlying WebSocket is automatically returned for reuse
+3. **Rendezvous handoff**: Recycled connections are handed directly to waiting `accept()` calls via a rendezvous channel, minimizing latency
 
 ### Data Flow
 

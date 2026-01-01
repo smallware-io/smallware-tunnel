@@ -12,7 +12,14 @@ use thiserror::Error;
 ///
 /// This enum uses `Arc<str>` for string fields to make cloning cheap,
 /// since errors are frequently cloned in async code paths.
+///
+/// # Stability
+///
+/// This enum is marked `#[non_exhaustive]`, meaning new variants may be added
+/// in future versions without a breaking change. When matching on this enum,
+/// always include a wildcard arm (`_`) to handle unknown variants.
 #[derive(Error, Debug, Clone)]
+#[non_exhaustive]
 pub enum TunnelError {
     /// Read stream was dropped before EOF
     #[error("Read stream was dropped before EOF")]
@@ -113,6 +120,23 @@ pub enum TunnelError {
     /// was not followed correctly.
     #[error("Tunnel protocol violation")]
     ProtocolError,
+}
+
+impl TunnelError {
+    pub fn can_retry_accept(&self) -> bool {
+        matches!(
+            self,
+            TunnelError::ConnectionFailed(_)
+                | TunnelError::WebSocketError(_)
+                | TunnelError::Timeout
+                | TunnelError::ConnectionClosed
+                | TunnelError::ProtocolError
+                | TunnelError::RemoteError(_)
+                | TunnelError::IoError(_)
+                | TunnelError::ServerError { status:_, message:_ }
+                | TunnelError::StreamDropped
+        )
+    }
 }
 
 impl From<jsonwebtoken::errors::Error> for TunnelError {

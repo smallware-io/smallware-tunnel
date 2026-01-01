@@ -35,6 +35,7 @@ use futures::lock::BiLock;
 use futures::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::watch;
 use tokio::time;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -46,7 +47,26 @@ const DEFAULT_SERVER_URL: &str = "wss://api.smallware.io/tunnels";
 ///
 /// This struct holds all the settings needed to establish and maintain
 /// tunnel connections.
+///
+/// # Construction
+///
+/// Use [`TunnelConfig::new()`] to create a configuration, then chain
+/// `with_*` methods to customize it:
+///
+/// ```rust
+/// use smallware_tunnel::TunnelConfig;
+///
+/// let config = TunnelConfig::new("api-key".into(), "domain.t00.smallware.io".into())
+///     .with_key_id("my-key".into());
+/// ```
+///
+/// # Stability
+///
+/// This struct is marked `#[non_exhaustive]`, meaning new fields may be added
+/// in future versions without a breaking change. Always use the constructor
+/// and builder methods rather than struct literal syntax.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TunnelConfig {
     /// The API key (secret) used to sign JWT tokens
     pub key: String,
@@ -155,8 +175,12 @@ struct RecycledConnection {
 /// # }
 /// ```
 pub struct TunnelListener {
-    config: Arc<TunnelConfig>,
-    jwt_manager: Arc<JwtManager>,
+    shared: Arc<ListenerShared>,
+}
+
+struct ListenerShared {
+    config: TunnelConfig,
+    jwt_manager: JwtManager,
     /// Rendezvous channel sink to recycle connections
     recycle_tx: flume::Sender<RecycledConnection>,
     /// Rendezvous channel source to receive recycled connections
@@ -165,6 +189,13 @@ pub struct TunnelListener {
     shutdown_tx: watch::Sender<bool>,
     /// Receiver for shutdown events
     shutdown_rx: watch::Receiver<bool>,
+    last_success: AtomicBool,
+    retry_state: tokio::sync::Mutex<RetryState>,
+}
+
+struct RetryState {
+    last_start_millis: i64,
+    next_start_millis: i64,
 }
 
 impl TunnelListener {
@@ -181,23 +212,25 @@ impl TunnelListener {
     pub fn new(config: TunnelConfig) -> Result<Self, TunnelError> {
         // Validate configuration by extracting the customer ID from the domain
         let customer_id = config.customer_id()?;
-
-        // Create the JWT manager
-        let jwt_manager = Arc::new(JwtManager::new(
+        let jwt_manager = JwtManager::new(
             config.key.clone(),
             customer_id,
             config.key_id.clone(),
-        ));
-
+        );
         let (recycle_tx, recycle_rx) = flume::bounded::<RecycledConnection>(0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shared: ListenerShared = ListenerShared {
+            config, jwt_manager, recycle_tx, recycle_rx, shutdown_tx, shutdown_rx,
+            last_success: AtomicBool::new(false),
+            retry_state: tokio::sync::Mutex::new(RetryState {
+                last_start_millis: 0,
+                next_start_millis: 0,
+            }) };
+
+        // Create the JWT manager
+
         Ok(Self {
-            config: Arc::new(config),
-            jwt_manager,
-            recycle_tx,
-            recycle_rx,
-            shutdown_tx,
-            shutdown_rx,
+            shared: Arc::new(shared),
         })
     }
 
@@ -209,7 +242,7 @@ impl TunnelListener {
     /// - `accept()` will return `TunnelError::ListenerClosed`
     pub async fn shutdown(&self) {
         tracing::info!("Shutting down tunnel listener");
-        let _ = self.shutdown_tx.send(true);
+        let _ = self.shared.shutdown_tx.send(true);
     }
 
     /// Accepts an incoming connection from the tunnel server.
@@ -235,11 +268,83 @@ impl TunnelListener {
     /// - [`TunnelError::ConnectionClosed`] if the server closes the connection
     /// - [`TunnelError::WebSocketError`] for other WebSocket-level errors
     pub async fn accept(&self) -> Result<(TunnelSink, TunnelStream), TunnelError> {
-        let mut shutdown_rx = self.shutdown_rx.clone();
+        let shared = self.shared.clone();
+        loop {
+            let mut retry_state = shared.retry_state.lock().await;
+            let mut now_millis = chrono::Utc::now().timestamp_millis();
+            let delay = (retry_state.next_start_millis - now_millis).max(0);
+
+            if delay > 0 {
+                tokio::time::sleep(time::Duration::from_millis(delay as u64)).await;
+                now_millis = chrono::Utc::now().timestamp_millis();
+            }
+            let fail_delay = (delay + (delay>>1)).max(1000).min(30000);
+            retry_state.last_start_millis = now_millis;
+            retry_state.next_start_millis = now_millis + fail_delay;
+
+            let (ws_tx, ws_rx) = match self.connect_or_recycle().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    // Connection failed, update retry state
+                    shared.last_success.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if !e.can_retry_accept() {
+                        return Err(e);
+                    }
+                    tracing::info!("WebSocket connect failed. Will retry in {} ms: {}.", fail_delay, e);
+                    continue;
+                }
+            };
+            // We have a websocket connection waiting for a CONNECT message
+            // If the last connection attempt failed, then wait for a connection inside the lock.
+            // If we get a connection,then the other attempts can try without delay.
+            if !shared.last_success.load(std::sync::atomic::Ordering::SeqCst) {
+                match self.wait_for_connection(ws_tx, ws_rx).await {
+                    Ok((sink, stream)) => {
+                        // Success, reset retry state
+                        shared.last_success.store(true, std::sync::atomic::Ordering::SeqCst);
+                        retry_state.next_start_millis = now_millis;
+                        return Ok((sink, stream));
+                    }
+                    Err(e) => {
+                        // Failed to get a connection, update retry state
+                        shared.last_success.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if !e.can_retry_accept() {
+                            tracing::info!("tunnel accept failed: {}", &e);
+                            return Err(e);
+                        }
+                        tracing::info!("tunnel accept failed. Will retry: {}", &e);
+                    }
+                }
+                continue;
+            }
+            // other attempts can try without delay
+            retry_state.next_start_millis = now_millis;
+            drop(retry_state);
+            match self.wait_for_connection(ws_tx, ws_rx).await {
+                Ok((sink, stream)) => {
+                    return Ok((sink, stream));
+                }
+                Err(e) => {
+                    // Failed to get a connection
+                    shared.last_success.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if !e.can_retry_accept() {
+                        tracing::info!("tunnel accept failed: {}", &e);
+                        return Err(e);
+                    }
+                    tracing::info!("tunnel accept failed. Will retry: {}", &e);
+                }
+            }
+        }
+    }
+
+
+    async fn connect_or_recycle(&self) -> Result<(WsRawSink, WsBaseStream), TunnelError> {
+        let shared = self.shared.clone();
+        let mut shutdown_rx = shared.shutdown_rx.clone();
         if *shutdown_rx.borrow_and_update() {
             return Err(TunnelError::ListenerClosed);
         }
-        let (ws_tx, ws_rx) = if let Ok(recycled) = self.recycle_rx.try_recv() {
+        let (ws_tx, ws_rx) = if let Ok(recycled) = shared.recycle_rx.try_recv() {
             // Send RESET message to tell the server we're ready for a new proxy client.
             // This must be sent before the server will accept new connections on this WebSocket.
             let reset_msg = Message::Text("RESET".into());
@@ -248,22 +353,20 @@ impl TunnelListener {
             (ws_tx, recycled.ws_rx)
         } else {
             // No recycled connection available, create a new one
-            let token = self.jwt_manager.get_token()?;
+            let token = shared.jwt_manager.get_token()?;
             // Build the WebSocket URL
-            let ws_url = format!("{}/{}", self.config.server_url, self.config.domain);
+            let ws_url = format!("{}/{}", shared.config.server_url, shared.config.domain);
 
             tokio::select! {
                 _ = util_shutdown(&mut shutdown_rx) => {
                     return Err(TunnelError::ListenerClosed);
                 }
-                result = connect_websocket(&ws_url, &token, self.config.trust_ca.as_ref()) => {
+                result = connect_websocket(&ws_url, &token, self.shared.config.trust_ca.as_ref()) => {
                     result?
                 }
             }
         };
-
-        let (ws_tx1, ws_tx2) = BiLock::new(ws_tx);
-        self.wait_for_connection(ws_tx1, ws_tx2, ws_rx).await
+        Ok((ws_tx, ws_rx))
     }
 
     /// Waits for a `CONNECT` message on the WebSocket indicating a client has connected.
@@ -277,12 +380,14 @@ impl TunnelListener {
     /// and spawns a background task to monitor them for recycling.
     async fn wait_for_connection(
         &self,
-        ws_tx1: WsBaseSink,
-        ws_tx2: WsBaseSink,
+        ws_tx: WsRawSink,
         mut ws_rx: WsBaseStream,
     ) -> Result<(TunnelSink, TunnelStream), TunnelError> {
         let mut _client_ip: Option<std::net::IpAddr> = None;
-        let mut shutdown_rx = self.shutdown_rx.clone();
+        let shared= self.shared.clone();
+        let mut shutdown_rx = shared.shutdown_rx.clone();
+        let (ws_tx1, ws_tx2) = BiLock::new(ws_tx);
+
         loop {
             tokio::select! {
                 _ = util_shutdown(&mut shutdown_rx) => {
@@ -338,8 +443,8 @@ impl TunnelListener {
         // TODO: _client_ip is parsed from CONNECT messages for future use (e.g., logging, access control)
         // but is not yet exposed in the public API
         let sink = TunnelSink::new(ws_tx2, recycle_sink_tx);
-        let recycle_tx = self.recycle_tx.clone();
-        let shutdown_rx = self.shutdown_rx.clone();
+        let recycle_tx = shared.recycle_tx.clone();
+        let shutdown_rx = shared.shutdown_rx.clone();
         tokio::spawn(Self::connection_task(
             ws_tx1,
             recycle_sink_rx,

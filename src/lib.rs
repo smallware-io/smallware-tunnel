@@ -16,7 +16,7 @@
 //! ```text
 //! ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
 //! │  Remote Client  │◄───────►│  Tunnel Server  │◄───────►│  Your App       │
-//! │                 │  HTTPS  │  api.smallware  │  WSS    │  (TunnelListener)│
+//! │                 │  HTTPS  │api.smallware.io │  WSS    │ (TunnelListener)│
 //! └─────────────────┘         └─────────────────┘         └─────────────────┘
 //!                                                                  │
 //!                                                                  ▼
