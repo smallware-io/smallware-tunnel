@@ -6,7 +6,7 @@
 //! # Usage
 //!
 //! ```bash
-//! smallware-tunnel --key YOUR_API_KEY www-abc-xyz.t00.smallware.io 8080
+//! smallware-tunnel --key KEYID.SECRET www-abc-xyz.t00.smallware.io 8080
 //! ```
 //!
 //! This will establish a tunnel so that requests to
@@ -14,23 +14,22 @@
 //!
 //! # Options
 //!
-//! - `--key` or `-k`: Your API key (can also be set via `SMALLWARE_KEY` env var)
-//! - `--key-id`: Key ID for JWT signing (defaults to "default")
+//! - `--key` or `-k`: Your API key in `<keyid>.<secret>` format (can also be set via `SMALLWARE_KEY` env var)
 //! - `--server`: Custom tunnel server URL
 //! - `-v` or `--verbose`: Enable verbose logging
 //!
 //! # Example
 //!
 //! ```bash
-//! # Using command line option
-//! smallware-tunnel -k my-secret-key www-abc-xyz.t00.smallware.io 3000
+//! # Using command line option (key format: keyid.secret)
+//! smallware-tunnel -k mykey.secret123 www-abc-xyz.t00.smallware.io 3000
 //!
 //! # Using environment variable
-//! export SMALLWARE_KEY=my-secret-key
+//! export SMALLWARE_KEY=mykey.secret123
 //! smallware-tunnel www-abc-xyz.t00.smallware.io 3000
 //!
 //! # With custom options
-//! smallware-tunnel -k my-key -v www-abc-xyz.t00.smallware.io 8080
+//! smallware-tunnel -k mykey.secret123 -v www-abc-xyz.t00.smallware.io 8080
 //! ```
 
 use anyhow::{Context, Result};
@@ -45,8 +44,9 @@ use tracing::{error, info, warn, Level};
 #[command(name = "smallware-tunnel")]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// The API key for authentication.
+    /// The API key for authentication in `<keyid>.<secret>` format.
     ///
+    /// The key ID may contain `.` characters, but the secret cannot.
     /// Can also be provided via the SMALLWARE_KEY environment variable.
     #[arg(short, long, env = "SMALLWARE_KEY")]
     key: String,
@@ -65,12 +65,6 @@ struct Args {
     /// it must be in the form IP:PORT.
     #[arg(value_name = "PORT")]
     local_port: String,
-
-    /// Key ID for JWT signing.
-    ///
-    /// This identifies which key to use for authentication on the server.
-    #[arg(long, default_value = "default")]
-    key_id: String,
 
     /// Custom tunnel server URL.
     ///
@@ -112,7 +106,8 @@ async fn main() -> Result<()> {
         .init();
 
     // Build the tunnel configuration
-    let mut config = TunnelConfig::new(args.key, args.domain.clone()).with_key_id(args.key_id);
+    let mut config = TunnelConfig::new(&args.key, &args.domain)
+        .context("Invalid API key format. Expected '<keyid>.<secret>'")?;
 
     if let Some(server_url) = args.server {
         config = config.with_server_url(server_url);

@@ -5,7 +5,7 @@ A Rust client library and CLI tool for establishing tunnels to the Smallware tun
 ## Overview
 
 This crate provides the smallware-tunnel library, which is the primary low-level facility that
-almost all clients should use to establish tunnels throug the smallware tunnel server.
+almost all clients should use to establish tunnels through the smallware tunnel server.
 
 The smallware tunnel server provides "causal hosting" facilities that anybody can use to
 share things on the internet, on an as-needed basis, even if they don't have a server presence
@@ -66,21 +66,31 @@ cargo install --path .
 ## CLI Usage
 
 ```bash
-
-# Basic usage
-smallware-tunnel --key YOUR_API_KEY www-whatever-custid.t00.smallware.io 8080
+# Basic usage (key format: <keyid>.<secret>)
+smallware-tunnel --key mykey.secret123 www-whatever-custid.t00.smallware.io 8080
 
 # Using environment variable for key
-export SMALLWARE_KEY=your-api-key
+export SMALLWARE_KEY=mykey.secret123
 smallware-tunnel www-whatever-custid.t00.smallware.io 8080
 ```
+
+### API Key Format
+
+Keys must be in the format `<keyid>.<secret>`:
+- The **key ID** identifies which key to use for authentication on the server
+- The **secret** is used to sign JWT tokens
+- The key ID may contain `.` characters, but the secret cannot
+- The key is split on the **last** `.` to separate the key ID from the secret
+
+Examples:
+- `default.mysecret123` → key ID: `default`, secret: `mysecret123`
+- `org.team.mykey.secretABC` → key ID: `org.team.mykey`, secret: `secretABC`
 
 ### CLI Options
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--key` | `-k` | API key (also via `SMALLWARE_KEY` env var) This is attached to your smallware account. |
-| `--key-id` | | Key ID for JWT signing (default: "default") |
+| `--key` | `-k` | API key in `<keyid>.<secret>` format (also via `SMALLWARE_KEY` env var). This is attached to your smallware account. |
 | `--server` | | Custom tunnel server URL.  By default this is `wss://api.smallware.io/tunnels` you would only change this to connect to a different implementation of the smallware tunneling protocol. |
 | `--trust-ca` | | Path to PEM file with an additional CA certificate to trust.  This can be used with the `--server` option if your server is using a slef-signed cert. |
 | `--verbose` | `-v` | Enable verbose logging |
@@ -96,10 +106,11 @@ use futures::{SinkExt, StreamExt};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Configure the tunnel
+    // Key format: <keyid>.<secret> (keyid may contain dots, secret cannot)
     let config = TunnelConfig::new(
-        "your-api-key".to_string(),
-        "www-abc-xyz.t00.smallware.io".to_string(),
-    );
+        "your-key-id.your-api-secret",
+        "www-abc-xyz.t00.smallware.io",
+    )?;
 
     // Create a listener
     let listener = TunnelListener::new(config)?;
@@ -147,9 +158,10 @@ loop {
 
 ```rust
 use std::path::PathBuf;
+use smallware_tunnel::TunnelConfig;
 
-let config = TunnelConfig::new(key, domain)
-    .with_key_id("my-custom-key-id".to_string())
+// Key format: <keyid>.<secret>
+let config = TunnelConfig::new("my-key-id.secret123", domain)?
     .with_server_url("wss://custom-server.example.com/tunnels".to_string())
     .with_trust_ca(PathBuf::from("/path/to/ca.pem"));
 ```

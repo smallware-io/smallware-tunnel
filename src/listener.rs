@@ -56,8 +56,10 @@ const DEFAULT_SERVER_URL: &str = "wss://api.smallware.io/tunnels";
 /// ```rust
 /// use smallware_tunnel::TunnelConfig;
 ///
-/// let config = TunnelConfig::new("api-key".into(), "domain.t00.smallware.io".into())
-///     .with_key_id("my-key".into());
+/// // Key format: <keyid>.<secret>
+/// // The keyid may contain '.' characters, but the secret cannot.
+/// let config = TunnelConfig::new("my-key-id.secret123", "domain.t00.smallware.io")?;
+/// # Ok::<(), smallware_tunnel::TunnelError>(())
 /// ```
 ///
 /// # Stability
@@ -69,9 +71,9 @@ const DEFAULT_SERVER_URL: &str = "wss://api.smallware.io/tunnels";
 #[non_exhaustive]
 pub struct TunnelConfig {
     /// The API key (secret) used to sign JWT tokens
-    pub key: String,
+    pub key_secret: String,
 
-    /// The key ID for JWT signing (defaults to "default")
+    /// The key ID for JWT signing
     pub key_id: String,
 
     /// The full tunnel domain name
@@ -89,33 +91,59 @@ pub struct TunnelConfig {
     pub trust_ca: Option<PathBuf>,
 }
 
+/// Parses a combined API key in the format `<keyid>.<secret>`.
+///
+/// The key ID may contain `.` characters, but the secret cannot.
+/// This function splits on the **last** `.` to separate the two parts.
+///
+/// # Returns
+///
+/// A tuple of `(key_id, secret)` if the key is valid.
+///
+/// # Errors
+///
+/// Returns `TunnelError::InvalidKeyFormat` if the key doesn't contain a `.`.
+pub fn parse_key(combined_key: &str) -> Result<(&str, &str), TunnelError> {
+    combined_key
+        .rfind('.')
+        .map(|pos| (&combined_key[..pos], &combined_key[pos + 1..]))
+        .ok_or(TunnelError::InvalidKeyFormat)
+}
+
 impl TunnelConfig {
     /// Creates a new tunnel configuration with default settings.
     ///
     /// # Arguments
     ///
-    /// * `key` - The API key (secret) for authentication
+    /// * `key` - The API key in the format `<keyid>.<secret>`.
+    ///           The key ID may contain `.` characters, but the secret cannot.
     /// * `domain` - The full tunnel domain name
     ///
-    /// The key ID defaults to "default" and the server URL defaults to
-    /// the production Smallware server.
-    pub fn new(key: String, domain: String) -> Self {
-        Self {
-            key,
-            key_id: "default".to_string(),
-            domain,
+    /// # Errors
+    ///
+    /// Returns `TunnelError::InvalidKeyFormat` if the key doesn't contain a `.`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use smallware_tunnel::TunnelConfig;
+    ///
+    /// // Simple key ID
+    /// let config = TunnelConfig::new("mykey.secret123", "domain.t00.smallware.io")?;
+    ///
+    /// // Key ID with dots
+    /// let config = TunnelConfig::new("org.team.mykey.secret123", "domain.t00.smallware.io")?;
+    /// # Ok::<(), smallware_tunnel::TunnelError>(())
+    /// ```
+    pub fn new(key: &str, domain: &str) -> Result<Self, TunnelError> {
+        let (key_id, secret) = parse_key(key)?;
+        Ok(Self {
+            key_secret: secret.to_string(),
+            key_id: key_id.to_string(),
+            domain: domain.to_string(),
             server_url: DEFAULT_SERVER_URL.to_string(),
             trust_ca: None,
-        }
-    }
-
-    /// Sets a custom key ID for JWT signing.
-    ///
-    /// The key ID is included in the JWT header and tells the server
-    /// which key to use for verification.
-    pub fn with_key_id(mut self, key_id: String) -> Self {
-        self.key_id = key_id;
-        self
+        })
     }
 
     /// Sets a custom server URL.
@@ -163,7 +191,8 @@ struct RecycledConnection {
 /// use smallware_tunnel::{TunnelConfig, TunnelListener};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = TunnelConfig::new("api-key".into(), "my-tunnel.t00.smallware.io".into());
+/// // Key format: <keyid>.<secret>
+/// let config = TunnelConfig::new("mykey.secret123", "my-tunnel.t00.smallware.io")?;
 /// let listener = TunnelListener::new(config)?;
 ///
 /// loop {
@@ -213,7 +242,7 @@ impl TunnelListener {
         // Validate configuration by extracting the customer ID from the domain
         let customer_id = config.customer_id()?;
         let jwt_manager = JwtManager::new(
-            config.key.clone(),
+            config.key_secret.clone(),
             customer_id,
             config.key_id.clone(),
         );
@@ -650,25 +679,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_key_simple() {
+        let (key_id, secret) = parse_key("mykey.secret123").unwrap();
+        assert_eq!(key_id, "mykey");
+        assert_eq!(secret, "secret123");
+    }
+
+    #[test]
+    fn test_parse_key_with_dots_in_keyid() {
+        // Key ID may contain dots, secret cannot
+        let (key_id, secret) = parse_key("org.team.mykey.secret123").unwrap();
+        assert_eq!(key_id, "org.team.mykey");
+        assert_eq!(secret, "secret123");
+    }
+
+    #[test]
+    fn test_parse_key_no_dot() {
+        let result = parse_key("nosecret");
+        assert!(matches!(result, Err(TunnelError::InvalidKeyFormat)));
+    }
+
+    #[test]
     fn test_config_new() {
         let config = TunnelConfig::new(
-            "key123".to_string(),
-            "www-abc-xyz.t00.smallware.io".to_string(),
-        );
+            "mykey.secret123",
+            "www-abc-xyz.t00.smallware.io",
+        ).unwrap();
 
-        assert_eq!(config.key, "key123");
+        assert_eq!(config.key_secret, "secret123");
+        assert_eq!(config.key_id, "mykey");
         assert_eq!(config.domain, "www-abc-xyz.t00.smallware.io");
-        assert_eq!(config.key_id, "default");
         assert_eq!(config.server_url, DEFAULT_SERVER_URL);
+    }
+
+    #[test]
+    fn test_config_with_dotted_keyid() {
+        let config = TunnelConfig::new(
+            "org.team.key.secret456",
+            "www-abc-xyz.t00.smallware.io",
+        ).unwrap();
+
+        assert_eq!(config.key_id, "org.team.key");
+        assert_eq!(config.key_secret, "secret456");
     }
 
     #[test]
     fn test_config_with_options() {
         let config = TunnelConfig::new(
-            "key123".to_string(),
-            "www-abc-xyz.t00.smallware.io".to_string(),
+            "mykey.secret123",
+            "www-abc-xyz.t00.smallware.io",
         )
-        .with_key_id("mykey".to_string())
+        .unwrap()
         .with_server_url("wss://test.example.com/tunnels".to_string());
 
         assert_eq!(config.key_id, "mykey");
@@ -678,9 +739,18 @@ mod tests {
     #[test]
     fn test_config_customer_id() {
         let config = TunnelConfig::new(
-            "key".to_string(),
-            "www-abc-xyz.t00.smallware.io".to_string(),
-        );
+            "key.secret",
+            "www-abc-xyz.t00.smallware.io",
+        ).unwrap();
         assert_eq!(config.customer_id().unwrap(), "xyz");
+    }
+
+    #[test]
+    fn test_config_invalid_key() {
+        let result = TunnelConfig::new(
+            "invalid-no-dot",
+            "www-abc-xyz.t00.smallware.io",
+        );
+        assert!(result.is_err());
     }
 }

@@ -6,6 +6,7 @@
 //! - [`Result<T>`]: A convenience type alias for `std::result::Result<T, TunnelError>`
 
 use std::sync::Arc;
+use http::StatusCode;
 use thiserror::Error;
 
 /// Errors that can occur when using the Smallware tunnel client.
@@ -86,6 +87,13 @@ pub enum TunnelError {
     #[error("Configuration error: {0}")]
     ConfigError(Arc<str>),
 
+    /// Invalid key format.
+    ///
+    /// The API key must be in the format `<keyid>.<secret>`.
+    /// The key ID may contain `.` characters, but the secret cannot.
+    #[error("Invalid key format: expected '<keyid>.<secret>'")]
+    InvalidKeyFormat,
+
     /// Server returned an error response.
     ///
     /// The server rejected the request with an HTTP error status.
@@ -153,7 +161,15 @@ impl From<std::io::Error> for TunnelError {
 
 impl From<tokio_tungstenite::tungstenite::Error> for TunnelError {
     fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
-        TunnelError::WebSocketError(Arc::from(err.to_string()))
+        match &err {
+            tokio_tungstenite::tungstenite::Error::Http(res) => {
+                if res.status() == StatusCode::FORBIDDEN {
+                    return TunnelError::AuthenticationFailed(err.to_string().into())
+                }
+                TunnelError::ServerError { status: res.status().as_u16(), message: err.to_string().into() }
+            },
+            _ => TunnelError::WebSocketError(Arc::from(err.to_string()))
+        }
     }
 }
 

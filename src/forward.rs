@@ -15,7 +15,8 @@
 //! use std::net::SocketAddr;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = TunnelConfig::new("api-key".into(), "www-abc-xyz.t00.smallware.io".into());
+//! // Key format: <keyid>.<secret>
+//! let config = TunnelConfig::new("mykey.secret123", "www-abc-xyz.t00.smallware.io")?;
 //! let listener = TunnelListener::new(config)?;
 //! let local_addr: SocketAddr = "127.0.0.1:8080".parse()?;
 //!

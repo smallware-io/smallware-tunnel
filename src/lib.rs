@@ -35,10 +35,11 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Configure the tunnel
+//!     // Key format: <keyid>.<secret> (keyid may contain dots, secret cannot)
 //!     let config = TunnelConfig::new(
-//!         "your-api-key".to_string(),
-//!         "www-abc123-xyz789.t00.smallware.io".to_string(),
-//!     );
+//!         "your-key-id.your-api-secret",
+//!         "www-abc123-xyz789.t00.smallware.io",
+//!     )?;
 //!
 //!     // Create a listener
 //!     let listener = TunnelListener::new(config)?;
@@ -96,6 +97,6 @@ mod tunnel_stream;
 pub use error::TunnelError;
 pub use forward::{forward_tunnel, forward_tunnel_tcp, ForwardStats};
 pub use jwt::JwtManager;
-pub use listener::{TunnelConfig, TunnelListener};
+pub use listener::{parse_key, TunnelConfig, TunnelListener};
 pub use tunnel_sink::TunnelSink;
 pub use tunnel_stream::TunnelStream;
