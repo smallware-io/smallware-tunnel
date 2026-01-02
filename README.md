@@ -4,17 +4,49 @@ A Rust client library and CLI tool for establishing tunnels to the Smallware tun
 
 ## Overview
 
-This crate provides:
-- **Library**: A Tokio-based API for establishing tunnel connections from Rust applications
-- **CLI**: A command-line tool for proxying traffic from tunnel domains to local ports
+This crate provides the smallware-tunnel library, which is the primary low-level facility that
+almost all clients should use to establish tunnels throug the smallware tunnel server.
+
+The smallware tunnel server provides "causal hosting" facilities that anybody can use to
+share things on the internet, on an as-needed basis, even if they don't have a server presence
+of their own:
+
+- Smallware customers use this library, or tools based on it, to connect make websocket
+  connections to wss://api.smallware.io/tunnels/...  The smallware servers then start accepting
+  requests on the customers' behalf.
+- When a customer's clients connect to the smallware tunnel server, they are connected though
+  the server directly to the customer's websocket, so the customer, not Smallware, can serve
+  the client requests.
+- NO SUBSCRIPTIONS: customers purchase credits in advance, and can spend those credits by using
+  smallware services. We will never charge you automatically or bother you for additional money.
+- SUPER CHEAP: credit packages are available for as little as US$ 2.50, and a little bit of
+  credit goes a long, long way.  We're not greedy.  The price is a reasonable markup on top
+  of what we pay for the tunnel hosting hardware.
+
+This create also provides the `smallware-tunnel` CLI tool, which you can use to establish
+tunnels and forward client connections directly to local or remote TCP ports.  This is a
+very thin on top of the library, and is not so easy to use.  For most use cases, you will
+want to use a client that is specifically written to support that use case.  The CLI tool
+provided here can be used for testing or for advanced users who can't find a more applicable
+client implementation.
+
+## Tunnel Domains
+
+When you establish a tunnel, you need to specify the domain that your clients will connect
+to.  This domain must be of the form `<service>-<anything>-<customer_id>.<shard>.smallware.io`, where:
+
+- `<service>` indicates the type of service that clients are connecting to.  This determines
+  the port they will use and how their request is routed to the correct customer.  Most often
+  this will be `www`, and clients will connect using HTTPS on port 443;
+- `<anything>` can be any combination of lowercase letters and digits.  Customers can choose
+  this however they like to identify the particular tunneled services that they provide;
+- `<customer_id>` is the smallware customer ID that is provided to every customer account;
+- `<shard>` indicates the particular smallware tunnel cluster that you want to connect to. You
+  can use `e0` for the default US east coast-ish cluster, or `w0` for the default US west
+  coast-ish cluster.  We make no promises about where these actually are, but we will generally
+  optimize their placement to best serve customers on the east and west coasts, respectively.
 
 ## Installation
-
-### CLI
-
-```bash
-cargo install --path .
-```
 
 ### Library
 
@@ -25,25 +57,32 @@ Add to your `Cargo.toml`:
 smallware-tunnel = "0.1"
 ```
 
+### CLI
+
+```bash
+cargo install --path .
+```
+
 ## CLI Usage
 
 ```bash
+
 # Basic usage
-smallware-tunnel --key YOUR_API_KEY www-abc-xyz.t00.smallware.io 8080
+smallware-tunnel --key YOUR_API_KEY www-whatever-custid.t00.smallware.io 8080
 
 # Using environment variable for key
 export SMALLWARE_KEY=your-api-key
-smallware-tunnel www-abc-xyz.t00.smallware.io 8080
+smallware-tunnel www-whatever-custid.t00.smallware.io 8080
 ```
 
 ### CLI Options
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--key` | `-k` | API key (also via `SMALLWARE_KEY` env var) |
+| `--key` | `-k` | API key (also via `SMALLWARE_KEY` env var) This is attached to your smallware account. |
 | `--key-id` | | Key ID for JWT signing (default: "default") |
-| `--server` | | Custom tunnel server URL |
-| `--trust-ca` | | Path to PEM file with CA certificate to trust |
+| `--server` | | Custom tunnel server URL.  By default this is `wss://api.smallware.io/tunnels` you would only change this to connect to a different implementation of the smallware tunneling protocol. |
+| `--trust-ca` | | Path to PEM file with an additional CA certificate to trust.  This can be used with the `--server` option if your server is using a slef-signed cert. |
 | `--verbose` | `-v` | Enable verbose logging |
 
 ## Library Usage
@@ -85,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
 
 ### Forwarding to Local Services
 
-The most common use case is forwarding tunnel traffic to a local TCP port:
+A common use case is forwarding tunnel traffic to a local TCP port:
 
 ```rust
 use smallware_tunnel::{TunnelListener, TunnelConfig, forward_tunnel_tcp};
@@ -152,25 +191,13 @@ The `TunnelListener` automatically manages WebSocket connection lifecycle:
 
 The library automatically manages JWT tokens:
 
-- Tokens use `iss: "customer"` for database-backed key validation
+- Tokens use `iss: "customer"` for customer-issued tokens
 - 30-minute expiration
 - Automatic refresh when less than 15 minutes remain
 - Customer ID extracted from domain name
 
-## Domain Format
-
-Tunnel domains follow this format:
-
-```
-<service>-<random>-<customer>.<shard>.smallware.io
-```
-
-Example: `www-abc123-xyz789.t00.smallware.io`
-
-- **service**: The tunnel service type (e.g., "www")
-- **random**: A random identifier
-- **customer**: Your customer ID
-- **shard**: The server shard (e.g., "t00", "t01")
+The `JwtManager` struct is available if you need to issue your own tokens, but
+you don't want to use the other parts of the tunnel library.
 
 ## Error Handling
 
