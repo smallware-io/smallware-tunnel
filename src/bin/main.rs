@@ -91,8 +91,10 @@ struct Args {
 async fn main() -> Result<()> {
     // Parse command line arguments
     let args = Args::parse();
-    
-    rustls::crypto::ring::default_provider().install_default().expect("Failed to install crypto provider");
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install crypto provider");
 
     // Initialize logging
     let log_level = if args.verbose {

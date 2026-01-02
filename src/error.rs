@@ -6,7 +6,6 @@
 //! - [`Result<T>`]: A convenience type alias for `std::result::Result<T, TunnelError>`
 
 use std::sync::Arc;
-use http::StatusCode;
 use thiserror::Error;
 
 /// Errors that can occur when using the Smallware tunnel client.
@@ -54,6 +53,14 @@ pub enum TunnelError {
     /// - The domain doesn't match the customer ID
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(Arc<str>),
+
+    /// Bad request.
+    ///
+    /// There's something wrong with the request that
+    /// doesn't fall into one of the other categories.
+    /// Don't retry
+    #[error("Authentication failed: {0}")]
+    BadRequest(Arc<str>),
 
     /// Invalid domain format.
     ///
@@ -128,6 +135,10 @@ pub enum TunnelError {
     /// was not followed correctly.
     #[error("Tunnel protocol violation")]
     ProtocolError,
+
+    /// Out of smallware credits.  Need to buy some
+    #[error("No credits remaining in the user account")]
+    NoCredits,
 }
 
 impl TunnelError {
@@ -141,7 +152,10 @@ impl TunnelError {
                 | TunnelError::ProtocolError
                 | TunnelError::RemoteError(_)
                 | TunnelError::IoError(_)
-                | TunnelError::ServerError { status:_, message:_ }
+                | TunnelError::ServerError {
+                    status: _,
+                    message: _
+                }
                 | TunnelError::StreamDropped
         )
     }
@@ -163,12 +177,22 @@ impl From<tokio_tungstenite::tungstenite::Error> for TunnelError {
     fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
         match &err {
             tokio_tungstenite::tungstenite::Error::Http(res) => {
-                if res.status() == StatusCode::FORBIDDEN {
-                    return TunnelError::AuthenticationFailed(err.to_string().into())
+                let code = res.status().as_u16();
+                if code == 401 || code == 403 {
+                    return TunnelError::AuthenticationFailed(err.to_string().into());
                 }
-                TunnelError::ServerError { status: res.status().as_u16(), message: err.to_string().into() }
-            },
-            _ => TunnelError::WebSocketError(Arc::from(err.to_string()))
+                if code == 402 {
+                    return TunnelError::NoCredits;
+                }
+                if code >= 400 && code < 500 && code != 429 {
+                    return TunnelError::BadRequest(err.to_string().into());
+                }
+                TunnelError::ServerError {
+                    status: res.status().as_u16(),
+                    message: err.to_string().into(),
+                }
+            }
+            _ => TunnelError::WebSocketError(Arc::from(err.to_string())),
         }
     }
 }

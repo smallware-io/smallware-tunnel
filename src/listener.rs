@@ -34,8 +34,8 @@ use flume::Receiver;
 use futures::lock::BiLock;
 use futures::{SinkExt, StreamExt};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::time;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -249,12 +249,18 @@ impl TunnelListener {
         let (recycle_tx, recycle_rx) = flume::bounded::<RecycledConnection>(0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shared: ListenerShared = ListenerShared {
-            config, jwt_manager, recycle_tx, recycle_rx, shutdown_tx, shutdown_rx,
+            config,
+            jwt_manager,
+            recycle_tx,
+            recycle_rx,
+            shutdown_tx,
+            shutdown_rx,
             last_success: AtomicBool::new(false),
             retry_state: tokio::sync::Mutex::new(RetryState {
                 last_start_millis: 0,
                 next_start_millis: 0,
-            }) };
+            }),
+        };
 
         // Create the JWT manager
 
@@ -307,7 +313,7 @@ impl TunnelListener {
                 tokio::time::sleep(time::Duration::from_millis(delay as u64)).await;
                 now_millis = chrono::Utc::now().timestamp_millis();
             }
-            let fail_delay = (delay + (delay>>1)).max(1000).min(30000);
+            let fail_delay = (delay + (delay >> 1)).max(1000).min(30000);
             retry_state.last_start_millis = now_millis;
             retry_state.next_start_millis = now_millis + fail_delay;
 
@@ -315,28 +321,41 @@ impl TunnelListener {
                 Ok(conn) => conn,
                 Err(e) => {
                     // Connection failed, update retry state
-                    shared.last_success.store(false, std::sync::atomic::Ordering::SeqCst);
+                    shared
+                        .last_success
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                     if !e.can_retry_accept() {
                         return Err(e);
                     }
-                    tracing::info!("WebSocket connect failed. Will retry in {} ms: {}.", fail_delay, e);
+                    tracing::info!(
+                        "WebSocket connect failed. Will retry in {} ms: {}.",
+                        fail_delay,
+                        e
+                    );
                     continue;
                 }
             };
             // We have a websocket connection waiting for a CONNECT message
             // If the last connection attempt failed, then wait for a connection inside the lock.
             // If we get a connection,then the other attempts can try without delay.
-            if !shared.last_success.load(std::sync::atomic::Ordering::SeqCst) {
+            if !shared
+                .last_success
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 match self.wait_for_connection(ws_tx, ws_rx).await {
                     Ok((sink, stream)) => {
                         // Success, reset retry state
-                        shared.last_success.store(true, std::sync::atomic::Ordering::SeqCst);
+                        shared
+                            .last_success
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                         retry_state.next_start_millis = now_millis;
                         return Ok((sink, stream));
                     }
                     Err(e) => {
                         // Failed to get a connection, update retry state
-                        shared.last_success.store(false, std::sync::atomic::Ordering::SeqCst);
+                        shared
+                            .last_success
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
                         if !e.can_retry_accept() {
                             tracing::info!("tunnel accept failed: {}", &e);
                             return Err(e);
@@ -355,7 +374,9 @@ impl TunnelListener {
                 }
                 Err(e) => {
                     // Failed to get a connection
-                    shared.last_success.store(false, std::sync::atomic::Ordering::SeqCst);
+                    shared
+                        .last_success
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                     if !e.can_retry_accept() {
                         tracing::info!("tunnel accept failed: {}", &e);
                         return Err(e);
@@ -365,7 +386,6 @@ impl TunnelListener {
             }
         }
     }
-
 
     async fn connect_or_recycle(&self) -> Result<(WsRawSink, WsBaseStream), TunnelError> {
         let shared = self.shared.clone();
@@ -413,7 +433,7 @@ impl TunnelListener {
         mut ws_rx: WsBaseStream,
     ) -> Result<(TunnelSink, TunnelStream), TunnelError> {
         let mut _client_ip: Option<std::net::IpAddr> = None;
-        let shared= self.shared.clone();
+        let shared = self.shared.clone();
         let mut shutdown_rx = shared.shutdown_rx.clone();
         let (ws_tx1, ws_tx2) = BiLock::new(ws_tx);
 
@@ -701,10 +721,7 @@ mod tests {
 
     #[test]
     fn test_config_new() {
-        let config = TunnelConfig::new(
-            "mykey.secret123",
-            "www-abc-xyz.t00.smallware.io",
-        ).unwrap();
+        let config = TunnelConfig::new("mykey.secret123", "www-abc-xyz.t00.smallware.io").unwrap();
 
         assert_eq!(config.key_secret, "secret123");
         assert_eq!(config.key_id, "mykey");
@@ -714,10 +731,8 @@ mod tests {
 
     #[test]
     fn test_config_with_dotted_keyid() {
-        let config = TunnelConfig::new(
-            "org.team.key.secret456",
-            "www-abc-xyz.t00.smallware.io",
-        ).unwrap();
+        let config =
+            TunnelConfig::new("org.team.key.secret456", "www-abc-xyz.t00.smallware.io").unwrap();
 
         assert_eq!(config.key_id, "org.team.key");
         assert_eq!(config.key_secret, "secret456");
@@ -725,12 +740,9 @@ mod tests {
 
     #[test]
     fn test_config_with_options() {
-        let config = TunnelConfig::new(
-            "mykey.secret123",
-            "www-abc-xyz.t00.smallware.io",
-        )
-        .unwrap()
-        .with_server_url("wss://test.example.com/tunnels".to_string());
+        let config = TunnelConfig::new("mykey.secret123", "www-abc-xyz.t00.smallware.io")
+            .unwrap()
+            .with_server_url("wss://test.example.com/tunnels".to_string());
 
         assert_eq!(config.key_id, "mykey");
         assert_eq!(config.server_url, "wss://test.example.com/tunnels");
@@ -738,19 +750,13 @@ mod tests {
 
     #[test]
     fn test_config_customer_id() {
-        let config = TunnelConfig::new(
-            "key.secret",
-            "www-abc-xyz.t00.smallware.io",
-        ).unwrap();
+        let config = TunnelConfig::new("key.secret", "www-abc-xyz.t00.smallware.io").unwrap();
         assert_eq!(config.customer_id().unwrap(), "xyz");
     }
 
     #[test]
     fn test_config_invalid_key() {
-        let result = TunnelConfig::new(
-            "invalid-no-dot",
-            "www-abc-xyz.t00.smallware.io",
-        );
+        let result = TunnelConfig::new("invalid-no-dot", "www-abc-xyz.t00.smallware.io");
         assert!(result.is_err());
     }
 }
