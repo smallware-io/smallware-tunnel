@@ -218,12 +218,42 @@ struct ListenerShared {
     shutdown_tx: watch::Sender<bool>,
     /// Receiver for shutdown events
     shutdown_rx: watch::Receiver<bool>,
+    /// Tracks whether the most recent connection attempt succeeded.
+    ///
+    /// This flag controls the concurrency behavior of `accept()`:
+    /// - When `false`: Connection attempts are serialized. Only one `accept()` call
+    ///   actively attempts a connection at a time, with the `retry_state` lock held
+    ///   through both `connect_or_recycle()` and `wait_for_connection()`. This prevents
+    ///   multiple callers from hammering the server when it may be experiencing issues.
+    /// - When `true`: Connection attempts can proceed concurrently. The lock is released
+    ///   before `wait_for_connection()`, allowing multiple WebSocket connections to wait
+    ///   for CONNECT messages in parallel.
+    ///
+    /// The flag is set to `false` on any connection failure and reset to `true` when
+    /// a serialized attempt succeeds, signaling that the server is healthy again.
     last_success: AtomicBool,
+    /// Controls retry timing and coordinates concurrent `accept()` calls.
+    ///
+    /// This mutex serves two purposes:
+    /// 1. **Backoff coordination**: After a failure, `next_start_millis` is set to a
+    ///    future time. All `accept()` calls will sleep until this time, with the lock
+    ///    held during the sleep to ensure only one attempt proceeds after the backoff.
+    /// 2. **Serialization when failing**: When `last_success` is `false`, the lock is
+    ///    held through the entire connection attempt (including `wait_for_connection()`)
+    ///    to serialize attempts and prevent overwhelming a potentially struggling server.
+    ///
+    /// When connections are succeeding (`last_success == true`), the lock is held only
+    /// briefly for bookkeeping and released before the potentially long `wait_for_connection()`.
     retry_state: tokio::sync::Mutex<RetryState>,
 }
 
+/// Shared state for retry timing across concurrent `accept()` calls.
 struct RetryState {
+    /// Timestamp when the last connection attempt started (for debugging/metrics).
     last_start_millis: i64,
+    /// Earliest time the next connection attempt should start.
+    /// Set to a future time after failures to implement exponential backoff.
+    /// Reset to the current time on success to allow immediate subsequent attempts.
     next_start_millis: i64,
 }
 
@@ -246,6 +276,10 @@ impl TunnelListener {
             customer_id,
             config.key_id.clone(),
         );
+        // Rendezvous channel (capacity 0) for recycling WebSocket connections.
+        // When a tunnel session completes successfully, `connection_task` offers the
+        // WebSocket for reuse. The zero capacity ensures the handoff is synchronous:
+        // if no `accept()` is ready to receive within the timeout, the connection is dropped.
         let (recycle_tx, recycle_rx) = flume::bounded::<RecycledConnection>(0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shared: ListenerShared = ListenerShared {
@@ -289,6 +323,23 @@ impl TunnelListener {
     /// Multiple calls to `accept()` can be made concurrently from different tasks.
     /// Each call will handle a separate incoming connection.
     ///
+    /// # Concurrency Model
+    ///
+    /// The method uses adaptive serialization to balance throughput with server protection:
+    ///
+    /// - **Normal operation** (`last_success == true`): Multiple `accept()` calls can
+    ///   proceed concurrently. Each acquires the retry lock briefly for bookkeeping,
+    ///   then releases it before the potentially long wait for a CONNECT message.
+    ///
+    /// - **After failures** (`last_success == false`): Attempts are serialized. Only one
+    ///   `accept()` actively waits for a connection at a time, with the retry lock held
+    ///   throughout. This prevents overwhelming a struggling server with parallel retries.
+    ///   Once a serialized attempt succeeds, normal concurrent operation resumes.
+    ///
+    /// - **Backoff**: After failures, an exponential backoff delay (1-30 seconds) is
+    ///   enforced. The lock is held during this sleep to ensure all callers respect
+    ///   the backoff period.
+    ///
     /// # Returns
     ///
     /// Returns a tuple of ([`TunnelSink`], [`TunnelStream`]) for bidirectional
@@ -305,14 +356,22 @@ impl TunnelListener {
     pub async fn accept(&self) -> Result<(TunnelSink, TunnelStream), TunnelError> {
         let shared = self.shared.clone();
         loop {
+            // Acquire the retry lock. This lock coordinates backoff timing and, when
+            // last_success is false, serializes connection attempts. See field docs
+            // for details on when this lock is held vs released.
             let mut retry_state = shared.retry_state.lock().await;
             let mut now_millis = chrono::Utc::now().timestamp_millis();
             let delay = (retry_state.next_start_millis - now_millis).max(0);
 
+            // Backoff sleep: if a previous attempt set next_start_millis in the future,
+            // we sleep here. The lock is intentionally held during this sleep to prevent
+            // other callers from bypassing the backoff period.
             if delay > 0 {
                 tokio::time::sleep(time::Duration::from_millis(delay as u64)).await;
                 now_millis = chrono::Utc::now().timestamp_millis();
             }
+            // Compute the backoff for the next attempt (in case this one fails).
+            // Exponential backoff: 1.5x the previous delay, clamped to 1-30 seconds.
             let fail_delay = (delay + (delay >> 1)).max(1000).min(30000);
             retry_state.last_start_millis = now_millis;
             retry_state.next_start_millis = now_millis + fail_delay;
@@ -335,16 +394,23 @@ impl TunnelListener {
                     continue;
                 }
             };
-            // We have a websocket connection waiting for a CONNECT message
-            // If the last connection attempt failed, then wait for a connection inside the lock.
-            // If we get a connection,then the other attempts can try without delay.
+            // We now have a fresh WebSocket: either newly connected or recycled with
+            // a RESET message just sent. The server should respond with CONNECT promptly
+            // once a client connects to the tunnel.
+            //
+            // Serialization decision: if the previous attempt failed, we hold the lock
+            // through wait_for_connection() to serialize attempts. If we succeed here,
+            // we signal that the server is healthy (last_success = true) so subsequent
+            // callers can proceed concurrently.
             if !shared
                 .last_success
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
+                // SERIALIZED PATH: Hold lock through wait_for_connection.
+                // Only one caller waits for CONNECT at a time until we succeed.
                 match self.wait_for_connection(ws_tx, ws_rx).await {
                     Ok((sink, stream)) => {
-                        // Success, reset retry state
+                        // Success! Server is healthy. Allow concurrent attempts again.
                         shared
                             .last_success
                             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -352,7 +418,6 @@ impl TunnelListener {
                         return Ok((sink, stream));
                     }
                     Err(e) => {
-                        // Failed to get a connection, update retry state
                         shared
                             .last_success
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -365,7 +430,8 @@ impl TunnelListener {
                 }
                 continue;
             }
-            // other attempts can try without delay
+            // CONCURRENT PATH: Release lock before the potentially long wait for CONNECT.
+            // Multiple callers can wait on their own WebSocket connections in parallel.
             retry_state.next_start_millis = now_millis;
             drop(retry_state);
             match self.wait_for_connection(ws_tx, ws_rx).await {
@@ -373,7 +439,10 @@ impl TunnelListener {
                     return Ok((sink, stream));
                 }
                 Err(e) => {
-                    // Failed to get a connection
+                    // Failed while in concurrent mode. Mark as failed so the next
+                    // attempt will serialize. Note: we don't hold the lock here,
+                    // so another caller might already be in wait_for_connection.
+                    // That's fine - they'll complete or fail independently.
                     shared
                         .last_success
                         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -387,6 +456,15 @@ impl TunnelListener {
         }
     }
 
+    /// Obtains a WebSocket connection, either by recycling an existing one or creating new.
+    ///
+    /// This method first checks the recycle channel for an available connection from a
+    /// completed tunnel session. If one is available, it sends a RESET message to signal
+    /// the server that we're ready for a new client. If no recycled connection is available,
+    /// a new WebSocket connection is established.
+    ///
+    /// The returned WebSocket is in a "fresh" state: either just connected or just reset.
+    /// The server will send a CONNECT message when a client connects to the tunnel.
     async fn connect_or_recycle(&self) -> Result<(WsRawSink, WsBaseStream), TunnelError> {
         let shared = self.shared.clone();
         let mut shutdown_rx = shared.shutdown_rx.clone();
@@ -420,9 +498,19 @@ impl TunnelListener {
 
     /// Waits for a `CONNECT` message on the WebSocket indicating a client has connected.
     ///
+    /// This method should only be called on a "fresh" WebSocket connection:
+    /// - A newly established connection (just completed handshake), or
+    /// - A recycled connection that just had a RESET message sent
+    ///
+    /// In either case, the server knows we're ready for a new client and will send
+    /// a CONNECT message promptly once a client connects to the tunnel. The 60-second
+    /// ping interval is for keep-alive during potentially long waits for clients,
+    /// not for failure detection on stale connections.
+    ///
     /// This method handles the WebSocket protocol:
-    /// - Sends periodic ping messages to keep the connection alive
+    /// - Sends periodic ping messages (every 60s) to keep the connection alive
     /// - Parses incoming `CONNECT` messages to extract client IP
+    /// - Ignores stale messages from previous connections on recycled WebSockets
     /// - Handles `DROP` messages and connection errors
     ///
     /// Once a `CONNECT` is received, it creates the `TunnelSink` and `TunnelStream`
@@ -509,9 +597,13 @@ impl TunnelListener {
     /// This task:
     /// 1. Waits for both the sink and stream to signal end-of-life (success or failure)
     /// 2. Sends periodic ping messages to keep the WebSocket alive while waiting
-    /// 3. If both completed successfully, reunites the BiLock halves and sends the
-    ///    recycled connection to the rendezvous channel for reuse
-    /// 4. If either failed, discards the connection
+    /// 3. If both completed successfully, reunites the BiLock halves and offers the
+    ///    connection to the rendezvous channel for reuse (with 5-second timeout)
+    /// 4. If either failed, or if no `accept()` claims the recycled connection within
+    ///    the timeout, the WebSocket is dropped
+    ///
+    /// The rendezvous channel (capacity 0) ensures synchronous handoff: a recycled
+    /// connection is only kept alive if an `accept()` call is ready to receive it.
     async fn connection_task(
         ws_tx1: WsBaseSink,
         recycle_sink_rx: Receiver<TunnelSinkEol>,
@@ -564,6 +656,9 @@ impl TunnelListener {
                 return;
             }
         };
+        // Offer the recycled connection to waiting accept() calls via rendezvous channel.
+        // With capacity 0, send_async blocks until a receiver is ready. If no accept()
+        // is waiting within 5 seconds, we give up and drop the connection.
         let mut shutdown_rx = shutdown_rx;
         tokio::select! {
             _ = recycle_tx.send_async(RecycledConnection { ws_tx: raw_sink, ws_rx: raw_stream}) => {},
