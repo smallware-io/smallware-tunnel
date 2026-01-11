@@ -25,8 +25,11 @@ pub(crate) type WsBaseSink = BiLock<WsRawSink>;
 pub(crate) enum TunnelSinkEol {
     /// Sink completed successfully; return the BiLock half for recycling.
     Ok(WsBaseSink),
-    /// Sink failed; the WebSocket should be discarded.
-    Fail,
+    /// Sink was dropped without sending EOF. Can recycle it after sending
+    Dropped(WsBaseSink),
+    /// Sink failed; the WebSocket should be discarded, but the connection_task
+    /// still has to close it
+    Fail(WsBaseSink),
 }
 
 /// The write half of a tunnel connection.
@@ -89,18 +92,25 @@ impl TunnelSink {
     ///
     /// Clears any cached guard, sends the BiLock half to the recycler, and
     /// sets the final result for subsequent operations.
-    fn set_done(&mut self, next: Result<(), TunnelError>) -> Result<(), TunnelError> {
+    fn set_done(
+        &mut self,
+        sent_eof: bool,
+        next: Result<(), TunnelError>,
+    ) -> Result<(), TunnelError> {
         // Clear the guard first (required for safety)
         self.ready_guard = None;
-        // Swap out the inner sink
-        let mut temp = Err(Err(TunnelError::InvalidState));
+        // Set the final result and swap out the inner sink
+        let mut temp = Err(next.clone());
         std::mem::swap(&mut self.inner, &mut temp);
         // If we had an active sink, signal that it can be recycled
         if let Ok(sink) = temp {
-            let _ = self.recycler.try_send(TunnelSinkEol::Ok(sink));
+            let eol = if sent_eof {
+                TunnelSinkEol::Ok(sink)
+            } else {
+                TunnelSinkEol::Dropped(sink)
+            };
+            let _ = self.recycler.try_send(eol);
         }
-        // Set the final result
-        self.inner = Err(next.clone());
         next
     }
 
@@ -117,8 +127,9 @@ impl TunnelSink {
         // Swap out the inner sink
         let mut temp = Err(Err(err.clone()));
         std::mem::swap(&mut self.inner, &mut temp);
-        // Signal that the connection should be discarded
-        let _ = self.recycler.try_send(TunnelSinkEol::Fail);
+        if let Ok(sink) = temp {
+            let _ = self.recycler.try_send(TunnelSinkEol::Fail(sink));
+        }
         Err(err)
     }
 }
@@ -128,7 +139,7 @@ impl Drop for TunnelSink {
         // If dropped while still active, signal completion to allow recycling
         // (though in practice this means the user didn't call close())
         if self.inner.is_ok() {
-            let _ = self.set_done(Err(TunnelError::InvalidState));
+            let _ = self.set_done(false, Err(TunnelError::InvalidState));
         }
     }
 }
@@ -266,7 +277,15 @@ impl Sink<Bytes> for TunnelSink {
         let send_result = guard.start_send_unpin(Message::Binary(Bytes::new()));
         drop(guard);
         // successfully closed
-        let _ = this.set_done(Err(TunnelError::InvalidState));
-        Poll::Ready(send_result.map_err(TunnelError::from))
+        match send_result {
+            Ok(_) => {
+                let _ = this.set_done(true, Err(TunnelError::InvalidState));
+                Poll::Ready(Ok(()))
+            }
+            Err(e) => {
+                let tune: TunnelError = e.into();
+                Poll::Ready(this.set_failure(tune))
+            }
+        }
     }
 }

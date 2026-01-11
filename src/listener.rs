@@ -31,13 +31,15 @@ use crate::tunnel_sink::{TunnelSink, TunnelSinkEol, WsBaseSink, WsRawSink};
 use crate::tunnel_stream::{TunnelStream, TunnelStreamEol, WsBaseStream};
 use bytes::Bytes;
 use flume::Receiver;
+use futures::channel::oneshot;
 use futures::lock::BiLock;
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
-use tokio::time;
+use tokio::time::{self, timeout};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// Default tunnel server URL.
@@ -372,7 +374,7 @@ impl TunnelListener {
             }
             // Compute the backoff for the next attempt (in case this one fails).
             // Exponential backoff: 1.5x the previous delay, clamped to 1-30 seconds.
-            let fail_delay = (delay + (delay >> 1)).max(1000).min(30000);
+            let fail_delay = (delay + (delay >> 1)).clamp(1000, 30000);
             retry_state.last_start_millis = now_millis;
             retry_state.next_start_millis = now_millis + fail_delay;
 
@@ -575,8 +577,8 @@ impl TunnelListener {
         }
         let (recycle_stream_tx, recycle_stream_rx) = flume::bounded::<TunnelStreamEol>(1);
         let (recycle_sink_tx, recycle_sink_rx) = flume::bounded::<TunnelSinkEol>(1);
-
-        let stream = TunnelStream::new(ws_rx, recycle_stream_tx);
+        let (stream_interrupt_tx, stream_interrupt_rx) = oneshot::channel();
+        let stream = TunnelStream::new(ws_rx, stream_interrupt_rx, recycle_stream_tx);
         // TODO: _client_ip is parsed from CONNECT messages for future use (e.g., logging, access control)
         // but is not yet exposed in the public API
         let sink = TunnelSink::new(ws_tx2, recycle_sink_tx);
@@ -586,6 +588,7 @@ impl TunnelListener {
             ws_tx1,
             recycle_sink_rx,
             recycle_stream_rx,
+            stream_interrupt_tx,
             recycle_tx,
             shutdown_rx,
         ));
@@ -608,40 +611,74 @@ impl TunnelListener {
         ws_tx1: WsBaseSink,
         recycle_sink_rx: Receiver<TunnelSinkEol>,
         recycle_stream_rx: Receiver<TunnelStreamEol>,
+        stream_interrupt_tx: oneshot::Sender<()>, // normall drop-signalled
         recycle_tx: flume::Sender<RecycledConnection>,
         shutdown_rx: watch::Receiver<bool>,
     ) {
-        let mut sink_eol: Option<Result<TunnelSinkEol, ()>> = None;
-        let mut stream_eol: Option<Result<TunnelStreamEol, ()>> = None;
-        while sink_eol.is_none() || stream_eol.is_none() {
+        let mut sink_eol: Option<TunnelSinkEol> = None;
+        let mut stream_eol: Option<TunnelStreamEol> = None;
+        // Wait for the caller to finish with its TunnelSink
+        while sink_eol.is_none() {
             tokio::select! {
-                    result = recycle_sink_rx.recv_async(), if sink_eol.is_none() => {
-                        match result {
-                            Ok(eol) => {sink_eol = Some(Ok(eol));},
-                            _ => {sink_eol = Some(Err(()));},
+                result = recycle_sink_rx.recv_async() => {
+                    match result {
+                        Ok(eol) => {sink_eol = Some(eol);},
+                        _ => {
+                            break;
+                        },
+                    }
+                },
+                result = recycle_stream_rx.recv_async(), if stream_eol.is_none() => {
+                    match result {
+                        Ok(eol) => {stream_eol = Some(eol);},
+                        _ => {stream_eol = Some(TunnelStreamEol::Fail);},
+                    }
+                    if let Some(TunnelStreamEol::Dropped(_)) = &stream_eol {
+                        let rsd_msg = Message::Text("RDSD".into());
+                        let mut guard = ws_tx1.lock().await;
+                        if !checked_send(&mut *guard, rsd_msg).await {
+                            return; // connection lost
                         }
-                    },
-                    result = recycle_stream_rx.recv_async(), if stream_eol.is_none() => {
-                        match result {
-                            Ok(eol) => {stream_eol = Some(Ok(eol));},
-                            _ => {stream_eol = Some(Err(()));},
+                    }
+                },
+                // send a ping every minute if we're not already busy sending something else
+                _ = time::sleep(time::Duration::from_secs(60)) => {
+                    // send keep-alive
+                    let ping_msg = Message::Ping(Bytes::new());
+                    if let Some(mut guard) = ws_tx1.try_lock() {
+                        if !checked_send(&mut *guard, ping_msg).await {
+                            return; // connection lost
                         }
-                    },
-                    // send a ping every minute if we're not already busy sending something else
-                    _ = time::sleep(time::Duration::from_secs(60)) => {
-                        // send keep-alive
-                        let ping_msg = Message::Ping(Bytes::new());
-                        if let Some(mut guard) = ws_tx1.try_lock() {
-                            if guard.send(ping_msg).await.is_err() {
-                                return; // connection lost
-                            }
-                        }
-                    },
+                    }
+                },
             }
         }
-        let raw_sink = match sink_eol {
-            Some(Ok(TunnelSinkEol::Ok(ws_tx2))) => match BiLock::reunite(ws_tx1, ws_tx2) {
+        // The writer is done and we have the other half of the write sink
+        // back.  Try to put the write sink back together, and make a note
+        // pf what we have to do with it.
+        let mut send_eof = false;
+        let mut send_close = false;
+        let mut raw_sink = match sink_eol {
+            Some(TunnelSinkEol::Ok(ws_tx2)) => match BiLock::reunite(ws_tx1, ws_tx2) {
                 Ok(sink) => sink,
+                Err(_) => {
+                    return;
+                }
+            },
+            Some(TunnelSinkEol::Dropped(ws_tx2)) => match BiLock::reunite(ws_tx1, ws_tx2) {
+                Ok(sink) => {
+                    send_eof = true;
+                    sink
+                }
+                Err(_) => {
+                    return;
+                }
+            },
+            Some(TunnelSinkEol::Fail(ws_tx2)) => match BiLock::reunite(ws_tx1, ws_tx2) {
+                Ok(sink) => {
+                    send_close = true;
+                    sink
+                }
                 Err(_) => {
                     return;
                 }
@@ -650,9 +687,52 @@ impl TunnelListener {
                 return;
             }
         };
+        if send_close {
+            // write failed, and connection is not recyclable
+            // send a close message to shut down the websocket
+            let _ = checked_close(&mut raw_sink).await;
+            return;
+        }
+        if send_eof {
+            // write dropped
+            let eof_msg = Message::Binary(Bytes::new());
+            if !checked_send(&mut raw_sink, eof_msg).await {
+                tracing::error!("Send EOF on drop failed");
+                return; // connection lost
+            }
+        }
+        // Write side closed done.  Wait for the read stream
+        while stream_eol.is_none() {
+            tokio::select! {
+                result = recycle_stream_rx.recv_async(), if stream_eol.is_none() => {
+                    match result {
+                        Ok(eol) => {stream_eol = Some(eol);},
+                        _ => {stream_eol = Some(TunnelStreamEol::Fail);},
+                    }
+                    if let Some(TunnelStreamEol::Dropped(_)) = &stream_eol {
+                        let rsd_msg = Message::Text("RDSD".into());
+                        if !checked_send(&mut raw_sink, rsd_msg).await {
+                            return; // connection lost
+                        }
+                    }
+                },
+                // send a ping every minute if we're not already busy sending something else
+                _ = time::sleep(time::Duration::from_secs(60)) => {
+                    // send keep-alive
+                    let ping_msg = Message::Ping(Bytes::new());
+                    if !checked_send(&mut raw_sink, ping_msg).await {
+                        return; // connection lost
+                    }
+                },
+            }
+        }
         let raw_stream = match stream_eol {
-            Some(Ok(TunnelStreamEol::Ok(ws_rx))) => ws_rx,
+            Some(TunnelStreamEol::Ok(ws_rx)) => ws_rx,
+            Some(TunnelStreamEol::Dropped(ws_rx)) => ws_rx,
             _ => {
+                // read stream is not recyclable.
+                let _ = checked_close(&mut raw_sink).await;
+                let _ = stream_interrupt_tx.send(());
                 return;
             }
         };
@@ -663,11 +743,18 @@ impl TunnelListener {
         tokio::select! {
             _ = recycle_tx.send_async(RecycledConnection { ws_tx: raw_sink, ws_rx: raw_stream}) => {},
             _ = time::sleep(time::Duration::from_secs(5)) => {},
-            _ = util_shutdown(&mut shutdown_rx) => {
-                return;
-            }
+            _ = util_shutdown(&mut shutdown_rx) => {}
         }
     }
+}
+
+async fn checked_send<T: Sink<Message> + Unpin>(sink: &mut T, msg: Message) -> bool {
+    let res = timeout(Duration::from_secs(60), sink.send(msg)).await;
+    res.is_ok()
+}
+async fn checked_close<T: Sink<Message> + Unpin>(sink: &mut T) -> bool {
+    let res = timeout(Duration::from_secs(60), sink.close()).await;
+    res.is_ok()
 }
 
 /// Waits until the shutdown signal is received.

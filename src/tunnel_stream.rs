@@ -4,8 +4,9 @@
 //! for receiving data from a remote client through the tunnel.
 
 use bytes::Bytes;
+use futures::channel::oneshot;
 use futures::stream::SplitStream;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -22,6 +23,8 @@ pub type WsBaseStream = SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::T
 pub(crate) enum TunnelStreamEol {
     /// Stream completed successfully; the WebSocket can be recycled.
     Ok(WsBaseStream),
+    /// Stream dropped without reading EOF
+    Dropped(WsBaseStream),
     /// Stream failed; the WebSocket should be discarded.
     Fail,
 }
@@ -65,14 +68,20 @@ pub struct TunnelStream {
     inner: Result<WsBaseStream, Option<Result<Bytes, TunnelError>>>,
     /// Channel to signal completion status for connection recycling.
     recycler: flume::Sender<TunnelStreamEol>,
+    interrupt_rx: oneshot::Receiver<()>,
 }
 
 impl TunnelStream {
     /// Creates a new `TunnelStream` wrapping a WebSocket stream.
-    pub(crate) fn new(inner: WsBaseStream, recycler: flume::Sender<TunnelStreamEol>) -> Self {
+    pub(crate) fn new(
+        inner: WsBaseStream,
+        interrupt_rx: oneshot::Receiver<()>,
+        recycler: flume::Sender<TunnelStreamEol>,
+    ) -> Self {
         Self {
             inner: Ok(inner),
             recycler,
+            interrupt_rx,
         }
     }
 
@@ -83,6 +92,7 @@ impl TunnelStream {
     /// that still allows recycling).
     fn set_done(
         &mut self,
+        got_eof: bool,
         next: Option<Result<Bytes, TunnelError>>,
     ) -> Option<Result<Bytes, TunnelError>> {
         // Swap out the inner stream, replacing it with the final result
@@ -90,7 +100,12 @@ impl TunnelStream {
         std::mem::swap(&mut self.inner, &mut inner);
         // If we had an active stream, signal that it can be recycled
         if let Ok(inner) = inner {
-            let _ = self.recycler.try_send(TunnelStreamEol::Ok(inner));
+            let eol = if got_eof {
+                TunnelStreamEol::Ok(inner)
+            } else {
+                TunnelStreamEol::Dropped(inner)
+            };
+            let _ = self.recycler.try_send(eol);
         }
         next
     }
@@ -102,7 +117,7 @@ impl TunnelStream {
         let mut inner = Err(Some(Err(err.clone())));
         std::mem::swap(&mut self.inner, &mut inner);
         // If we had an active stream, signal that it should be discarded
-        if let Ok(_) = inner {
+        if inner.is_ok() {
             let _ = self.recycler.try_send(TunnelStreamEol::Fail);
         }
         Some(Err(err))
@@ -111,11 +126,7 @@ impl TunnelStream {
 
 impl Drop for TunnelStream {
     fn drop(&mut self) {
-        // If dropped while the stream is still active (not completed),
-        // signal failure so the connection is not recycled
-        if self.inner.is_ok() {
-            let _ = self.recycler.try_send(TunnelStreamEol::Fail);
-        }
+        self.set_done(false, None);
     }
 }
 
@@ -137,10 +148,10 @@ impl Stream for TunnelStream {
             Poll::Ready(Some(Ok(Message::Binary(bin)))) => {
                 if !bin.is_empty() {
                     // Normal data chunk
-                    return Poll::Ready(Some(Ok(Bytes::from(bin))));
+                    return Poll::Ready(Some(Ok(bin)));
                 }
                 // Empty binary message = graceful EOF signal from server
-                return Poll::Ready(this.set_done(None));
+                return Poll::Ready(this.set_done(true, None));
             }
 
             // Text message: control/error messages
@@ -149,7 +160,7 @@ impl Stream for TunnelStream {
                 if let Some(err) = str.strip_prefix("DROP:") {
                     // Remote client disconnected with an error; connection can still be recycled
                     let err = TunnelError::RemoteError(Arc::from(err.trim()));
-                    return Poll::Ready(this.set_done(Some(Err(err))));
+                    return Poll::Ready(this.set_done(true, Some(Err(err))));
                 }
                 // Other text messages are ignored (may be from previous connection)
             }
@@ -168,7 +179,13 @@ impl Stream for TunnelStream {
             // Other message types (Ping, Pong, Close) are handled by tungstenite
             Poll::Ready(Some(Ok(_))) => {}
 
-            Poll::Pending => return Poll::Pending,
+            Poll::Pending => {
+                if this.interrupt_rx.poll_unpin(cx).is_ready() {
+                    this.set_failed(TunnelError::ConnectionClosed);
+                    return Poll::Ready(Some(Err(TunnelError::ConnectionClosed)));
+                }
+                return Poll::Pending;
+            }
         }
 
         // The message didn't produce a value (e.g., ignored text message).

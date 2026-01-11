@@ -194,6 +194,8 @@ The `TunnelListener` automatically manages WebSocket connection lifecycle:
   - `DROP: <reason>` - Error on the proxy connection.  The websocket can still
     be reused for a new client.
 - Client -> server text messages for control signals:
+  - `RDSD` - The proxy connection reader dropped without reading EOF.  Server should
+    stop sending.
   - `RESET` - The connection has been recycled.  Start waiting for a new proxy
     connection.  This is only valid after Client -> server EOF and server ->
     client EOF or DROP.  Sending this in other situations will cause the connection
