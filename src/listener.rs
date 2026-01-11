@@ -27,6 +27,7 @@
 use crate::bilock_ext::BiLockExt;
 use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
+use crate::trace_id::{next_trace_id, TraceId};
 use crate::tunnel_sink::{TunnelSink, TunnelSinkEol, WsBaseSink, WsRawSink};
 use crate::tunnel_stream::{TunnelStream, TunnelStreamEol, WsBaseStream};
 use bytes::Bytes;
@@ -34,6 +35,7 @@ use flume::Receiver;
 use futures::channel::oneshot;
 use futures::lock::BiLock;
 use futures::{Sink, SinkExt, StreamExt};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -41,6 +43,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::{self, timeout};
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tracing::Instrument;
 
 /// Default tunnel server URL.
 const DEFAULT_SERVER_URL: &str = "wss://api.smallware.io/tunnels";
@@ -209,6 +212,14 @@ pub struct TunnelListener {
     shared: Arc<ListenerShared>,
 }
 
+/// Information about a remote connected client
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct TunnelClientInfo{
+    pub ip_addr: Option<IpAddr>,
+    pub connection_id: TraceId,
+}
+
 struct ListenerShared {
     config: TunnelConfig,
     jwt_manager: JwtManager,
@@ -355,71 +366,118 @@ impl TunnelListener {
     /// - [`TunnelError::ConnectionFailed`] if the WebSocket connection fails
     /// - [`TunnelError::ConnectionClosed`] if the server closes the connection
     /// - [`TunnelError::WebSocketError`] for other WebSocket-level errors
-    pub async fn accept(&self) -> Result<(TunnelSink, TunnelStream), TunnelError> {
+    pub async fn accept(&self) -> Result<(TunnelSink, TunnelStream, TunnelClientInfo), TunnelError> {
+        let trace_id = next_trace_id();
         let shared = self.shared.clone();
-        loop {
-            // Acquire the retry lock. This lock coordinates backoff timing and, when
-            // last_success is false, serializes connection attempts. See field docs
-            // for details on when this lock is held vs released.
-            let mut retry_state = shared.retry_state.lock().await;
-            let mut now_millis = chrono::Utc::now().timestamp_millis();
-            let delay = (retry_state.next_start_millis - now_millis).max(0);
-
-            // Backoff sleep: if a previous attempt set next_start_millis in the future,
-            // we sleep here. The lock is intentionally held during this sleep to prevent
-            // other callers from bypassing the backoff period.
-            if delay > 0 {
-                tokio::time::sleep(time::Duration::from_millis(delay as u64)).await;
-                now_millis = chrono::Utc::now().timestamp_millis();
-            }
-            // Compute the backoff for the next attempt (in case this one fails).
-            // Exponential backoff: 1.5x the previous delay, clamped to 1-30 seconds.
-            let fail_delay = (delay + (delay >> 1)).clamp(1000, 30000);
-            retry_state.last_start_millis = now_millis;
-            retry_state.next_start_millis = now_millis + fail_delay;
-
-            let (ws_tx, ws_rx) = match self.connect_or_recycle().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // Connection failed, update retry state
-                    shared
-                        .last_success
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    if !e.can_retry_accept() {
-                        return Err(e);
-                    }
-                    tracing::info!(
-                        "WebSocket connect failed. Will retry in {} ms: {}.",
-                        fail_delay,
-                        e
-                    );
-                    continue;
+        async {
+            loop {
+                // Acquire the retry lock. This lock coordinates backoff timing and, when
+                // last_success is false, serializes connection attempts. See field docs
+                // for details on when this lock is held vs released.
+                let entry_millis = chrono::Utc::now().timestamp_millis();
+                let mut retry_state = shared.retry_state.lock().await;
+                let mut now_millis = chrono::Utc::now().timestamp_millis();
+                if now_millis - entry_millis > 10 {
+                    tracing::info!("waited for accept lock: {} ms", now_millis - entry_millis);
                 }
-            };
-            // We now have a fresh WebSocket: either newly connected or recycled with
-            // a RESET message just sent. The server should respond with CONNECT promptly
-            // once a client connects to the tunnel.
-            //
-            // Serialization decision: if the previous attempt failed, we hold the lock
-            // through wait_for_connection() to serialize attempts. If we succeed here,
-            // we signal that the server is healthy (last_success = true) so subsequent
-            // callers can proceed concurrently.
-            if !shared
-                .last_success
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                // SERIALIZED PATH: Hold lock through wait_for_connection.
-                // Only one caller waits for CONNECT at a time until we succeed.
-                match self.wait_for_connection(ws_tx, ws_rx).await {
-                    Ok((sink, stream)) => {
-                        // Success! Server is healthy. Allow concurrent attempts again.
-                        shared
-                            .last_success
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                        retry_state.next_start_millis = now_millis;
-                        return Ok((sink, stream));
+                let delay = (retry_state.next_start_millis - now_millis).max(0);
+
+                // Backoff sleep: if a previous attempt set next_start_millis in the future,
+                // we sleep here. The lock is intentionally held during this sleep to prevent
+                // other callers from bypassing the backoff period.
+                if delay > 0 {
+                    tracing::info!("accept backoff: {} ms", delay);
+                    tokio::time::sleep(time::Duration::from_millis(delay as u64)).await;
+                    now_millis = chrono::Utc::now().timestamp_millis();
+                }
+                // Compute the backoff for the next attempt (in case this one fails).
+                // Exponential backoff: 1.5x the previous delay, clamped to 1-30 seconds.
+                let fail_delay = (delay + (delay >> 1)).clamp(1000, 30000);
+                retry_state.last_start_millis = now_millis;
+                retry_state.next_start_millis = now_millis + fail_delay;
+
+                let (ws_tx, ws_rx) = match self.connect_or_recycle().await {
+                    Ok(conn) => {
+                        tracing::info!(
+                            "got server after {} ms",
+                            chrono::Utc::now().timestamp_millis() - now_millis
+                        );
+                        conn
                     }
                     Err(e) => {
+                        // Connection failed, update retry state
+                        shared
+                            .last_success
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        let connect_delay = chrono::Utc::now().timestamp_millis() - now_millis;
+                        if !e.can_retry_accept() {
+                            tracing::info!(
+                                "Websocket connect failed after {} ms. No retry: {}",
+                                connect_delay,
+                                e
+                            );
+                            return Err(e);
+                        }
+                        tracing::info!(
+                            "Websocket connect failed after {} ms. Retry in {}: {}",
+                            connect_delay,
+                            fail_delay,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                // We now have a fresh WebSocket: either newly connected or recycled with
+                // a RESET message just sent. The server should respond with CONNECT promptly
+                // once a client connects to the tunnel.
+                //
+                // Serialization decision: if the previous attempt failed, we hold the lock
+                // through wait_for_connection() to serialize attempts. If we succeed here,
+                // we signal that the server is healthy (last_success = true) so subsequent
+                // callers can proceed concurrently.
+                if !shared
+                    .last_success
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    // SERIALIZED PATH: Hold lock through wait_for_connection.
+                    // Only one caller waits for CONNECT at a time until we succeed.
+                    tracing::info!("Waiting for connect (blocking)");
+                    match self.wait_for_connection(ws_tx, ws_rx).await {
+                        Ok((sink, stream, client_info)) => {
+                            // Success! Server is healthy. Allow concurrent attempts again.
+                            shared
+                                .last_success
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            retry_state.next_start_millis = now_millis;
+                            return Ok((sink, stream, client_info));
+                        }
+                        Err(e) => {
+                            shared
+                                .last_success
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            if !e.can_retry_accept() {
+                                tracing::info!("tunnel accept failed: {}", &e);
+                                return Err(e);
+                            }
+                            tracing::info!("tunnel accept failed. Will retry: {}", &e);
+                        }
+                    }
+                    continue;
+                }
+                // CONCURRENT PATH: Release lock before the potentially long wait for CONNECT.
+                // Multiple callers can wait on their own WebSocket connections in parallel.
+                retry_state.next_start_millis = now_millis;
+                drop(retry_state);
+                tracing::info!("Waiting for connect (parallel)");
+                match self.wait_for_connection(ws_tx, ws_rx).await {
+                    Ok((sink, stream, client_info)) => {
+                        return Ok((sink, stream, client_info));
+                    }
+                    Err(e) => {
+                        // Failed while in concurrent mode. Mark as failed so the next
+                        // attempt will serialize. Note: we don't hold the lock here,
+                        // so another caller might already be in wait_for_connection.
+                        // That's fine - they'll complete or fail independently.
                         shared
                             .last_success
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -430,32 +488,10 @@ impl TunnelListener {
                         tracing::info!("tunnel accept failed. Will retry: {}", &e);
                     }
                 }
-                continue;
-            }
-            // CONCURRENT PATH: Release lock before the potentially long wait for CONNECT.
-            // Multiple callers can wait on their own WebSocket connections in parallel.
-            retry_state.next_start_millis = now_millis;
-            drop(retry_state);
-            match self.wait_for_connection(ws_tx, ws_rx).await {
-                Ok((sink, stream)) => {
-                    return Ok((sink, stream));
-                }
-                Err(e) => {
-                    // Failed while in concurrent mode. Mark as failed so the next
-                    // attempt will serialize. Note: we don't hold the lock here,
-                    // so another caller might already be in wait_for_connection.
-                    // That's fine - they'll complete or fail independently.
-                    shared
-                        .last_success
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    if !e.can_retry_accept() {
-                        tracing::info!("tunnel accept failed: {}", &e);
-                        return Err(e);
-                    }
-                    tracing::info!("tunnel accept failed. Will retry: {}", &e);
-                }
             }
         }
+        .instrument(tracing::info_span!("tunnel_accept", accept=%trace_id))
+        .await
     }
 
     /// Obtains a WebSocket connection, either by recycling an existing one or creating new.
@@ -521,8 +557,9 @@ impl TunnelListener {
         &self,
         ws_tx: WsRawSink,
         mut ws_rx: WsBaseStream,
-    ) -> Result<(TunnelSink, TunnelStream), TunnelError> {
-        let mut _client_ip: Option<std::net::IpAddr> = None;
+    ) -> Result<(TunnelSink, TunnelStream, TunnelClientInfo), TunnelError> {
+        let mut client_ip: Option<std::net::IpAddr> = None;
+        let mut conn_id: Option<TraceId> = None;
         let shared = self.shared.clone();
         let mut shutdown_rx = shared.shutdown_rx.clone();
         let (ws_tx1, ws_tx2) = BiLock::new(ws_tx);
@@ -543,11 +580,17 @@ impl TunnelListener {
                 result = ws_rx.next() => {
                     match result {
                         Some(Ok(Message::Text(text))) => {
-                            let text_str = text.to_string();
+                            let text_str = text.as_str();
+                            tracing::info!("got text: {}", text_str);
                             // CONNECT message means a client is connecting
                             if text_str.starts_with("CONNECT: ") {
-                                let ip_str = text_str.trim_start_matches("CONNECT:");
-                                _client_ip = ip_str.trim().parse().ok();
+                                let mut connect_parts = text_str.trim_start_matches("CONNECT:").split(',');
+                                if let Some(ip_str) = connect_parts.next() {
+                                    client_ip = ip_str.trim().parse().ok();
+                                    if let Some(id_str) = connect_parts.next() {
+                                        conn_id = Some(id_str.into());
+                                    }
+                                }
                                 break;
                             } else if text_str.starts_with("DROP: ") {
                             }
@@ -555,44 +598,49 @@ impl TunnelListener {
                             // Ignore other text messages
                         },
                         Some(Ok(Message::Binary(_))) => {
+                            tracing::info!("wait failed: unexpected binary");
                             // Unexpected binary data before CONNECT
                             return Err(TunnelError::ProtocolError);
                         },
                         Some(Ok(Message::Close(_))) => {
-                            tracing::debug!("WebSocket closed by server");
+                            tracing::info!("wait failed: close message");
                             return Err(TunnelError::ConnectionClosed);
                         },
                         Some(Ok(_)) => {
                             // Ignore other messages
                         },
                         Some(Err(e)) => {
+                            tracing::info!("wait failed: {}", e);
                             return Err(e.into());
                         },
                         None => {
+                            tracing::info!("wait failed: webSocket closed by server");
                             return Err(TunnelError::ConnectionClosed);
                         }
                     }
                 }
             }
         }
+        let conn_id = conn_id.unwrap_or_else(|| "?".into());
         let (recycle_stream_tx, recycle_stream_rx) = flume::bounded::<TunnelStreamEol>(1);
         let (recycle_sink_tx, recycle_sink_rx) = flume::bounded::<TunnelSinkEol>(1);
         let (stream_interrupt_tx, stream_interrupt_rx) = oneshot::channel();
         let stream = TunnelStream::new(ws_rx, stream_interrupt_rx, recycle_stream_tx);
-        // TODO: _client_ip is parsed from CONNECT messages for future use (e.g., logging, access control)
-        // but is not yet exposed in the public API
         let sink = TunnelSink::new(ws_tx2, recycle_sink_tx);
         let recycle_tx = shared.recycle_tx.clone();
         let shutdown_rx = shared.shutdown_rx.clone();
-        tokio::spawn(Self::connection_task(
-            ws_tx1,
-            recycle_sink_rx,
-            recycle_stream_rx,
-            stream_interrupt_tx,
-            recycle_tx,
-            shutdown_rx,
-        ));
-        Ok((sink, stream))
+        tokio::spawn(
+            Self::connection_task(
+                ws_tx1,
+                recycle_sink_rx,
+                recycle_stream_rx,
+                stream_interrupt_tx,
+                recycle_tx,
+                shutdown_rx,
+            )
+            .instrument(tracing::info_span!("connection", conn = %conn_id)),
+        );
+        Ok((sink, stream, TunnelClientInfo{connection_id: conn_id, ip_addr: client_ip}))
     }
 
     /// Background task that monitors a connection for completion and handles recycling.

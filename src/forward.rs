@@ -83,6 +83,7 @@ pub async fn forward_tunnel_tcp(
     stream: TunnelStream,
     addr: SocketAddr,
 ) -> Result<ForwardStats, TunnelError> {
+    tracing::info!("Forwarding to {}", &addr);
     let local_stream = TcpStream::connect(addr).await.map_err(|e| {
         TunnelError::IoError(format!("Failed to connect to {}: {}", addr, e).into())
     })?;
@@ -201,7 +202,7 @@ where
         match local.read(&mut buf).await {
             Ok(0) => {
                 // EOF from local
-                tracing::debug!("EOF from local service");
+                tracing::info!("EOF from local service");
                 break;
             }
             Ok(n) => {
