@@ -91,13 +91,16 @@ pub mod error;
 pub mod forward;
 pub mod jwt;
 pub mod listener;
-mod trace_id;
+pub mod proc_machines;
+pub mod spsc;
+pub mod trace_id;
+pub mod tunnel_protocol;
 mod tunnel_sink;
 mod tunnel_stream;
 
 pub use error::TunnelError;
 pub use forward::{forward_tunnel, forward_tunnel_tcp, ForwardStats};
 pub use jwt::JwtManager;
-pub use listener::{parse_key, TunnelConfig, TunnelListener, TunnelClientInfo};
+pub use listener::{parse_key, TunnelClientInfo, TunnelConfig, TunnelListener};
 pub use tunnel_sink::TunnelSink;
 pub use tunnel_stream::TunnelStream;
