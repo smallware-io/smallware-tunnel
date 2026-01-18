@@ -258,7 +258,7 @@ struct ProcMachineTask<FUT>
 where
     FUT: Future<Output = TaskEnd> + Send,
 {
-    /// Signal flag: set to `true` by the waker, cleared on poll.
+    /// Set to true by the task's waker
     /// If `false` when we go to poll, the task is considered "idle".
     sig: AtomicBool,
 
@@ -289,38 +289,35 @@ where
     /// # Counter Logic
     ///
     /// - If the task was NOT signaled (idle): increment idle count, reset done count
-    /// - If the task was polled and returned Pending: reset both counts (made progress)
-    /// - If the task was polled and returned Ready: remove it, increment both counts
-    /// - If the task was already done (None): increment both counts
+    /// - If the task WAS signaled (woken): reset both counts (task made progress)
+    /// - If the task has already completed (None): increment both counts
     ///
     /// The outer `tick()` loop uses these counters to detect when all tasks are
     /// idle (idle_count >= num_tasks) or all done (done_count >= num_tasks).
+    ///
+    /// Note: We only poll tasks that were woken. Idle tasks are not polled because
+    /// nothing has changed since their last poll - they would just return Pending again.
     pub fn tick(&self, idle_and_done_count: &mut (u8, u8)) {
-        // Check and clear the signal flag atomically.
-        // If it was false, this task is idle (wasn't woken since last poll).
-        if !self.sig.swap(false, Ordering::SeqCst) {
-            // Task is idle - increment idle count, reset done count
-            // (can't be "done" if we're counting idle)
-            *idle_and_done_count = (idle_and_done_count.0 + 1, 0);
-        }
-
         let mut guard = self.fut.lock().unwrap();
         if let Some((w, f)) = guard.as_mut() {
-            // Task exists and hasn't completed yet - poll it.
-            // SAFETY: We never move the future after init(), so Pin is safe.
-            let pinned = unsafe { std::pin::Pin::new_unchecked(f) };
-            let mut cx = Context::from_waker(&w);
+            // Task exists and hasn't completed yet
+            if self.sig.swap(false, Ordering::SeqCst) {
+                // Waking task - reset counts since we're making progress
+                *idle_and_done_count = (0, 0);
+                // SAFETY: We never move the future after init(), so Pin is safe.
+                let pinned = unsafe { std::pin::Pin::new_unchecked(f) };
+                let mut cx = Context::from_waker(&w);
 
-            if pinned.poll(&mut cx).is_ready() {
-                // Task completed! Remove it from storage.
-                *guard = None;
-            };
-
-            // We polled the task, so reset both counters (we made progress).
-            *idle_and_done_count = (0, 0)
+                if pinned.poll(&mut cx).is_ready() {
+                    // Task completed! Remove it from storage.
+                    *guard = None;
+                }
+            } else {
+                // Task is idle - increment idle count, reset done count
+                *idle_and_done_count = (idle_and_done_count.0 + 1, 0);
+            }
         } else {
-            // Task has already completed (fut is None).
-            // Increment both idle and done counts.
+            //task is done.  inc both counts
             *idle_and_done_count = (idle_and_done_count.0 + 1, idle_and_done_count.1 + 1);
         }
     }
@@ -328,8 +325,11 @@ where
     /// Initialize this task with a waker and future.
     ///
     /// Called once during ProcMachine creation.
+    /// Sets the signal flag so the task will be polled on the first tick.
     pub fn init(&self, w: Waker, f: FUT) {
         self.fut.lock().unwrap().replace((w, f));
+        // Set signal so task gets polled on first tick
+        self.sig.store(true, Ordering::SeqCst);
     }
 
     /// Signal this task to be polled again.

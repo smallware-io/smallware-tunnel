@@ -100,18 +100,13 @@ pub struct YieldOnce {
 impl Future for YieldOnce {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.yielded {
             // We've already yielded once; now we're ready to continue
             Poll::Ready(())
         } else {
             // Mark that we're yielding
             self.yielded = true;
-            // CRUCIAL: Wake the executor so it polls us again!
-            // Without this, the task would be suspended forever since nothing
-            // else would wake it. By calling wake_by_ref(), we ensure the
-            // ProcMachine's `tick()` will poll us again on the next round.
-            cx.waker().wake_by_ref();
             Poll::Pending
         }
     }
@@ -688,8 +683,8 @@ where
                 SpScItemState::Waiting => {
                     // Consumer is ready! Write the item.
                     // Transition: Waiting -> Full
-                    // Note: We update wst to Full so caller knows we succeeded
-                    wst = SpScItemState::Full;
+                    w.set_state(SpScItemState::Full);
+                    wst = SpScItemState::Full; // Update return value
                     *w.timeout_mut() = None; // Clear timeout since write succeeded
                     *w.item_mut() = sender.take(); // Move item from sender to storage
                     true // Notify consumer: we wrote an item
