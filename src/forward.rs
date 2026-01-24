@@ -21,7 +21,7 @@
 //! let local_addr: SocketAddr = "127.0.0.1:8080".parse()?;
 //!
 //! loop {
-//!     let (sink, stream) = listener.accept().await?;
+//!     let (sink, stream, _client_info) = listener.accept().await?;
 //!     tokio::spawn(async move {
 //!         if let Err(e) = forward_tunnel_tcp(sink, stream, local_addr).await {
 //!             eprintln!("Forward error: {}", e);
@@ -163,24 +163,20 @@ where
 {
     let mut total_bytes = 0u64;
 
-    while let Some(result) = tunnel.next().await {
-        match result {
-            Ok(data) => {
-                if data.is_empty() {
-                    // EOF from tunnel
-                    tracing::debug!("EOF from tunnel");
-                    break;
-                }
-                total_bytes += data.len() as u64;
-                if let Err(e) = local.write_all(&data).await {
-                    tracing::warn!(error = %e, "Error writing to local service");
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Error reading from tunnel");
-                break;
-            }
+    while let Some(data) = tunnel.next().await {
+        if data.is_empty() {
+            // EOF from tunnel
+            tracing::debug!("EOF from tunnel");
+            break;
+        }
+        total_bytes += data.len() as u64;
+        if let Err(e) = local.write_all(&data).await {
+            tracing::warn!(error = %e, "Error writing to local service");
+            break;
+        }
+        if let Err(e) = local.flush().await {
+            tracing::warn!(error = %e, "Error flushing to local service");
+            break;
         }
     }
 

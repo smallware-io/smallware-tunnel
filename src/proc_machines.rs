@@ -153,8 +153,8 @@ fn get_multi_waker<T: MultiWake + 'static>(target: &Arc<T>, n: u8) -> Waker {
 /// Returns (real_pointer, task_index).
 fn unpack_multi_waker<T>(ptr: *const ()) -> (*const T, u8) {
     let addr = ptr as usize;
-    let tag = (addr & 0x7) as u8;        // Extract low 3 bits as task index
-    let real_ptr = (addr & !0x7) as *const T;  // Clear low 3 bits to get real address
+    let tag = (addr & 0x7) as u8; // Extract low 3 bits as task index
+    let real_ptr = (addr & !0x7) as *const T; // Clear low 3 bits to get real address
     (real_ptr, tag)
 }
 
@@ -165,10 +165,10 @@ fn unpack_multi_waker<T>(ptr: *const ()) -> (*const T, u8) {
 /// The vtable defines how to clone, wake, and drop the waker.
 fn multi_waker_vtable<T: MultiWake + 'static>() -> &'static RawWakerVTable {
     &RawWakerVTable::new(
-        multi_waker_clone_raw::<T>,      // clone
-        multi_wake_raw::<T>,             // wake (consumes waker)
-        multi_wake_by_ref_raw::<T>,      // wake_by_ref (doesn't consume)
-        multi_waker_drop_raw::<T>,       // drop
+        multi_waker_clone_raw::<T>, // clone
+        multi_wake_raw::<T>,        // wake (consumes waker)
+        multi_wake_by_ref_raw::<T>, // wake_by_ref (doesn't consume)
+        multi_waker_drop_raw::<T>,  // drop
     )
 }
 
@@ -955,7 +955,6 @@ where
     d: ProcMachineTask<D>,
 }
 
-
 impl<A, B, C, D> std::fmt::Debug for ProcMachine4<A, B, C, D>
 where
     A: Future<Output = TaskEnd> + Send + 'static,
@@ -1226,7 +1225,6 @@ where
 {
     a: ProcMachineTask<A>,
 }
-
 
 impl<A> std::fmt::Debug for ProcMachine1<A>
 where

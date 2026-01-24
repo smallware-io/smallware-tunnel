@@ -37,7 +37,7 @@ use clap::Parser;
 use smallware_tunnel::{forward_tunnel_tcp, TunnelConfig, TunnelError, TunnelListener};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use tracing::{Instrument, Level, error, info, warn};
+use tracing::{error, info, warn, Instrument, Level};
 
 /// Smallware Tunnel CLI - Expose local services through secure tunnels
 #[derive(Parser, Debug)]
@@ -145,20 +145,23 @@ async fn main() -> Result<()> {
         match listener.accept().await {
             Ok((sink, stream, client_info)) => {
                 // Spawn a task to handle this connection
-                tokio::spawn(async move {
-                    match forward_tunnel_tcp(sink, stream, local_addr).await {
-                        Ok(stats) => {
-                            info!(
-                                downloaded = stats.bytes_downloaded,
-                                uploaded = stats.bytes_uploaded,
-                                "Connection completed"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Connection handler error");
+                tokio::spawn(
+                    async move {
+                        match forward_tunnel_tcp(sink, stream, local_addr).await {
+                            Ok(stats) => {
+                                info!(
+                                    downloaded = stats.bytes_downloaded,
+                                    uploaded = stats.bytes_uploaded,
+                                    "Connection completed"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Connection handler error");
+                            }
                         }
                     }
-                }.instrument(tracing::info_span!("proxy", connid=%client_info.connection_id)));
+                    .instrument(tracing::info_span!("proxy", connid=%client_info.connection_id)),
+                );
             }
             Err(TunnelError::ListenerClosed) => {
                 info!("Tunnel listener closed");

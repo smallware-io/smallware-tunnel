@@ -75,6 +75,7 @@
 // ============================================================================
 
 use coarsetime::Instant;
+use futures::pin_mut;
 use std::{
     fmt,
     future::{poll_fn, Future},
@@ -141,6 +142,35 @@ pub fn yield_once() -> YieldOnce {
     YieldOnce { yielded: false }
 }
 
+pub trait SpScFutureExt<F>
+where
+    F: Future,
+{
+    type Output;
+    fn just_poll(self: Self, cx: &mut Context<'_>) -> Poll<Self::Output>;
+}
+
+impl<F> SpScFutureExt<F> for F
+where
+    F: Future,
+{
+    type Output = F::Output;
+
+    #[inline]
+    fn just_poll(self: Self, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let fut = self;
+        pin_mut!(fut);
+        fut.poll(cx)
+    }
+}
+
+#[inline]
+pub async fn with_context<RET, F: FnMut(&mut Context<'_>) -> RET>(mut f: F) -> RET {
+    poll_fn(|cx|{
+        Poll::Ready(f(cx))
+    }).await
+}
+
 // ============================================================================
 // ACCESSOR
 // ============================================================================
@@ -186,7 +216,10 @@ pub fn yield_once() -> YieldOnce {
 /// [`SpScMutex`] is the standard implementation, using a `std::sync::Mutex` to
 /// protect the inner data. This allows the producer and consumer to run in
 /// different threads.
-pub trait SpScAccessor<T> {
+pub trait SpScAccessor {
+    /// The inner data type protected by this accessor.
+    type Inner;
+
     /// Access the inner data as the "producer" (read-write).
     ///
     /// 1. Registers the producer's waker from the current async context
@@ -197,7 +230,7 @@ pub trait SpScAccessor<T> {
     ///
     /// - `true`: You made a change the consumer should see (e.g., wrote new data)
     /// - `false`: No notification needed (e.g., just checked state)
-    fn p<F: FnMut(&mut T) -> bool>(&self, proc: F) -> impl Future<Output = ()>;
+    fn p<F: FnMut(&mut Self::Inner) -> bool>(&self, proc: F) -> impl Future<Output = ()>;
 
     /// Access the inner data as the "producer" (read-only).
     ///
@@ -206,7 +239,10 @@ pub trait SpScAccessor<T> {
     /// 3. Returns whatever `proc` returns
     ///
     /// This method never notifies the consumer since it's read-only.
-    fn p_get<RET, F: FnMut(&T) -> RET>(&self, proc: F) -> impl std::future::Future<Output = RET>;
+    fn p_get<RET, F: FnMut(&Self::Inner) -> RET>(
+        &self,
+        proc: F,
+    ) -> impl std::future::Future<Output = RET>;
 
     /// Access the inner data as the "consumer" (read-write).
     ///
@@ -218,7 +254,10 @@ pub trait SpScAccessor<T> {
     ///
     /// - `true`: You made a change the producer should see (e.g., consumed data)
     /// - `false`: No notification needed (e.g., just checked state)
-    fn c<F: FnMut(&mut T) -> bool>(&self, proc: F) -> impl std::future::Future<Output = ()>;
+    fn c<F: FnMut(&mut Self::Inner) -> bool>(
+        &self,
+        proc: F,
+    ) -> impl std::future::Future<Output = ()>;
 
     /// Access the inner data as the "consumer" (read-only).
     ///
@@ -227,7 +266,10 @@ pub trait SpScAccessor<T> {
     /// 3. Returns whatever `proc` returns
     ///
     /// This method never notifies the producer since it's read-only.
-    fn c_get<RET, F: FnMut(&T) -> RET>(&self, proc: F) -> impl std::future::Future<Output = RET>;
+    fn c_get<RET, F: FnMut(&Self::Inner) -> RET>(
+        &self,
+        proc: F,
+    ) -> impl std::future::Future<Output = RET>;
 
     /// Access the inner data from outside the producer/consumer relationship.
     ///
@@ -236,7 +278,7 @@ pub trait SpScAccessor<T> {
     ///
     /// - Does NOT register any waker (this is not an async method)
     /// - If `proc` returns `true`, wakes BOTH producer and consumer
-    fn side_check<F: FnMut(&mut T) -> bool>(&self, proc: F);
+    fn side_check<F: FnMut(&mut Self::Inner) -> bool>(&self, proc: F);
 }
 
 /// An [`SpScAccessor`] that protects the inner data with a `std::sync::Mutex`.
@@ -286,7 +328,9 @@ impl<T> SpScMutex<T> {
     }
 }
 
-impl<T> SpScAccessor<T> for SpScMutex<T> {
+impl<T> SpScAccessor for SpScMutex<T> {
+    type Inner = T;
+
     #[inline]
     async fn p<F: FnMut(&mut T) -> bool>(&self, mut proc: F) {
         // We use poll_fn to get access to the async Context (which contains the waker).
@@ -535,7 +579,7 @@ pub trait SpScItemInner<T> {
 ///     }
 /// }
 /// ```
-pub trait SpScItem<INNER, T> {
+pub trait SpScItem<T> {
     /// Try to read an item from the exchange (consumer side).
     ///
     /// # State Transitions
@@ -552,6 +596,22 @@ pub trait SpScItem<INNER, T> {
     fn c_try_read(
         &self,
         receiver: &mut Option<T>,
+        timeout: Option<Instant>,
+    ) -> impl std::future::Future<Output = SpScItemState>;
+
+    /// Check to see if an item can be readfrom the exchange (consumer side).
+    ///
+    /// # State Transitions
+    ///
+    /// - `Busy` → `Waiting`: Consumer signals it's ready for the next item
+    /// - Other: No change 
+    ///
+    /// # Returns
+    ///
+    /// The resulting state after the operation. Check for `Full` to see if
+    /// an item can be read
+    fn c_check_read(
+        &self,
         timeout: Option<Instant>,
     ) -> impl std::future::Future<Output = SpScItemState>;
 
@@ -574,6 +634,53 @@ pub trait SpScItem<INNER, T> {
         sender: &mut Option<T>,
         timeout: Option<Instant>,
     ) -> impl std::future::Future<Output = SpScItemState>;
+
+    /// Check to see if the exchange can accept an item.
+    /// 
+    /// This just registers the caller's waker, adjusts the timeout if necessary,
+    /// and returns the current state
+    fn p_check_write(
+        &self,
+        timeout: Option<Instant>,
+    ) -> impl std::future::Future<Output = SpScItemState>;
+
+    /// Try to write an item into the exchange as a side task
+    ///
+    /// This is like p_try_write, but it's not async and it doesn't
+    /// arrange for the caller to be notified when the stream unblocks.
+    ///
+    /// # State Transitions
+    ///
+    /// - `Waiting` → `Full`: Item is transferred from `sender`, producer notified
+    /// - `Full` → returns `Busy`: Can't write, previous item not consumed yet
+    /// - `Busy` → returns `Busy`: Consumer is processing, can't write yet
+    /// - `Closed`/`Failed`: No change
+    ///
+    /// # Returns
+    ///
+    /// - `Full`: Item was successfully written
+    /// - `Busy`: Consumer hasn't consumed the previous item yet (or is processing)
+    /// - `Closed`/`Failed`: Channel is closed
+    fn side_try_write(&self, sender: &mut Option<T>, timeout: Option<Instant>) -> SpScItemState;
+
+    /// Try to read an item from the exchange as a side task
+    ///
+    /// This is like c_try_read, but it's not async and it doesn't
+    /// arrange for the caller to be notified when an item arrives.
+    ///
+    /// # State Transitions
+    ///
+    /// - `Full` → `Busy`: Item is moved to receiver, producer notified
+    /// - `Busy` → returns `Busy`: Already processing
+    /// - `Waiting` → returns `Waiting`: No item available yet
+    /// - `Closed`/`Failed`: No change
+    ///
+    /// # Returns
+    ///
+    /// - `Busy`: Item was successfully read into receiver
+    /// - `Waiting`: No item available
+    /// - `Closed`/`Failed`: Channel is closed
+    fn side_try_read(&self, receiver: &mut Option<T>, timeout: Option<Instant>) -> SpScItemState;
 
     /// Try to flush any pending item (producer side).
     ///
@@ -611,10 +718,10 @@ pub trait SpScItem<INNER, T> {
 
 // Blanket implementation of SpScItem for any SpScAccessor over SpScItemInner.
 // This is where the actual state machine logic lives.
-impl<INNER, T, ACC> SpScItem<INNER, T> for ACC
+impl<T, ACC> SpScItem<T> for ACC
 where
-    INNER: SpScItemInner<T>,
-    ACC: SpScAccessor<INNER>,
+    ACC: SpScAccessor,
+    ACC::Inner: SpScItemInner<T>,
 {
     #[inline]
     async fn c_try_read(
@@ -662,6 +769,41 @@ where
     }
 
     #[inline]
+    async fn c_check_read(
+        &self,
+        timeout: Option<Instant>,
+    ) -> SpScItemState {
+        let mut rst = SpScItemState::Failed;
+        self.c(|r| {
+            // The closure returns true if we made a change the producer should see
+            let changed = match r.get_state() {
+                SpScItemState::Busy => {
+                    // Consumer finished processing, now ready for next item.
+                    // Transition: Busy -> Waiting
+                    r.set_state(SpScItemState::Waiting);
+                    *r.timeout_mut() = timeout;
+                    true // Notify producer: we're ready for more
+                }
+                SpScItemState::Waiting => {
+                    // Already waiting. Just update timeout if it changed.
+                    let tr = r.timeout_mut();
+                    if *tr != timeout {
+                        *tr = timeout;
+                        true // Timeout changed, notify producer
+                    } else {
+                        false // No change
+                    }
+                }
+                _ => false,
+            };
+            rst = r.get_state();
+            changed
+        })
+        .await;
+        rst
+    }
+
+    #[inline]
     async fn p_try_write(&self, sender: &mut Option<T>, timeout: Option<Instant>) -> SpScItemState {
         let mut wst = SpScItemState::Failed;
         self.p(|w| {
@@ -700,6 +842,107 @@ where
         })
         .await;
         wst
+    }
+    #[inline]
+
+    async fn p_check_write(&self, timeout: Option<Instant>) -> SpScItemState {
+        let mut wst = SpScItemState::Failed;
+        self.p(|w| {
+            wst = w.get_state();
+            match wst {
+                SpScItemState::Busy| SpScItemState::Full=> {
+                    // Consumer is busy processing. We can't write yet.
+                    // Just update the timeout if it changed.
+                    let tr = w.timeout_mut();
+                    if *tr != timeout {
+                        *tr = timeout;
+                        true // Timeout changed, notify consumer
+                    } else {
+                        false // No change
+                    }
+                }
+                // Terminal states: no change
+                SpScItemState::Failed | SpScItemState::Closed | SpScItemState::Waiting=> false,
+            }
+        })
+        .await;
+        wst
+    }
+
+
+    #[inline]
+    fn side_try_write(&self, sender: &mut Option<T>, timeout: Option<Instant>) -> SpScItemState {
+        let mut wst = SpScItemState::Failed;
+        self.side_check(|w| {
+            wst = w.get_state();
+            match wst {
+                SpScItemState::Busy => {
+                    // Consumer is busy processing. We can't write yet.
+                    // Just update the timeout if it changed.
+                    let tr = w.timeout_mut();
+                    if *tr != timeout {
+                        *tr = timeout;
+                        true // Timeout changed, notify consumer
+                    } else {
+                        false // No change
+                    }
+                }
+                // Terminal states: no change
+                SpScItemState::Failed | SpScItemState::Closed => false,
+                SpScItemState::Waiting => {
+                    // Consumer is ready! Write the item.
+                    // Transition: Waiting -> Full
+                    w.set_state(SpScItemState::Full);
+                    wst = SpScItemState::Full; // Update return value
+                    *w.timeout_mut() = None; // Clear timeout since write succeeded
+                    *w.item_mut() = sender.take(); // Move item from sender to storage
+                    true // Notify consumer: we wrote an item
+                }
+                SpScItemState::Full => {
+                    // Consumer hasn't taken the previous item yet.
+                    // Report as Busy (we can't write) but set up timeout.
+                    wst = SpScItemState::Busy; // Lie to caller: report as Busy
+                    *w.timeout_mut() = timeout;
+                    false // Don't notify (nothing changed)
+                }
+            }
+        });
+        wst
+    }
+
+    #[inline]
+    fn side_try_read(&self, receiver: &mut Option<T>, timeout: Option<Instant>) -> SpScItemState {
+        let mut rst = SpScItemState::Failed;
+        self.side_check(|r| {
+            rst = r.get_state();
+            match rst {
+                SpScItemState::Waiting => {
+                    // No item available yet
+                    let tr = r.timeout_mut();
+                    if *tr != timeout {
+                        *tr = timeout;
+                        true // Timeout changed, notify producer
+                    } else {
+                        false // No change
+                    }
+                }
+                // Terminal states: no change
+                SpScItemState::Failed | SpScItemState::Closed => false,
+                SpScItemState::Full => {
+                    // Item is available! Read it.
+                    // Transition: Full -> Busy
+                    r.set_state(SpScItemState::Busy);
+                    rst = SpScItemState::Busy; // Update return value
+                    *receiver = r.item_mut().take(); // Move item from storage to receiver
+                    true // Notify producer: we took the item
+                }
+                SpScItemState::Busy => {
+                    // Already processing. Report as Busy.
+                    false // No change
+                }
+            }
+        });
+        rst
     }
 
     #[inline]

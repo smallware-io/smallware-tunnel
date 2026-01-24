@@ -47,11 +47,13 @@
 //!     // Accept incoming connections
 //!     loop {
 //!         match listener.accept().await {
-//!             Ok((sink, stream)) => {
+//!             Ok((sink, stream, client_info)) => {
+//!                 println!("Client connected: {:?}", client_info);
 //!                 tokio::spawn(async move {
-//!                     // `stream` implements futures::Stream<Item = Result<Bytes, TunnelError>>
+//!                     // `stream` implements futures::Stream<Item = Bytes>
 //!                     // `sink` implements futures::Sink<Bytes, Error = TunnelError>
 //!                     // Use them for bidirectional communication
+//!                     let _ = (sink, stream);
 //!                 });
 //!             }
 //!             Err(TunnelError::ListenerClosed) => break,
@@ -86,21 +88,20 @@
 //! - A new token is generated when the current one has less than 15 minutes remaining
 //! - The customer ID is extracted from the domain name
 
-mod bilock_ext;
 pub mod error;
 pub mod forward;
 pub mod jwt;
 pub mod listener;
 pub mod proc_machines;
+mod scitemstream;
+mod spitemsink;
 pub mod spsc;
 pub mod trace_id;
 pub mod tunnel_protocol;
-mod tunnel_sink;
-mod tunnel_stream;
 
 pub use error::TunnelError;
 pub use forward::{forward_tunnel, forward_tunnel_tcp, ForwardStats};
 pub use jwt::JwtManager;
-pub use listener::{parse_key, TunnelClientInfo, TunnelConfig, TunnelListener};
-pub use tunnel_sink::TunnelSink;
-pub use tunnel_stream::TunnelStream;
+pub use listener::{
+    parse_key, TunnelClientInfo, TunnelConfig, TunnelListener, TunnelSink, TunnelStream,
+};

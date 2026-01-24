@@ -712,6 +712,28 @@ impl TunnelProtocol {
         self.io.update_clock(now);
         self.pm.tick()
     }
+
+    /// Returns a reference to the upload input channel (app → protocol).
+    ///
+    /// This is used by TunnelSink to write data.
+    pub fn up_in(&self) -> &SpScMutex<SimpleSpScItemInner<Bytes>> {
+        &self.io.up_in
+    }
+
+    /// Returns a reference to the download output channel (protocol → app).
+    ///
+    /// This is used by TunnelStream to read data.
+    pub fn down_out(&self) -> &SpScMutex<SimpleSpScItemInner<Bytes>> {
+        &self.io.down_out
+    }
+}
+
+/// Implement ProcMachine for TunnelProtocol so it can be used with SpScItemSink/Stream.
+impl ProcMachine for TunnelProtocol {
+    fn tick(&self) -> bool {
+        self.io.update_clock(Instant::now());
+        self.pm.tick()
+    }
 }
 
 // ============================================================================

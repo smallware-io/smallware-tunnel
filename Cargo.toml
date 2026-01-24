@@ -8,6 +8,10 @@ keywords = ["tunnel", "websocket", "proxy", "smallware"]
 categories = ["network-programming", "development-tools"]
 repository = "https://github.com/smallware-io/smallware-tunnel"
 
+[profile.dev]
+opt-level = 0
+debug = true
+
 [lib]
 name = "smallware_tunnel"
 path = "src/lib.rs"
