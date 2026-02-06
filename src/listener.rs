@@ -29,13 +29,12 @@ use crate::jwt::{extract_customer_id, JwtManager};
 use crate::scitemstream::ScItemStream;
 use crate::spitemsink::SpItemSink;
 use crate::spsc::{
-    SimpleSpScItemInner, SpScItem, SpScItemState, SpScMutex, with_context, yield_once
+    with_context, yield_once, SimpleSpScItemInner, SpScItem, SpScItemState, SpScMutex,
 };
 use crate::trace_id::{next_trace_id, TraceId};
 use crate::tunnel_protocol::TunnelProtocol;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use tokio::time;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -44,6 +43,7 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
+use tokio::time;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::Instrument;
@@ -63,7 +63,7 @@ const DEFAULT_SERVER_URL: &str = "wss://api.smallware.io/tunnels";
 /// Configuration for the tunnel listener.
 ///
 /// This struct holds all the settings needed to establish and maintain
-/// tunnel connections.
+/// tunnel connections, except for authentication (handled by [`JwtManager`]).
 ///
 /// # Construction
 ///
@@ -75,8 +75,7 @@ const DEFAULT_SERVER_URL: &str = "wss://api.smallware.io/tunnels";
 ///
 /// // Key format: <keyid>.<secret>
 /// // The keyid may contain '.' characters, but the secret cannot.
-/// let config = TunnelConfig::new("my-key-id.secret123", "domain.t00.smallware.io")?;
-/// # Ok::<(), smallware_tunnel::TunnelError>(())
+/// let config = TunnelConfig::new("domain.t00.smallware.io".to_string());
 /// ```
 ///
 /// # Stability
@@ -87,12 +86,6 @@ const DEFAULT_SERVER_URL: &str = "wss://api.smallware.io/tunnels";
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TunnelConfig {
-    /// The API key (secret) used to sign JWT tokens
-    pub key_secret: String,
-
-    /// The key ID for JWT signing
-    pub key_id: String,
-
     /// The full tunnel domain name
     /// Format: `<service>-<random>-<customer>.<shard>.smallware.io`
     pub domain: String,
@@ -132,35 +125,13 @@ impl TunnelConfig {
     ///
     /// # Arguments
     ///
-    /// * `key` - The API key in the format `<keyid>.<secret>`.
-    ///           The key ID may contain `.` characters, but the secret cannot.
     /// * `domain` - The full tunnel domain name
-    ///
-    /// # Errors
-    ///
-    /// Returns `TunnelError::InvalidKeyFormat` if the key doesn't contain a `.`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use smallware_tunnel::TunnelConfig;
-    ///
-    /// // Simple key ID
-    /// let config = TunnelConfig::new("mykey.secret123", "domain.t00.smallware.io")?;
-    ///
-    /// // Key ID with dots
-    /// let config = TunnelConfig::new("org.team.mykey.secret123", "domain.t00.smallware.io")?;
-    /// # Ok::<(), smallware_tunnel::TunnelError>(())
-    /// ```
-    pub fn new(key: &str, domain: &str) -> Result<Self, TunnelError> {
-        let (key_id, secret) = parse_key(key)?;
-        Ok(Self {
-            key_secret: secret.to_string(),
-            key_id: key_id.to_string(),
-            domain: domain.to_string(),
+    pub fn new(domain: String) -> Self {
+        Self {
+            domain: domain,
             server_url: DEFAULT_SERVER_URL.to_string(),
             trust_ca: None,
-        })
+        }
     }
 
     /// Sets a custom server URL.
@@ -201,26 +172,8 @@ struct RecycledConnection {
 /// `TunnelListener` manages WebSocket connections to the tunnel server and
 /// accepts incoming connections from remote clients. It supports multiple
 /// concurrent connections and automatic connection recycling.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use smallware_tunnel::{TunnelConfig, TunnelListener};
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// // Key format: <keyid>.<secret>
-/// let config = TunnelConfig::new("mykey.secret123", "my-tunnel.t00.smallware.io")?;
-/// let listener = TunnelListener::new(config)?;
-///
-/// loop {
-///     let (sink, stream, _client_info) = listener.accept().await?;
-///     tokio::spawn(async move {
-///         // Handle the connection using sink and stream
-///         let _ = (sink, stream);
-///     });
-/// }
-/// # }
-/// ```
+
+#[derive(Clone, Debug)]
 pub struct TunnelListener {
     shared: Arc<ListenerShared>,
 }
@@ -233,9 +186,10 @@ pub struct TunnelClientInfo {
     pub connection_id: TraceId,
 }
 
+#[derive(Debug)]
 struct ListenerShared {
+    auth: Arc<JwtManager>,
     config: TunnelConfig,
-    jwt_manager: JwtManager,
     /// Rendezvous channel sink to recycle connections
     recycle_tx: flume::Sender<RecycledConnection>,
     /// Rendezvous channel source to receive recycled connections
@@ -274,6 +228,7 @@ struct ListenerShared {
 }
 
 /// Shared state for retry timing across concurrent `accept()` calls.
+#[derive(Clone, Debug)]
 struct RetryState {
     /// Timestamp when the last connection attempt started (for debugging/metrics).
     last_start_millis: i64,
@@ -294,14 +249,7 @@ impl TunnelListener {
     ///
     /// Returns an error if the domain format is invalid and the customer ID
     /// cannot be extracted.
-    pub fn new(config: TunnelConfig) -> Result<Self, TunnelError> {
-        // Validate configuration by extracting the customer ID from the domain
-        let customer_id = config.customer_id()?;
-        let jwt_manager = JwtManager::new(
-            config.key_secret.clone(),
-            customer_id,
-            config.key_id.clone(),
-        );
+    pub fn new(auth: Arc<JwtManager>, config: TunnelConfig) -> Self {
         // Rendezvous channel (capacity 0) for recycling WebSocket connections.
         // When a tunnel session completes successfully, `connection_task` offers the
         // WebSocket for reuse. The zero capacity ensures the handoff is synchronous:
@@ -309,8 +257,8 @@ impl TunnelListener {
         let (recycle_tx, recycle_rx) = flume::bounded::<RecycledConnection>(0);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shared: ListenerShared = ListenerShared {
+            auth,
             config,
-            jwt_manager,
             recycle_tx,
             recycle_rx,
             shutdown_tx,
@@ -324,9 +272,9 @@ impl TunnelListener {
 
         // Create the JWT manager
 
-        Ok(Self {
+        Self {
             shared: Arc::new(shared),
-        })
+        }
     }
 
     /// Shuts down the listener.  Existing proxy connections will
@@ -534,7 +482,7 @@ impl TunnelListener {
             (ws_tx, recycled.ws_rx)
         } else {
             // No recycled connection available, create a new one
-            let token = shared.jwt_manager.get_token()?;
+            let token = shared.auth.get_token()?;
             // Build the WebSocket URL
             let ws_url = format!("{}/{}", shared.config.server_url, shared.config.domain);
 
@@ -705,11 +653,11 @@ impl TunnelListener {
 
             if up_open {
                 match poll_transfer_up(&mut ws_tx, &c_item).await {
-                    Poll::Pending => {},
+                    Poll::Pending => {}
                     Poll::Ready(Err(SpScItemState::Closed)) => {
                         up_open = false;
                     }
-                    Poll::Ready(res) =>{
+                    Poll::Ready(res) => {
                         if res.is_err() {
                             got_err = true;
                             up_open = false;
@@ -724,11 +672,11 @@ impl TunnelListener {
             }
             if down_open {
                 match poll_transfer_down(&mut ws_rx, &p_item).await {
-                    Poll::Pending => {},
+                    Poll::Pending => {}
                     Poll::Ready(Err(SpScItemState::Closed)) => {
                         down_open = false;
                     }
-                    Poll::Ready(res) =>{
+                    Poll::Ready(res) => {
                         if res.is_err() {
                             down_open = false;
                             got_err = true;
@@ -741,8 +689,8 @@ impl TunnelListener {
 
             if up_open && now - last_ping > coarsetime::Duration::from_secs(60) {
                 match poll_transfer_ping(&mut ws_tx).await {
-                    Poll::Pending => {},
-                    Poll::Ready(res) =>{
+                    Poll::Pending => {}
+                    Poll::Ready(res) => {
                         if res.is_err() {
                             up_open = false;
                             got_err = true;
@@ -757,7 +705,7 @@ impl TunnelListener {
             }
             if need_flush && !did_something {
                 match poll_transfer_flush(&mut ws_tx).await {
-                    Poll::Pending => {},
+                    Poll::Pending => {}
                     Poll::Ready(Ok(_)) => {
                         need_flush = false;
                     }
@@ -791,7 +739,6 @@ impl TunnelListener {
             _ = time::sleep(time::Duration::from_secs(5)) => {}
             _ = util_shutdown(&mut shutdown_rx) => {}
         }
-    
     }
 }
 
@@ -811,7 +758,7 @@ async fn poll_transfer_up(
         Poll::Ready(Err(_)) => {
             c_item.close();
             tracing::error!("Websocket write failed");
-            return Poll::Ready(Err(rst))
+            return Poll::Ready(Err(rst));
         }
         Poll::Ready(Ok(_)) => {}
     };
@@ -839,15 +786,13 @@ async fn poll_transfer_up(
     Poll::Ready(Ok(()))
 }
 
-async fn poll_transfer_ping(
-    ws_tx: &mut WsRawSink,
-) -> Poll<Result<(), ()>> {
+async fn poll_transfer_ping(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
     let ready = with_context(|cx| ws_tx.poll_ready_unpin(cx)).await;
     match ready {
         Poll::Pending => return Poll::Pending,
         Poll::Ready(Err(_)) => {
             tracing::error!("Websocket write failed");
-            return Poll::Ready(Err(()))
+            return Poll::Ready(Err(()));
         }
         Poll::Ready(Ok(_)) => {}
     };
@@ -860,15 +805,13 @@ async fn poll_transfer_ping(
     Poll::Ready(Ok(()))
 }
 
-async fn poll_transfer_flush(
-    ws_tx: &mut WsRawSink,
-) -> Poll<Result<(), ()>> {
+async fn poll_transfer_flush(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
     let ready = with_context(|cx| ws_tx.poll_flush_unpin(cx)).await;
     match ready {
         Poll::Pending => return Poll::Pending,
         Poll::Ready(Err(_)) => {
             tracing::error!("Websocket flush failed");
-            return Poll::Ready(Err(()))
+            return Poll::Ready(Err(()));
         }
         Poll::Ready(Ok(_)) => {}
     };
@@ -876,13 +819,16 @@ async fn poll_transfer_flush(
     Poll::Ready(Ok(()))
 }
 
-async fn poll_transfer_down(ws_rx: &mut WsBaseStream, p_item: &SpScMutex<SimpleSpScItemInner<Message>>) -> Poll<Result<(), SpScItemState>> {
+async fn poll_transfer_down(
+    ws_rx: &mut WsBaseStream,
+    p_item: &SpScMutex<SimpleSpScItemInner<Message>>,
+) -> Poll<Result<(), SpScItemState>> {
     let wst = p_item.p_check_write(None).await;
     match wst {
-        SpScItemState::Waiting => {},
+        SpScItemState::Waiting => {}
         SpScItemState::Busy => return Poll::Pending,
         SpScItemState::Full => return Poll::Pending,
-        SpScItemState::Closed | SpScItemState::Failed => return Poll::Ready(Err(wst))
+        SpScItemState::Closed | SpScItemState::Failed => return Poll::Ready(Err(wst)),
     }
     let ready = with_context(|cx| ws_rx.poll_next_unpin(cx)).await;
     let mut sender = match ready {
@@ -890,15 +836,15 @@ async fn poll_transfer_down(ws_rx: &mut WsBaseStream, p_item: &SpScMutex<SimpleS
         Poll::Ready(Some(Err(_))) => {
             p_item.close();
             tracing::error!("Websocket read failed");
-            return Poll::Ready(Err(wst))
+            return Poll::Ready(Err(wst));
         }
         Poll::Ready(None) => {
             // web socket EOF
             p_item.close();
             tracing::error!("Websocket read EOF");
-            return Poll::Ready(Err(wst))
+            return Poll::Ready(Err(wst));
         }
-        Poll::Ready(Some(Ok(data))) => Some(data)
+        Poll::Ready(Some(Ok(data))) => Some(data),
     };
     tracing::debug!("WS DOWN: {:.100?}", &sender);
     match p_item.p_try_write(&mut sender, None).await {
@@ -906,7 +852,7 @@ async fn poll_transfer_down(ws_rx: &mut WsBaseStream, p_item: &SpScMutex<SimpleS
         _ => {
             tracing::error!("Can't write after successful check");
             p_item.close();
-            return Poll::Ready(Err(wst))
+            return Poll::Ready(Err(wst));
         }
     };
     Poll::Ready(Ok(()))
@@ -1058,42 +1004,24 @@ mod tests {
 
     #[test]
     fn test_config_new() {
-        let config = TunnelConfig::new("mykey.secret123", "www-abc-xyz.t00.smallware.io").unwrap();
+        let auth = Arc::new(JwtManager::new(
+            "xyz".to_string(),
+            "mykey".to_string(),
+            "secret123".to_string(),
+        ));
+        let config = TunnelConfig::new("www-abc-xyz.t00.smallware.io".to_string());
 
-        assert_eq!(config.key_secret, "secret123");
-        assert_eq!(config.key_id, "mykey");
         assert_eq!(config.domain, "www-abc-xyz.t00.smallware.io");
+        assert_eq!(config.customer_id().unwrap(), auth.customer_id());
+        assert_eq!(config.customer_id().unwrap(), "xyz");
         assert_eq!(config.server_url, DEFAULT_SERVER_URL);
     }
 
     #[test]
-    fn test_config_with_dotted_keyid() {
-        let config =
-            TunnelConfig::new("org.team.key.secret456", "www-abc-xyz.t00.smallware.io").unwrap();
-
-        assert_eq!(config.key_id, "org.team.key");
-        assert_eq!(config.key_secret, "secret456");
-    }
-
-    #[test]
     fn test_config_with_options() {
-        let config = TunnelConfig::new("mykey.secret123", "www-abc-xyz.t00.smallware.io")
-            .unwrap()
+        let config = TunnelConfig::new("www-abc-xyz.t00.smallware.io".to_string())
             .with_server_url("wss://test.example.com/tunnels".to_string());
 
-        assert_eq!(config.key_id, "mykey");
         assert_eq!(config.server_url, "wss://test.example.com/tunnels");
-    }
-
-    #[test]
-    fn test_config_customer_id() {
-        let config = TunnelConfig::new("key.secret", "www-abc-xyz.t00.smallware.io").unwrap();
-        assert_eq!(config.customer_id().unwrap(), "xyz");
-    }
-
-    #[test]
-    fn test_config_invalid_key() {
-        let result = TunnelConfig::new("invalid-no-dot", "www-abc-xyz.t00.smallware.io");
-        assert!(result.is_err());
     }
 }

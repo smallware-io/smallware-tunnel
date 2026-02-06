@@ -34,9 +34,9 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use smallware_tunnel::{forward_tunnel_tcp, TunnelConfig, TunnelError, TunnelListener};
-use std::net::SocketAddr;
+use smallware_tunnel::{forward_tunnel_tcp, JwtManager, TunnelConfig, TunnelError, TunnelListener};
 use std::path::PathBuf;
+use std::{net::SocketAddr, sync::Arc};
 use tracing::{error, info, warn, Instrument, Level};
 
 /// Smallware Tunnel CLI - Expose local services through secure tunnels
@@ -107,9 +107,12 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    let auth = JwtManager::from_access_key(&args.key)
+        .map_err(|_| anyhow::Error::msg("Malformed access key"))?;
+    let auth = Arc::new(auth);
+
     // Build the tunnel configuration
-    let mut config = TunnelConfig::new(&args.key, &args.domain)
-        .context("Invalid API key format. Expected '<keyid>.<secret>'")?;
+    let mut config = TunnelConfig::new(args.domain.clone());
 
     if let Some(server_url) = args.server {
         config = config.with_server_url(server_url);
@@ -133,7 +136,7 @@ async fn main() -> Result<()> {
     );
 
     // Create the tunnel listener
-    let listener = TunnelListener::new(config).context("Failed to create tunnel listener")?;
+    let listener = TunnelListener::new(auth, config);
 
     info!(
         "Tunnel active! Requests to https://{} will be forwarded to {}",

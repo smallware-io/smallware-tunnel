@@ -89,6 +89,7 @@ struct CachedToken {
 /// // Get a valid token (generates new one if needed)
 /// let token = manager.get_token().expect("Failed to generate token");
 /// ```
+#[derive(Debug)]
 pub struct JwtManager {
     /// The API key (secret) used to sign tokens
     secret: String,
@@ -108,19 +109,30 @@ impl JwtManager {
     ///
     /// # Arguments
     ///
-    /// * `secret` - The API key (secret) used to sign tokens. This must match
-    ///   the key stored in the server's database for the customer.
     /// * `customer_id` - The customer ID to include in the `sub` claim.
     ///   This is typically extracted from the tunnel domain.
     /// * `key_id` - The key ID (`kid`) to include in the JWT header.
     ///   This identifies which key the server should use for verification.
-    pub fn new(secret: String, customer_id: String, key_id: String) -> Self {
+    /// * `secret` - The API key (secret) used to sign tokens. This must match
+    ///   the key stored in the server's database for the customer.
+    pub fn new(customer_id: String, key_id: String, secret: String) -> Self {
         Self {
             secret,
             customer_id,
             key_id,
             cached_token: RwLock::new(None),
         }
+    }
+
+    /// Creates a new JWT manager from a combined access key in the form `<customer_id>.<key_id>.<secret>`.
+    /// Whitespaces within the key are ignored.
+    /// # Arguments
+    /// * `combined_key` - The combined access key string.
+    /// # Returns
+    /// * `Result<Self, ()>` - Ok with JwtManager if parsing is successful, Err if the key is malformed.
+    pub fn from_access_key(combined_key: &str) -> Result<Self, ()> {
+        let (customer_id, key_id, secret) = parse_access_key(combined_key)?;
+        Ok(Self::new(customer_id, key_id, secret))
     }
 
     /// Gets a valid JWT token, generating a new one if necessary.
@@ -198,6 +210,24 @@ impl JwtManager {
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
+}
+
+/// Parse an access key in the format `<customer_id>.<key_id>.<secret>` form into its components.
+/// Whitespace within the key is removed
+pub fn parse_access_key(combined_key: &str) -> Result<(String, String, String), ()> {
+    let div1 = combined_key.find('.').unwrap_or(0);
+    let div2 = combined_key.rfind('.').unwrap_or(0);
+    if div1 == 0 || div2 == 0 || div1 >= div2 {
+        return Err(());
+    }
+    let mut customer_id = combined_key[..div1].to_string();
+    customer_id.retain(|c| !c.is_whitespace());
+    let mut key_id = combined_key[div1 + 1..div2].to_string();
+    key_id.retain(|c| !c.is_whitespace());
+    let mut secret = combined_key[div2 + 1..].to_string();
+    secret.retain(|c| !c.is_whitespace());
+
+    return Ok((customer_id, key_id, secret));
 }
 
 /// Extracts the customer ID from a tunnel domain.
@@ -286,9 +316,9 @@ mod tests {
     #[test]
     fn test_jwt_manager_generates_token() {
         let manager = JwtManager::new(
-            "test-secret".to_string(),
             "customer123".to_string(),
             "key1".to_string(),
+            "test-secret".to_string(),
         );
 
         let token = manager.get_token().unwrap();
@@ -302,9 +332,9 @@ mod tests {
     #[test]
     fn test_jwt_manager_caches_token() {
         let manager = JwtManager::new(
-            "test-secret".to_string(),
             "customer123".to_string(),
             "key1".to_string(),
+            "test-secret".to_string(),
         );
 
         let token1 = manager.get_token().unwrap();
@@ -317,9 +347,9 @@ mod tests {
     #[test]
     fn test_jwt_manager_refresh_generates_new_token() {
         let manager = JwtManager::new(
-            "test-secret".to_string(),
             "customer123".to_string(),
             "key1".to_string(),
+            "test-secret".to_string(),
         );
 
         let token1 = manager.get_token().unwrap();

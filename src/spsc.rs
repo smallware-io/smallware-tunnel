@@ -166,9 +166,7 @@ where
 
 #[inline]
 pub async fn with_context<RET, F: FnMut(&mut Context<'_>) -> RET>(mut f: F) -> RET {
-    poll_fn(|cx|{
-        Poll::Ready(f(cx))
-    }).await
+    poll_fn(|cx| Poll::Ready(f(cx))).await
 }
 
 // ============================================================================
@@ -604,7 +602,7 @@ pub trait SpScItem<T> {
     /// # State Transitions
     ///
     /// - `Busy` → `Waiting`: Consumer signals it's ready for the next item
-    /// - Other: No change 
+    /// - Other: No change
     ///
     /// # Returns
     ///
@@ -636,7 +634,7 @@ pub trait SpScItem<T> {
     ) -> impl std::future::Future<Output = SpScItemState>;
 
     /// Check to see if the exchange can accept an item.
-    /// 
+    ///
     /// This just registers the caller's waker, adjusts the timeout if necessary,
     /// and returns the current state
     fn p_check_write(
@@ -769,10 +767,7 @@ where
     }
 
     #[inline]
-    async fn c_check_read(
-        &self,
-        timeout: Option<Instant>,
-    ) -> SpScItemState {
+    async fn c_check_read(&self, timeout: Option<Instant>) -> SpScItemState {
         let mut rst = SpScItemState::Failed;
         self.c(|r| {
             // The closure returns true if we made a change the producer should see
@@ -850,7 +845,7 @@ where
         self.p(|w| {
             wst = w.get_state();
             match wst {
-                SpScItemState::Busy| SpScItemState::Full=> {
+                SpScItemState::Busy | SpScItemState::Full => {
                     // Consumer is busy processing. We can't write yet.
                     // Just update the timeout if it changed.
                     let tr = w.timeout_mut();
@@ -862,13 +857,12 @@ where
                     }
                 }
                 // Terminal states: no change
-                SpScItemState::Failed | SpScItemState::Closed | SpScItemState::Waiting=> false,
+                SpScItemState::Failed | SpScItemState::Closed | SpScItemState::Waiting => false,
             }
         })
         .await;
         wst
     }
-
 
     #[inline]
     fn side_try_write(&self, sender: &mut Option<T>, timeout: Option<Instant>) -> SpScItemState {

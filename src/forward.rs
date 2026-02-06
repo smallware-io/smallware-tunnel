@@ -7,29 +7,6 @@
 //!
 //! - [`forward_tunnel`]: Forward tunnel traffic to any `AsyncRead + AsyncWrite` stream
 //! - [`forward_tunnel_tcp`]: Convenience function to forward to a TCP socket address
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use smallware_tunnel::{TunnelConfig, TunnelListener, forward_tunnel_tcp};
-//! use std::net::SocketAddr;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Key format: <keyid>.<secret>
-//! let config = TunnelConfig::new("mykey.secret123", "www-abc-xyz.t00.smallware.io")?;
-//! let listener = TunnelListener::new(config)?;
-//! let local_addr: SocketAddr = "127.0.0.1:8080".parse()?;
-//!
-//! loop {
-//!     let (sink, stream, _client_info) = listener.accept().await?;
-//!     tokio::spawn(async move {
-//!         if let Err(e) = forward_tunnel_tcp(sink, stream, local_addr).await {
-//!             eprintln!("Forward error: {}", e);
-//!         }
-//!     });
-//! }
-//! # }
-//! ```
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};

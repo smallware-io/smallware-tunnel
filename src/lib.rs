@@ -26,45 +26,6 @@
 //!                                                         └─────────────────┘
 //! ```
 //!
-//! # Example
-//!
-//! ```rust,no_run
-//! use smallware_tunnel::{TunnelListener, TunnelConfig, TunnelError};
-//! use futures::{SinkExt, StreamExt};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Configure the tunnel
-//!     // Key format: <keyid>.<secret> (keyid may contain dots, secret cannot)
-//!     let config = TunnelConfig::new(
-//!         "your-key-id.your-api-secret",
-//!         "www-abc123-xyz789.t00.smallware.io",
-//!     )?;
-//!
-//!     // Create a listener
-//!     let listener = TunnelListener::new(config)?;
-//!
-//!     // Accept incoming connections
-//!     loop {
-//!         match listener.accept().await {
-//!             Ok((sink, stream, client_info)) => {
-//!                 println!("Client connected: {:?}", client_info);
-//!                 tokio::spawn(async move {
-//!                     // `stream` implements futures::Stream<Item = Bytes>
-//!                     // `sink` implements futures::Sink<Bytes, Error = TunnelError>
-//!                     // Use them for bidirectional communication
-//!                     let _ = (sink, stream);
-//!                 });
-//!             }
-//!             Err(TunnelError::ListenerClosed) => break,
-//!             Err(e) => eprintln!("Error: {}", e),
-//!         }
-//!     }
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
 //! # Connection Recycling
 //!
 //! The library automatically manages WebSocket connection recycling:
