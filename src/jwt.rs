@@ -81,9 +81,9 @@ struct CachedToken {
 /// use smallware_tunnel::JwtManager;
 ///
 /// let manager = JwtManager::new(
-///     "your-api-key".to_string(),
-///     "customer123".to_string(),
-///     "default".to_string(),
+///     "your-api-key",
+///     "customer123",
+///     "default",
 /// );
 ///
 /// // Get a valid token (generates new one if needed)
@@ -92,13 +92,13 @@ struct CachedToken {
 #[derive(Debug)]
 pub struct JwtManager {
     /// The API key (secret) used to sign tokens
-    secret: String,
+    secret: Arc<str>,
 
     /// The customer ID to use in the `sub` claim
-    customer_id: String,
+    customer_id: Arc<str>,
 
     /// The key ID for the JWT header
-    key_id: String,
+    key_id: Arc<str>,
 
     /// Cached token (if any)
     cached_token: RwLock<Option<CachedToken>>,
@@ -115,11 +115,11 @@ impl JwtManager {
     ///   This identifies which key the server should use for verification.
     /// * `secret` - The API key (secret) used to sign tokens. This must match
     ///   the key stored in the server's database for the customer.
-    pub fn new(customer_id: String, key_id: String, secret: String) -> Self {
+    pub fn new(customer_id: &str, key_id: &str, secret: &str) -> Self {
         Self {
-            secret,
-            customer_id,
-            key_id,
+            secret: Arc::from(secret),
+            customer_id: Arc::from(customer_id),
+            key_id: Arc::from(key_id),
             cached_token: RwLock::new(None),
         }
     }
@@ -132,7 +132,11 @@ impl JwtManager {
     /// * `Result<Self, ()>` - Ok with JwtManager if parsing is successful, Err if the key is malformed.
     pub fn from_access_key(combined_key: &str) -> Result<Self, ()> {
         let (customer_id, key_id, secret) = parse_access_key(combined_key)?;
-        Ok(Self::new(customer_id, key_id, secret))
+        Ok(Self::new(
+            customer_id.as_str(),
+            key_id.as_str(),
+            secret.as_str(),
+        ))
     }
 
     /// Gets a valid JWT token, generating a new one if necessary.
@@ -170,7 +174,7 @@ impl JwtManager {
 
         let claims = CustomerClaims {
             iss: "customer".to_string(),
-            sub: self.customer_id.clone(),
+            sub: self.customer_id.to_string(),
             exp: expires_at.timestamp(),
             iat: now.timestamp(),
             roles: vec!["tunnel".to_string()],
@@ -178,7 +182,7 @@ impl JwtManager {
 
         // Create header with key ID
         let mut header = Header::new(Algorithm::HS256);
-        header.kid = Some(self.key_id.clone());
+        header.kid = Some(self.key_id.to_string());
 
         // Encode the token
         let encoding_key = EncodingKey::from_secret(self.secret.as_bytes());
@@ -209,6 +213,17 @@ impl JwtManager {
     /// Returns the key ID used for token signing.
     pub fn key_id(&self) -> &str {
         &self.key_id
+    }
+}
+
+impl Clone for JwtManager {
+    fn clone(&self) -> Self {
+        Self {
+            secret: self.secret.clone(),
+            customer_id: self.customer_id.clone(),
+            key_id: self.key_id.clone(),
+            cached_token: RwLock::new(None),
+        }
     }
 }
 
@@ -315,11 +330,7 @@ mod tests {
 
     #[test]
     fn test_jwt_manager_generates_token() {
-        let manager = JwtManager::new(
-            "customer123".to_string(),
-            "key1".to_string(),
-            "test-secret".to_string(),
-        );
+        let manager = JwtManager::new("customer123", "key1", "test-secret");
 
         let token = manager.get_token().unwrap();
         assert!(!token.is_empty());
@@ -331,11 +342,7 @@ mod tests {
 
     #[test]
     fn test_jwt_manager_caches_token() {
-        let manager = JwtManager::new(
-            "customer123".to_string(),
-            "key1".to_string(),
-            "test-secret".to_string(),
-        );
+        let manager = JwtManager::new("customer123", "key1", "test-secret");
 
         let token1 = manager.get_token().unwrap();
         let token2 = manager.get_token().unwrap();
@@ -346,11 +353,7 @@ mod tests {
 
     #[test]
     fn test_jwt_manager_refresh_generates_new_token() {
-        let manager = JwtManager::new(
-            "customer123".to_string(),
-            "key1".to_string(),
-            "test-secret".to_string(),
-        );
+        let manager = JwtManager::new("customer123", "key1", "test-secret");
 
         let token1 = manager.get_token().unwrap();
 

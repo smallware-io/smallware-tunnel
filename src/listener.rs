@@ -1004,11 +1004,7 @@ mod tests {
 
     #[test]
     fn test_config_new() {
-        let auth = Arc::new(JwtManager::new(
-            "xyz".to_string(),
-            "mykey".to_string(),
-            "secret123".to_string(),
-        ));
+        let auth = Arc::new(JwtManager::new("xyz", "mykey", "secret123"));
         let config = TunnelConfig::new("www-abc-xyz.t00.smallware.io".to_string());
 
         assert_eq!(config.domain, "www-abc-xyz.t00.smallware.io");
