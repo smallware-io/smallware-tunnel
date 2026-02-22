@@ -34,7 +34,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use smallware_tunnel::{forward_tunnel_tcp, JwtManager, TunnelConfig, TunnelError, TunnelListener};
+use smallware_tunnel::{JwtManager, TunnelConfig, TunnelError, TunnelListener, forward_tunnel_tcp};
 use std::path::PathBuf;
 use std::{net::SocketAddr, sync::Arc};
 use tracing::{error, info, warn, Instrument, Level};
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
     );
 
     // Create the tunnel listener
-    let listener = TunnelListener::new(auth, config);
+    let listener = TunnelListener::new(auth, config, None);
 
     info!(
         "Tunnel active! Requests to https://{} will be forwarded to {}",

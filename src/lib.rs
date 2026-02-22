@@ -59,6 +59,7 @@ mod spitemsink;
 pub mod spsc;
 pub mod trace_id;
 pub mod tunnel_protocol;
+mod stat_counter;
 
 pub use error::TunnelError;
 pub use forward::{forward_tunnel, forward_tunnel_tcp, ForwardStats};
@@ -66,3 +67,4 @@ pub use jwt::JwtManager;
 pub use listener::{
     parse_key, TunnelClientInfo, TunnelConfig, TunnelListener, TunnelSink, TunnelStream,
 };
+pub use stat_counter::*;

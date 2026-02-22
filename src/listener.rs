@@ -24,6 +24,7 @@
 //! A rendezvous channel ensures recycled connections are handed off directly
 //! to waiting `accept()` calls.
 
+use crate::{STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS, ScopeStat, StatCounter, noop_stat_counter};
 use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
 use crate::scitemstream::ScItemStream;
@@ -34,6 +35,7 @@ use crate::spsc::{
 use crate::trace_id::{next_trace_id, TraceId};
 use crate::tunnel_protocol::TunnelProtocol;
 use bytes::Bytes;
+use derivative::Derivative;
 use futures::{SinkExt, StreamExt};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -100,6 +102,7 @@ pub struct TunnelConfig {
     /// servers using self-signed certificates.
     pub trust_ca: Option<PathBuf>,
 }
+
 
 /// Parses a combined API key in the format `<keyid>.<secret>`.
 ///
@@ -186,9 +189,12 @@ pub struct TunnelClientInfo {
     pub connection_id: TraceId,
 }
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 struct ListenerShared {
     auth: Arc<JwtManager>,
+    #[derivative(Debug="ignore")]
+    stat_counter: Arc<dyn StatCounter>,
     config: TunnelConfig,
     /// Rendezvous channel sink to recycle connections
     recycle_tx: flume::Sender<RecycledConnection>,
@@ -249,7 +255,7 @@ impl TunnelListener {
     ///
     /// Returns an error if the domain format is invalid and the customer ID
     /// cannot be extracted.
-    pub fn new(auth: Arc<JwtManager>, config: TunnelConfig) -> Self {
+    pub fn new(auth: Arc<JwtManager>, config: TunnelConfig, stat_counter: Option<Arc<dyn StatCounter>>) -> Self {
         // Rendezvous channel (capacity 0) for recycling WebSocket connections.
         // When a tunnel session completes successfully, `connection_task` offers the
         // WebSocket for reuse. The zero capacity ensures the handoff is synchronous:
@@ -258,6 +264,10 @@ impl TunnelListener {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shared: ListenerShared = ListenerShared {
             auth,
+            stat_counter: match stat_counter {
+                Some(x) => x,
+                None => noop_stat_counter()
+            },
             config,
             recycle_tx,
             recycle_rx,
@@ -333,6 +343,7 @@ impl TunnelListener {
     ) -> Result<(TunnelSink, TunnelStream, TunnelClientInfo), TunnelError> {
         let trace_id = next_trace_id();
         let shared = self.shared.clone();
+        let mut waiting_stat: Option<ScopeStat> = None;
         async {
             loop {
                 // Acquire the retry lock. This lock coordinates backoff timing and, when
@@ -399,6 +410,9 @@ impl TunnelListener {
                 // through wait_for_connection() to serialize attempts. If we succeed here,
                 // we signal that the server is healthy (last_success = true) so subsequent
                 // callers can proceed concurrently.
+                if waiting_stat.is_none() {
+                    waiting_stat = Some(ScopeStat::new(&self.shared.stat_counter, STAT_COUNT_ACCEPTS_WAITING))
+                }
                 if !shared
                     .last_success
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -596,7 +610,7 @@ impl TunnelListener {
         let recycle_tx = shared.recycle_tx.clone();
         let shutdown_rx = shared.shutdown_rx.clone();
         tokio::spawn(
-            Self::protocol_bridge_task(protocol, ws_tx, ws_rx, recycle_tx, shutdown_rx)
+            Self::protocol_bridge_task(protocol, self.shared.stat_counter.clone(), ws_tx, ws_rx, recycle_tx, shutdown_rx)
                 .instrument(tracing::info_span!("connection", conn = %conn_id)),
         );
 
@@ -623,11 +637,13 @@ impl TunnelListener {
     /// connection is only kept alive if an `accept()` call is ready to receive it.
     async fn protocol_bridge_task(
         protocol: TunnelProtocol,
+        stat_counter: Arc<dyn StatCounter>,
         mut ws_tx: WsRawSink,
         mut ws_rx: WsBaseStream,
         recycle_tx: flume::Sender<RecycledConnection>,
         shutdown_rx: watch::Receiver<bool>,
     ) {
+        let _connection_stat = ScopeStat::new(&stat_counter, STAT_COUNT_CONNECTIONS);
         let io = protocol.io();
         let mut shutdown_rx = shutdown_rx;
         let mut protocol_done = false;
@@ -652,7 +668,7 @@ impl TunnelListener {
             let mut did_something = false;
 
             if up_open {
-                match poll_transfer_up(&mut ws_tx, &c_item).await {
+                match poll_transfer_up(&stat_counter, &mut ws_tx, &c_item).await {
                     Poll::Pending => {}
                     Poll::Ready(Err(SpScItemState::Closed)) => {
                         up_open = false;
@@ -671,7 +687,7 @@ impl TunnelListener {
                 }
             }
             if down_open {
-                match poll_transfer_down(&mut ws_rx, &p_item).await {
+                match poll_transfer_down(&stat_counter, &mut ws_rx, &p_item).await {
                     Poll::Pending => {}
                     Poll::Ready(Err(SpScItemState::Closed)) => {
                         down_open = false;
@@ -743,6 +759,7 @@ impl TunnelListener {
 }
 
 async fn poll_transfer_up(
+    stat_counter: &Arc<dyn StatCounter>,
     ws_tx: &mut WsRawSink,
     c_item: &SpScMutex<SimpleSpScItemInner<Message>>,
 ) -> Poll<Result<(), SpScItemState>> {
@@ -767,6 +784,12 @@ async fn poll_transfer_up(
         SpScItemState::Busy => {
             if let Some(item) = receiver {
                 tracing::debug!("WS UP");
+                match &item {
+                    Message::Binary(bytes) => {
+                        stat_counter.stat_count(STAT_COUNT_BYTES_UP, bytes.len() as i32);
+                    },
+                    _ => {}
+                }
                 if ws_tx.start_send_unpin(item).is_err() {
                     c_item.close();
                     tracing::error!("start_send failed");
@@ -820,6 +843,7 @@ async fn poll_transfer_flush(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
 }
 
 async fn poll_transfer_down(
+    stat_counter: &Arc<dyn StatCounter>,
     ws_rx: &mut WsBaseStream,
     p_item: &SpScMutex<SimpleSpScItemInner<Message>>,
 ) -> Poll<Result<(), SpScItemState>> {
@@ -844,9 +868,14 @@ async fn poll_transfer_down(
             tracing::error!("Websocket read EOF");
             return Poll::Ready(Err(wst));
         }
-        Poll::Ready(Some(Ok(data))) => Some(data),
+        Poll::Ready(Some(Ok(data))) => {
+            match &data {
+                Message::Binary(bytes) => {stat_counter.stat_count(STAT_COUNT_BYTES_DOWN, bytes.len() as i32);},
+                _ => {}
+            }
+            Some(data)
+        },
     };
-    tracing::debug!("WS DOWN: {:.100?}", &sender);
     match p_item.p_try_write(&mut sender, None).await {
         SpScItemState::Full => {}
         _ => {
