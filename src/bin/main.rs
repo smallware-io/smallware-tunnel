@@ -34,7 +34,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use smallware_tunnel::{JwtManager, TunnelConfig, TunnelError, TunnelListener, forward_tunnel_tcp};
+use smallware_tunnel::{forward_tunnel_tcp, JwtManager, TunnelConfig, TunnelError, TunnelListener};
 use std::path::PathBuf;
 use std::{net::SocketAddr, sync::Arc};
 use tracing::{error, info, warn, Instrument, Level};

@@ -24,7 +24,6 @@
 //! A rendezvous channel ensures recycled connections are handed off directly
 //! to waiting `accept()` calls.
 
-use crate::{STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS, ScopeStat, StatCounter, noop_stat_counter};
 use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
 use crate::scitemstream::ScItemStream;
@@ -34,6 +33,10 @@ use crate::spsc::{
 };
 use crate::trace_id::{next_trace_id, TraceId};
 use crate::tunnel_protocol::TunnelProtocol;
+use crate::{
+    noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN,
+    STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS,
+};
 use bytes::Bytes;
 use derivative::Derivative;
 use futures::{SinkExt, StreamExt};
@@ -58,9 +61,6 @@ type WsBaseStream = futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<
 
 pub type TunnelStream = ScItemStream<TunnelProtocol, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
 pub type TunnelSink = SpItemSink<TunnelProtocol, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
-
-/// Default tunnel server URL.
-const DEFAULT_SERVER_URL: &str = "wss://api.smallware.io/tunnels";
 
 /// Configuration for the tunnel listener.
 ///
@@ -103,7 +103,6 @@ pub struct TunnelConfig {
     pub trust_ca: Option<PathBuf>,
 }
 
-
 /// Parses a combined API key in the format `<keyid>.<secret>`.
 ///
 /// The key ID may contain `.` characters, but the secret cannot.
@@ -130,9 +129,11 @@ impl TunnelConfig {
     ///
     /// * `domain` - The full tunnel domain name
     pub fn new(domain: String) -> Self {
+        let shard = domain.as_str().split('.').nth(1).unwrap_or("x");
+        let server_url = format!("wss://api.{shard}.smallware.io/tunnels");
         Self {
             domain: domain,
-            server_url: DEFAULT_SERVER_URL.to_string(),
+            server_url: server_url,
             trust_ca: None,
         }
     }
@@ -193,7 +194,7 @@ pub struct TunnelClientInfo {
 #[derivative(Debug)]
 struct ListenerShared {
     auth: Arc<JwtManager>,
-    #[derivative(Debug="ignore")]
+    #[derivative(Debug = "ignore")]
     stat_counter: Arc<dyn StatCounter>,
     config: TunnelConfig,
     /// Rendezvous channel sink to recycle connections
@@ -255,7 +256,11 @@ impl TunnelListener {
     ///
     /// Returns an error if the domain format is invalid and the customer ID
     /// cannot be extracted.
-    pub fn new(auth: Arc<JwtManager>, config: TunnelConfig, stat_counter: Option<Arc<dyn StatCounter>>) -> Self {
+    pub fn new(
+        auth: Arc<JwtManager>,
+        config: TunnelConfig,
+        stat_counter: Option<Arc<dyn StatCounter>>,
+    ) -> Self {
         // Rendezvous channel (capacity 0) for recycling WebSocket connections.
         // When a tunnel session completes successfully, `connection_task` offers the
         // WebSocket for reuse. The zero capacity ensures the handoff is synchronous:
@@ -266,7 +271,7 @@ impl TunnelListener {
             auth,
             stat_counter: match stat_counter {
                 Some(x) => x,
-                None => noop_stat_counter()
+                None => noop_stat_counter(),
             },
             config,
             recycle_tx,
@@ -411,7 +416,10 @@ impl TunnelListener {
                 // we signal that the server is healthy (last_success = true) so subsequent
                 // callers can proceed concurrently.
                 if waiting_stat.is_none() {
-                    waiting_stat = Some(ScopeStat::new(&self.shared.stat_counter, STAT_COUNT_ACCEPTS_WAITING))
+                    waiting_stat = Some(ScopeStat::new(
+                        &self.shared.stat_counter,
+                        STAT_COUNT_ACCEPTS_WAITING,
+                    ))
                 }
                 if !shared
                     .last_success
@@ -610,8 +618,15 @@ impl TunnelListener {
         let recycle_tx = shared.recycle_tx.clone();
         let shutdown_rx = shared.shutdown_rx.clone();
         tokio::spawn(
-            Self::protocol_bridge_task(protocol, self.shared.stat_counter.clone(), ws_tx, ws_rx, recycle_tx, shutdown_rx)
-                .instrument(tracing::info_span!("connection", conn = %conn_id)),
+            Self::protocol_bridge_task(
+                protocol,
+                self.shared.stat_counter.clone(),
+                ws_tx,
+                ws_rx,
+                recycle_tx,
+                shutdown_rx,
+            )
+            .instrument(tracing::info_span!("connection", conn = %conn_id)),
         );
 
         Ok((
@@ -787,7 +802,7 @@ async fn poll_transfer_up(
                 match &item {
                     Message::Binary(bytes) => {
                         stat_counter.stat_count(STAT_COUNT_BYTES_UP, bytes.len() as i32);
-                    },
+                    }
                     _ => {}
                 }
                 if ws_tx.start_send_unpin(item).is_err() {
@@ -870,11 +885,13 @@ async fn poll_transfer_down(
         }
         Poll::Ready(Some(Ok(data))) => {
             match &data {
-                Message::Binary(bytes) => {stat_counter.stat_count(STAT_COUNT_BYTES_DOWN, bytes.len() as i32);},
+                Message::Binary(bytes) => {
+                    stat_counter.stat_count(STAT_COUNT_BYTES_DOWN, bytes.len() as i32);
+                }
                 _ => {}
             }
             Some(data)
-        },
+        }
     };
     match p_item.p_try_write(&mut sender, None).await {
         SpScItemState::Full => {}
@@ -1039,7 +1056,7 @@ mod tests {
         assert_eq!(config.domain, "www-abc-xyz.t00.smallware.io");
         assert_eq!(config.customer_id().unwrap(), auth.customer_id());
         assert_eq!(config.customer_id().unwrap(), "xyz");
-        assert_eq!(config.server_url, DEFAULT_SERVER_URL);
+        assert_eq!(config.server_url, "wss://api.t00.smallware.io/tunnels");
     }
 
     #[test]

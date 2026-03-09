@@ -7,7 +7,7 @@ pub const STAT_COUNT_CONNECTIONS: &'static str = "connections";
 pub const STAT_COUNT_BYTES_UP: &'static str = "up_bytes";
 pub const STAT_COUNT_BYTES_DOWN: &'static str = "down_bytes";
 
-pub trait StatCounter : Send + Sync {
+pub trait StatCounter: Send + Sync {
     fn stat_count(&self, stat: &'static str, delta: i32);
     fn stat_level(&self, stat: &'static str, value: i32);
 }
