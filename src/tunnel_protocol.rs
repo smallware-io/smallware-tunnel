@@ -66,26 +66,7 @@
 //! - When upload finishes, it sets `up_result` so download knows
 //! - When download finishes, it sets `down_result` so upload knows
 //! - If one side fails, the other starts a shutdown timer
-//!
-//! # Usage
-//!
-//! ```ignore
-//! // Create the protocol
-//! let protocol = TunnelProtocol::new(Instant::now());
-//!
-//! // In your I/O loop:
-//! loop {
-//!     // Feed data from WebSocket into down_in
-//!     // Feed data from app into up_in
-//!     // Read from up_out to send to WebSocket
-//!     // Read from down_out to send to app
-//!
-//!     // Advance the protocol
-//!     if !protocol.tick(Instant::now()) {
-//!         break; // Protocol completed
-//!     }
-//! }
-//! ```
+
 
 use bytes::Bytes;
 use coarsetime::{Duration, Instant};
@@ -265,8 +246,7 @@ pub struct UpToDown {
 ///
 /// This async function reads from `up_in` and writes to `up_out` until EOF
 /// or an error occurs. It coordinates with the download task via `up_to_down`.
-async fn up_connected(io_val: Arc<TunnelIO>) -> TaskEnd {
-    let io = io_val.as_ref();
+async fn up_connected(io: &TunnelIO) -> TaskEnd {
     let mut got_eof = false;
 
     // Once we're in shutdown mode, we use a read timeout to avoid hanging forever
@@ -442,8 +422,7 @@ async fn up_abort(io: &TunnelIO) -> TaskEnd {
 ///
 /// This async function reads from `down_in` and writes to `down_out` until EOF
 /// or an error occurs. It coordinates with the upload task via `up_to_down`.
-async fn down_connected(io_val: Arc<TunnelIO>) -> TaskEnd {
-    let io = io_val.as_ref();
+async fn down_connected(io: &TunnelIO) -> TaskEnd {
     let mut got_eof = false;
 
     // If we can't write to the app, we enter discarding mode:
@@ -612,128 +591,10 @@ async fn down_abort(io: &TunnelIO) -> TaskEnd {
 // PUBLIC API
 // ============================================================================
 
-/// The main tunnel protocol state machine.
-///
-/// This struct combines the I/O state (`TunnelIO`) with the procedural state
-/// machine (`ProcMachine`) that runs the upload and download tasks.
-///
-/// # Usage
-///
-/// ```ignore
-/// // Create the protocol
-/// let protocol = TunnelProtocol::new(Instant::now());
-///
-/// // Get access to the I/O channels
-/// let io = protocol.io();
-///
-/// // In your main I/O loop:
-/// loop {
-///     // Feed incoming WebSocket messages into the protocol
-///     if let Some(msg) = ws.try_recv() {
-///         io.down_in.p_try_write(&mut Some(msg), timeout).await;
-///     }
-///
-///     // Feed outgoing data from app into the protocol
-///     if let Some(data) = app.try_read() {
-///         io.up_in.p_try_write(&mut Some(data), timeout).await;
-///     }
-///
-///     // Get outgoing WebSocket messages from the protocol
-///     let mut msg = None;
-///     if io.up_out.c_try_read(&mut msg, None).await == SpScItemState::Busy {
-///         ws.send(msg.take().unwrap()).await;
-///     }
-///
-///     // Get data to send to the app
-///     let mut data = None;
-///     if io.down_out.c_try_read(&mut data, None).await == SpScItemState::Busy {
-///         app.write(data.take().unwrap()).await;
-///     }
-///
-///     // Advance the protocol state machine
-///     if !protocol.tick(Instant::now()) {
-///         break; // Protocol completed
-///     }
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub struct TunnelProtocol {
-    /// Shared I/O state for data exchange with external code
-    io: Arc<TunnelIO>,
-    /// The procedural state machine running upload and download tasks
-    pm: Arc<dyn ProcMachine>,
-}
-
-impl TunnelProtocol {
-    /// Creates a new tunnel protocol instance.
-    ///
-    /// # Arguments
-    ///
-    /// * `now` - The current timestamp (used for timeout calculations)
-    ///
-    /// # Returns
-    ///
-    /// A new `TunnelProtocol` with both upload and download tasks ready to run.
-    pub fn new(now: Instant) -> Self {
-        // Create shared I/O state
-        let io = Arc::new(TunnelIO::new(&now));
-
-        // Create the procedural state machine with two tasks:
-        // - up_connected: handles app → WebSocket
-        // - down_connected: handles WebSocket → app
-        let pm = create_proc_machine2(up_connected(io.clone()), down_connected(io.clone()));
-
-        Self { io, pm }
-    }
-
-    /// Returns a reference to the shared I/O state.
-    ///
-    /// Use this to interact with the protocol's channels for feeding data
-    /// in and pulling data out.
-    pub fn io(&self) -> &Arc<TunnelIO> {
-        &self.io
-    }
-
-    /// Advance the protocol by updating the clock and polling the tasks.
-    ///
-    /// This method should be called repeatedly in your I/O loop. It:
-    /// 1. Updates the internal clock and checks for expired timeouts
-    /// 2. Polls all async tasks until they're all idle
-    ///
-    /// # Arguments
-    ///
-    /// * `now` - The current timestamp
-    ///
-    /// # Returns
-    ///
-    /// * `true` - Protocol is still running, call `tick()` again later
-    /// * `false` - Protocol has completed (both tasks finished)
-    pub fn tick(&self, now: Instant) -> bool {
-        self.io.update_clock(now);
-        self.pm.tick()
-    }
-
-    /// Returns a reference to the upload input channel (app → protocol).
-    ///
-    /// This is used by TunnelSink to write data.
-    pub fn up_in(&self) -> &SpScMutex<SimpleSpScItemInner<Bytes>> {
-        &self.io.up_in
-    }
-
-    /// Returns a reference to the download output channel (protocol → app).
-    ///
-    /// This is used by TunnelStream to read data.
-    pub fn down_out(&self) -> &SpScMutex<SimpleSpScItemInner<Bytes>> {
-        &self.io.down_out
-    }
-}
-
-/// Implement ProcMachine for TunnelProtocol so it can be used with SpScItemSink/Stream.
-impl ProcMachine for TunnelProtocol {
-    fn tick(&self) -> bool {
-        self.io.update_clock(Instant::now());
-        self.pm.tick()
-    }
+pub type TunnelProtocol = Arc<dyn ProcMachine<TunnelIO>>;
+pub fn create_tunnel_protocol(now: Instant) -> TunnelProtocol {
+    let arc = PROC_MACHINE_JOBS_BASE.with(up_connected).with(down_connected).build(TunnelIO::new(&now));
+    arc
 }
 
 // ============================================================================
@@ -766,29 +627,24 @@ mod tests {
     impl TestHarness {
         fn new() -> Self {
             let now = Instant::now();
-            let mut h = Self {
-                protocol: TunnelProtocol::new(now),
+            Self {
+                protocol: create_tunnel_protocol(now),
                 now,
                 ws_out_msgs: Vec::new(),
                 app_out_data: Vec::new(),
-            };
-            // Initial tick to register task wakers with SpScAccessor channels.
-            // Without this, the wakers would be noop_waker and external writes
-            // wouldn't wake the tasks.
-            h.tick();
-            h
+            }
         }
 
-        fn io(&self) -> &Arc<TunnelIO> {
-            self.protocol.io()
-        }
 
         /// Drain all available output from both output channels
         fn drain_outputs(&mut self) {
             // Drain WebSocket output (up_out)
             loop {
                 let mut item = None;
-                let state = block_on(self.io().up_out.c_try_read(&mut item, None));
+                let state = {
+                    let g = self.protocol.lock();
+                    block_on(g.up_out.c_try_read(&mut item, None))
+                };
                 match state {
                     SpScItemState::Busy => {
                         if let Some(msg) = item {
@@ -802,7 +658,11 @@ mod tests {
             // Drain app output (down_out)
             loop {
                 let mut item = None;
-                let state = block_on(self.io().down_out.c_try_read(&mut item, None));
+
+                let state = {
+                    let g = self.protocol.lock();
+                    block_on(g.down_out.c_try_read(&mut item, None))
+                };
                 match state {
                     SpScItemState::Busy => {
                         self.app_out_data.push(item);
@@ -812,78 +672,65 @@ mod tests {
             }
         }
 
-        /// Tick the protocol and drain any output
-        fn tick(&mut self) -> bool {
-            let result = self.protocol.tick(self.now);
-            self.drain_outputs();
-            result
-        }
-
-        /// Tick multiple times, draining output each time
-        fn tick_n(&mut self, n: usize) -> bool {
-            let mut result = true;
-            for _ in 0..n {
-                result = self.tick();
-                if !result {
-                    break;
-                }
-            }
-            result
-        }
-
         /// Advance time by the given duration and tick
-        fn advance_and_tick(&mut self, duration: Duration) -> bool {
+        fn advance_and_tick(&mut self, duration: Duration) {
             self.now += duration;
-            self.tick()
+            let g = self.protocol.lock();
+            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
         }
 
         /// Write data from "app" into the upload channel
         fn app_write(&mut self, data: Bytes) -> SpScItemState {
             let mut item = Some(data);
-            let result = block_on(self.io().up_in.p_try_write(&mut item, None));
-            // Tick to process the write
-            self.tick();
-            result
+            let g=self.protocol.lock();
+            block_on(g.up_in.p_try_write(&mut item, None))
         }
         fn app_write_eof(&mut self) -> SpScItemState {
             let mut item: Option<Bytes> = None;
-            let result = block_on(self.io().up_in.p_try_write(&mut item, None));
-            // Tick to process the write
-            self.tick();
+            let g=self.protocol.lock();
+            let result = block_on(g.up_in.p_try_write(&mut item, None));
             result
         }
 
         /// Close the app's upload channel (simulate app EOF)
         fn app_close_upload(&mut self) {
-            self.io().up_in.close();
-            self.tick();
+            let g=self.protocol.lock();
+            g.up_in.close();
+            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
         }
 
         /// Close the app's download channel (simulate app closed for reading)
         fn app_close_download(&mut self) {
-            self.io().down_out.close();
-            self.tick();
+            let g=self.protocol.lock();
+            g.down_out.close();
+            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
+        }
+
+        fn is_done(&self) -> bool {
+            self.protocol.is_done()
         }
 
         /// Write a WebSocket message into the download channel
         fn ws_write(&mut self, msg: Message) -> SpScItemState {
             let mut item = Some(msg);
-            let result = block_on(self.io().down_in.p_try_write(&mut item, None));
-            // Tick to process the write
-            self.tick();
+            let g=self.protocol.lock();
+            let result = block_on(g.down_in.p_try_write(&mut item, None));
+            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
             result
         }
 
         /// Close the WebSocket input channel
         fn ws_close_input(&mut self) {
-            self.io().down_in.close();
-            self.tick();
+            let g=self.protocol.lock();
+            g.down_in.close();
+            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
         }
 
         /// Close the WebSocket output channel
         fn ws_close_output(&mut self) {
-            self.io().up_out.close();
-            self.tick();
+            let g=self.protocol.lock();
+            g.up_out.close();
+            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
         }
 
         /// Get collected WebSocket output messages
@@ -894,16 +741,6 @@ mod tests {
         /// Get collected app output data
         fn take_app_data(&mut self) -> Vec<Option<Bytes>> {
             std::mem::take(&mut self.app_out_data)
-        }
-
-        /// Run until protocol completes or max iterations
-        fn run_to_completion(&mut self, max_iters: usize) -> bool {
-            for _ in 0..max_iters {
-                if !self.tick() {
-                    return true; // Completed
-                }
-            }
-            false // Did not complete
         }
     }
 
@@ -1049,9 +886,6 @@ mod tests {
         // Server sends DROP
         h.ws_write(Message::Text("DROP: connection closed by remote".into()));
 
-        // Tick a few more times to let it settle
-        h.tick_n(5);
-
         // App should receive EOF (None)
         let app_data = h.take_app_data();
         // DROP causes EOF which means None is written to down_out
@@ -1083,7 +917,7 @@ mod tests {
         h.ws_write(Message::Binary(Bytes::new()));
 
         // 4. Run to completion
-        assert!(h.run_to_completion(20), "Protocol should have completed");
+        assert!(h.is_done(), "Protocol should have completed");
     }
 
     // ========================================================================
@@ -1100,7 +934,7 @@ mod tests {
 
         // The protocol should eventually terminate (download task aborts)
         assert!(
-            h.run_to_completion(20),
+            h.is_done(),
             "Protocol should terminate after unexpected CONNECT"
         );
     }
@@ -1115,7 +949,7 @@ mod tests {
 
         // Should terminate
         assert!(
-            h.run_to_completion(20),
+            h.is_done(),
             "Protocol should terminate after close frame"
         );
     }
@@ -1130,7 +964,7 @@ mod tests {
 
         // Should terminate eventually
         assert!(
-            h.run_to_completion(30),
+            h.is_done(),
             "Protocol should terminate after ws_input close"
         );
     }
@@ -1146,12 +980,9 @@ mod tests {
         // Close WebSocket output before it can be fully processed
         h.ws_close_output();
 
-        // Tick to let protocol react
-        h.tick_n(10);
-
         // Protocol should terminate
         assert!(
-            h.run_to_completion(30),
+            h.is_done(),
             "Protocol should terminate after ws_output close"
         );
     }
@@ -1187,7 +1018,7 @@ mod tests {
 
         // Should eventually complete
         assert!(
-            h.run_to_completion(30),
+            h.is_done(),
             "Protocol should complete in discarding mode"
         );
     }
@@ -1220,7 +1051,7 @@ mod tests {
 
         // Protocol should eventually terminate due to timeout
         assert!(
-            h.run_to_completion(20),
+            h.is_done(),
             "Protocol should terminate due to timeout"
         );
     }
@@ -1233,29 +1064,27 @@ mod tests {
         // Write data but don't drain outputs (simulate slow consumer)
         {
             let mut item = Some(Bytes::from_static(b"test1"));
-            block_on(h.io().up_in.p_try_write(&mut item, None));
+            let g=h.protocol.lock();
+            block_on(g.up_in.p_try_write(&mut item, None));
         }
-        // Don't call tick() which would drain outputs
-
-        // Manually tick without draining
-        h.protocol.tick(h.now);
-
         // Write more data
         {
             let mut item = Some(Bytes::from_static(b"test2"));
-            block_on(h.io().up_in.p_try_write(&mut item, None));
+            let g=h.protocol.lock();
+            block_on(g.up_in.p_try_write(&mut item, None));
         }
 
         // Advance time past the send timeout without consuming
         for _ in 0..70 {
+            let g= h.protocol.lock();
             h.now += Duration::from_secs(1);
-            h.protocol.tick(h.now);
+            g.now_ticks.store(h.now.as_ticks(), Ordering::SeqCst);
         }
 
         // Now drain and check protocol terminates
         h.drain_outputs();
         assert!(
-            h.run_to_completion(20),
+            h.is_done(),
             "Protocol should fail due to send timeout"
         );
     }
@@ -1307,7 +1136,7 @@ mod tests {
         assert!(app_data.is_empty(), "Unknown messages should be ignored");
 
         // Protocol should still be running
-        assert!(h.tick(), "Protocol should still be running");
+        assert!(!h.is_done(), "Protocol should still be running");
     }
 
     /// Test Ping/Pong messages are ignored
@@ -1337,9 +1166,6 @@ mod tests {
 
         // WebSocket sends EOF
         h.ws_write(Message::Binary(Bytes::new()));
-
-        // Keep ticking - upload task should notice download finished and send RDSD
-        h.tick_n(10);
 
         // Check if RDSD was sent
         let ws_msgs = h.take_ws_msgs();
@@ -1426,7 +1252,7 @@ mod tests {
 
         // Protocol should terminate
         assert!(
-            h.run_to_completion(30),
+            h.is_done(),
             "Protocol should have terminated after download failure"
         );
     }
@@ -1445,13 +1271,13 @@ mod tests {
         // Write more to trigger failure
         {
             let mut item = Some(Bytes::from_static(b"more"));
-            block_on(h.io().up_in.p_try_write(&mut item, None));
+            let g=h.protocol.lock();
+            block_on(g.up_in.p_try_write(&mut item, None));
         }
-        h.tick_n(10);
 
         // Download should eventually notice and terminate
         assert!(
-            h.run_to_completion(30),
+            h.is_done(),
             "Protocol should have completed after upload abort"
         );
     }
@@ -1468,9 +1294,6 @@ mod tests {
 
         // Close WebSocket input to make download fail
         h.ws_close_input();
-
-        // Run for a bit
-        h.tick_n(20);
 
         // Count EOF messages sent to WebSocket
         let ws_msgs = h.take_ws_msgs();

@@ -26,13 +26,14 @@
 
 use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
+use crate::proc_machines::LockableSelector;
 use crate::scitemstream::ScItemStream;
 use crate::spitemsink::SpItemSink;
 use crate::spsc::{
     with_context, yield_once, SimpleSpScItemInner, SpScItem, SpScItemState, SpScMutex,
 };
 use crate::trace_id::{next_trace_id, TraceId};
-use crate::tunnel_protocol::TunnelProtocol;
+use crate::tunnel_protocol::{TunnelIO, TunnelProtocol, create_tunnel_protocol};
 use crate::{
     noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN,
     STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS,
@@ -49,7 +50,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::Instrument;
 
@@ -59,8 +60,8 @@ type WsRawSink = futures::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpSt
 /// The underlying WebSocket stream type (read half after split).
 type WsBaseStream = futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
-pub type TunnelStream = ScItemStream<TunnelProtocol, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
-pub type TunnelSink = SpItemSink<TunnelProtocol, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
+pub type TunnelStream = ScItemStream<TunnelIO, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
+pub type TunnelSink = SpItemSink<TunnelIO, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
 
 /// Configuration for the tunnel listener.
 ///
@@ -608,11 +609,11 @@ impl TunnelListener {
         let conn_id = conn_id.unwrap_or_else(|| "?".into());
 
         // Create the sans-io protocol state machine
-        let protocol = TunnelProtocol::new(coarsetime::Instant::now());
+        let protocol = create_tunnel_protocol(coarsetime::Instant::now());
 
         // Create sink and stream that interface with the protocol
-        let sink = TunnelSink::new(protocol.clone(), |io| &io.io().up_in);
-        let stream = TunnelStream::new(protocol.clone(), |io| &io.io().down_out);
+        let sink = TunnelSink::new(protocol.clone(), |io: &TunnelIO| &io.up_in);
+        let stream = TunnelStream::new(protocol.clone(), |io: &TunnelIO| &io.down_out);
 
         // Spawn the bridge task that connects the protocol to the WebSocket
         let recycle_tx = shared.recycle_tx.clone();
@@ -659,11 +660,8 @@ impl TunnelListener {
         shutdown_rx: watch::Receiver<bool>,
     ) {
         let _connection_stat = ScopeStat::new(&stat_counter, STAT_COUNT_CONNECTIONS);
-        let io = protocol.io();
         let mut shutdown_rx = shutdown_rx;
         let mut protocol_done = false;
-        let p_item = &io.down_in;
-        let c_item = &io.up_out;
         let mut up_open = true;
         let mut down_open = true;
         let mut got_err = false;
@@ -676,20 +674,26 @@ impl TunnelListener {
         while up_open || down_open {
             // Tick the protocol to advance state
             let now = coarsetime::Instant::now();
-            if !protocol.tick(now) {
+            {
+                let g=protocol.lock();
+                g.now_ticks.store(now.as_ticks(), std::sync::atomic::Ordering::SeqCst);
+            }
+            if protocol.is_done() {
                 protocol_done = true;
                 break;
             }
             let mut did_something = false;
 
             if up_open {
-                match poll_transfer_up(&stat_counter, &mut ws_tx, &c_item).await {
+                match poll_transfer_up(&stat_counter, &mut ws_tx, &protocol).await {
                     Poll::Pending => {}
                     Poll::Ready(Err(SpScItemState::Closed)) => {
                         up_open = false;
                     }
                     Poll::Ready(res) => {
                         if res.is_err() {
+                            let g=protocol.lock();
+                            let c_item = &g.up_out;
                             got_err = true;
                             up_open = false;
                             c_item.close();
@@ -702,6 +706,8 @@ impl TunnelListener {
                 }
             }
             if down_open {
+                let g=protocol.lock();
+                let p_item = &g.down_in;
                 match poll_transfer_down(&stat_counter, &mut ws_rx, &p_item).await {
                     Poll::Pending => {}
                     Poll::Ready(Err(SpScItemState::Closed)) => {
@@ -723,9 +729,10 @@ impl TunnelListener {
                     Poll::Pending => {}
                     Poll::Ready(res) => {
                         if res.is_err() {
+                        let g=protocol.lock();
+                        let c_item = &g.up_out;
                             up_open = false;
                             got_err = true;
-                            c_item.close();
                         } else {
                             last_ping = now;
                             need_flush = true;
@@ -744,6 +751,8 @@ impl TunnelListener {
                         need_flush = false;
                         up_open = false;
                         got_err = true;
+                        let g=protocol.lock();
+                        let c_item = &g.up_out;
                         c_item.close();
                         did_something = true;
                     }
@@ -756,8 +765,11 @@ impl TunnelListener {
         }
 
         // Close the protocol channels
-        io.down_in.close();
-        io.up_out.close();
+        {
+            let g = protocol.lock();
+            g.down_in.close();
+            g.up_out.close();
+        }
 
         if !protocol_done || got_err {
             // Can't recycle. Just drop everything
@@ -776,8 +788,10 @@ impl TunnelListener {
 async fn poll_transfer_up(
     stat_counter: &Arc<dyn StatCounter>,
     ws_tx: &mut WsRawSink,
-    c_item: &SpScMutex<SimpleSpScItemInner<Message>>,
+    protocol: &TunnelProtocol,
 ) -> Poll<Result<(), SpScItemState>> {
+    let g=protocol.lock();
+    let c_item = &g.up_out;
     let rst = c_item.c_check_read(None).await;
     match rst {
         SpScItemState::Waiting | SpScItemState::Busy => return Poll::Pending,
