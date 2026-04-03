@@ -8,7 +8,7 @@ use std::{
 
 use futures::task::AtomicWaker;
 
-use crate::{shared_sink::SharedSink, shared_stream::SharedStream};
+use crate::{io_sink::IoSink, io_stream::IoStream};
 
 // A single-slot rendezvous exchange between a `Sink` writer and a `Stream` reader.
 //
@@ -46,7 +46,7 @@ const EXCH_FULL_CLOSED: u8 = 4;
 const EXCH_DONE: u8 = 5;
 const EXCH_DROPPED: u8 = 6;
 
-impl<ITEM> SharedExchange<ITEM> {
+impl<ITEM: Send> SharedExchange<ITEM> {
     pub fn new() -> Self {
         Self {
             reader: AtomicWaker::new(),
@@ -56,7 +56,7 @@ impl<ITEM> SharedExchange<ITEM> {
         }
     }
 }
-impl<ITEM> SharedStream<ITEM> for SharedExchange<ITEM> {
+impl<ITEM: Send> IoStream<ITEM> for SharedExchange<ITEM> {
     // Reader side: attempt to take the next item.
     //
     // Behavior:
@@ -104,7 +104,7 @@ impl<ITEM> SharedStream<ITEM> for SharedExchange<ITEM> {
         }
     }
 }
-impl<ITEM> SharedSink<ITEM> for SharedExchange<ITEM> {
+impl<ITEM: Send> IoSink<ITEM> for SharedExchange<ITEM> {
     type Error = SharedExchangeWriteError;
     // Writer side: is the slot available for a new item?
     // Returns Pending while an item is still in flight or during close.

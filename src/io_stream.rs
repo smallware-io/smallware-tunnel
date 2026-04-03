@@ -8,13 +8,13 @@ use futures::Stream;
 
 /// A variant of the `Stream` interface with internal mutability, allowing it to
 /// be used in contexts where the sink is not owned by the caller.
-pub trait SharedStream<ITEM> {
+pub trait IoStream<ITEM> {
     fn poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<ITEM>>;
     fn drop_read(&self);
 }
 
 pub trait AsSharedStream<ITEM> {
-    fn as_shared_stream(&self) -> &dyn SharedStream<ITEM>;
+    fn as_shared_stream(&self) -> &dyn IoStream<ITEM>;
 }
 
 pub struct DetachedSharedStream<ITEM> {
@@ -41,7 +41,7 @@ impl<ITEM> Drop for DetachedSharedStream<ITEM> {
     }
 }
 
-impl<ITEM> SharedStream<ITEM> for DetachedSharedStream<ITEM> {
+impl<ITEM> IoStream<ITEM> for DetachedSharedStream<ITEM> {
     fn poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<ITEM>> {
         self.inner.as_shared_stream().poll_read(cx)
     }
@@ -50,7 +50,7 @@ impl<ITEM> SharedStream<ITEM> for DetachedSharedStream<ITEM> {
     }
 }
 
-impl<ITEM> Stream for dyn SharedStream<ITEM> {
+impl<ITEM> Stream for dyn IoStream<ITEM> {
     type Item = ITEM;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.as_ref().poll_read(cx)

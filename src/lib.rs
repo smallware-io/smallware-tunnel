@@ -56,13 +56,15 @@ pub mod listener;
 pub mod proc_machines;
 mod scitemstream;
 pub mod shared_exchange;
-pub mod shared_sink;
-pub mod shared_stream;
+pub mod io_sink;
+pub mod io_stream;
 mod spitemsink;
 pub mod spsc;
 mod stat_counter;
 pub mod trace_id;
 pub mod tunnel_protocol;
+pub mod pin_ext;
+pub mod alarm_clock;
 
 pub use error::TunnelError;
 pub use forward::{forward_tunnel, forward_tunnel_tcp, ForwardStats};

@@ -70,11 +70,10 @@
 
 use bytes::Bytes;
 use coarsetime::{Duration, Instant};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::alarm_clock::AlarmClock;
 use crate::proc_machines::*;
 use crate::spsc::*;
 
@@ -139,7 +138,7 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct TunnelIO {
     /// Current timestamp as ticks (for timeout checking).
     /// Updated by external code via `update_clock()`.
-    pub now_ticks: AtomicU64,
+    pub clock: AlarmClock<Instant>,
 
     /// WebSocket messages coming in (external → download task).
     /// External code writes Messages received from the WebSocket here.
@@ -166,9 +165,9 @@ impl TunnelIO {
     /// Creates a new TunnelIO with the given initial timestamp.
     ///
     /// All channels start in the `Waiting` state (ready to receive).
-    pub fn new(now: &Instant) -> Self {
+    pub fn new(now: Instant) -> Self {
         Self {
-            now_ticks: AtomicU64::new(now.as_ticks()),
+            clock: AlarmClock::new(now),
             down_in: SpScMutex::new(SimpleSpScItemInner::default()),
             down_out: SpScMutex::new(SimpleSpScItemInner::default()),
             up_in: SpScMutex::new(SimpleSpScItemInner::default()),
@@ -181,7 +180,7 @@ impl TunnelIO {
     ///
     /// This is used by tasks to calculate timeout deadlines.
     pub fn now(&self) -> Instant {
-        Instant::from_ticks(self.now_ticks.load(Ordering::SeqCst))
+        *self.clock.get()
     }
 
     /// Update the clock and check for expired timeouts.
@@ -193,10 +192,7 @@ impl TunnelIO {
     ///
     /// * `now` - The current timestamp
     pub fn update_clock(&self, now: Instant) {
-        let now_ticks = now.as_ticks();
-        let old_ticks = self.now_ticks.fetch_max(now.as_ticks(), Ordering::SeqCst);
-        // Only check timeouts if time actually advanced
-        if old_ticks < now_ticks {
+        if self.clock.advance(now) {
             self.down_in.check_timeouts(now);
             self.down_out.check_timeouts(now);
             self.up_in.check_timeouts(now);
@@ -593,7 +589,7 @@ async fn down_abort(io: &TunnelIO) -> TaskEnd {
 
 pub type TunnelProtocol = Arc<dyn ProcMachine<TunnelIO>>;
 pub fn create_tunnel_protocol(now: Instant) -> TunnelProtocol {
-    let arc = PROC_MACHINE_JOBS_BASE.with(up_connected).with(down_connected).build(TunnelIO::new(&now));
+    let arc = PROC_MACHINE_JOBS_BASE.with(up_connected).with(down_connected).build(TunnelIO::new(now));
     arc
 }
 
@@ -676,7 +672,7 @@ mod tests {
         fn advance_and_tick(&mut self, duration: Duration) {
             self.now += duration;
             let g = self.protocol.lock();
-            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
+            g.update_clock(self.now);
         }
 
         /// Write data from "app" into the upload channel
@@ -696,14 +692,14 @@ mod tests {
         fn app_close_upload(&mut self) {
             let g=self.protocol.lock();
             g.up_in.close();
-            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
+            g.clock.advance(self.now);
         }
 
         /// Close the app's download channel (simulate app closed for reading)
         fn app_close_download(&mut self) {
             let g=self.protocol.lock();
             g.down_out.close();
-            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
+            g.clock.advance(self.now);
         }
 
         fn is_done(&self) -> bool {
@@ -715,7 +711,7 @@ mod tests {
             let mut item = Some(msg);
             let g=self.protocol.lock();
             let result = block_on(g.down_in.p_try_write(&mut item, None));
-            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
+            g.clock.advance(self.now);
             result
         }
 
@@ -723,14 +719,14 @@ mod tests {
         fn ws_close_input(&mut self) {
             let g=self.protocol.lock();
             g.down_in.close();
-            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
+            g.clock.advance(self.now);
         }
 
         /// Close the WebSocket output channel
         fn ws_close_output(&mut self) {
             let g=self.protocol.lock();
             g.up_out.close();
-            g.now_ticks.store(self.now.as_ticks(), Ordering::SeqCst);
+            g.clock.advance(self.now);
         }
 
         /// Get collected WebSocket output messages
@@ -1078,7 +1074,7 @@ mod tests {
         for _ in 0..70 {
             let g= h.protocol.lock();
             h.now += Duration::from_secs(1);
-            g.now_ticks.store(h.now.as_ticks(), Ordering::SeqCst);
+            g.clock.advance(h.now);
         }
 
         // Now drain and check protocol terminates

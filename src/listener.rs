@@ -676,7 +676,7 @@ impl TunnelListener {
             let now = coarsetime::Instant::now();
             {
                 let g=protocol.lock();
-                g.now_ticks.store(now.as_ticks(), std::sync::atomic::Ordering::SeqCst);
+                g.clock.advance(now);
             }
             if protocol.is_done() {
                 protocol_done = true;
