@@ -1,4 +1,5 @@
 use std::{
+    fmt::Display,
     sync::{
         atomic::{AtomicU8, Ordering},
         Mutex,
@@ -19,7 +20,8 @@ use crate::{io_sink::IoSink, io_stream::IoStream};
 //
 // The `Mutex<Option<ITEM>>` protects the actual payload. The `state` tracks
 // whether the slot is empty/full, flushing, or closed.
-pub struct SharedExchange<ITEM> {
+#[derive(Debug)]
+pub struct IoExchange<ITEM> {
     reader: AtomicWaker,
     writer: AtomicWaker,
     state: AtomicU8,
@@ -27,9 +29,22 @@ pub struct SharedExchange<ITEM> {
 }
 
 #[derive(Debug)]
-pub enum SharedExchangeWriteError {
+pub enum ExchangeWriteError {
     ReaderDropped,
     InvalidState,
+}
+
+impl Display for ExchangeWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExchangeWriteError::ReaderDropped => {
+                write!(f, "Write operation failed -- the reader has been dropped.")
+            }
+            ExchangeWriteError::InvalidState => {
+                write!(f, "Write operation failed -- not ready to receive")
+            }
+        }
+    }
 }
 
 // State machine (single slot) overview:
@@ -46,7 +61,7 @@ const EXCH_FULL_CLOSED: u8 = 4;
 const EXCH_DONE: u8 = 5;
 const EXCH_DROPPED: u8 = 6;
 
-impl<ITEM: Send> SharedExchange<ITEM> {
+impl<ITEM: Send> IoExchange<ITEM> {
     pub fn new() -> Self {
         Self {
             reader: AtomicWaker::new(),
@@ -56,7 +71,18 @@ impl<ITEM: Send> SharedExchange<ITEM> {
         }
     }
 }
-impl<ITEM: Send> IoStream<ITEM> for SharedExchange<ITEM> {
+impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
+    fn check_read(&self, cx: &mut Context<'_>) -> Poll<bool> {
+        self.reader.register(cx.waker());
+        let guard = self.item.lock().unwrap();
+        let st = self.state.load(Ordering::Acquire);
+        match st {
+            EXCH_EMPTY | EXCH_EMPTY_FLUSH => Poll::Pending,
+            EXCH_FULL | EXCH_FULL_CLOSED | EXCH_FULL_FLUSH => Poll::Ready(guard.is_some()),
+            _ => Poll::Ready(false),
+        }
+    }
+
     // Reader side: attempt to take the next item.
     //
     // Behavior:
@@ -104,23 +130,29 @@ impl<ITEM: Send> IoStream<ITEM> for SharedExchange<ITEM> {
         }
     }
 }
-impl<ITEM: Send> IoSink<ITEM> for SharedExchange<ITEM> {
-    type Error = SharedExchangeWriteError;
+impl<ITEM: Send> IoSink for IoExchange<ITEM> {
+    type Error = ExchangeWriteError;
+    type Item = ITEM;
     // Writer side: is the slot available for a new item?
     // Returns Pending while an item is still in flight or during close.
-    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), SharedExchangeWriteError>> {
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
         self.writer.register(cx.waker());
         match self.state.load(Ordering::Acquire) {
             EXCH_EMPTY | EXCH_EMPTY_FLUSH => Poll::Ready(Ok(())),
             EXCH_FULL | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => Poll::Pending,
-            EXCH_DROPPED => Poll::Ready(Err(SharedExchangeWriteError::ReaderDropped)),
-            _ => Poll::Ready(Err(SharedExchangeWriteError::InvalidState)),
+            EXCH_DROPPED => Poll::Ready(Err(ExchangeWriteError::ReaderDropped)),
+            _ => Poll::Ready(Err(ExchangeWriteError::InvalidState)),
         }
     }
-    // Writer side: publish a new item into the slot.
-    //
-    // This only succeeds when the slot is empty (flush state allowed).
-    fn start_send(&self, item: ITEM) -> Result<(), SharedExchangeWriteError> {
+    fn poll_send(
+        &self,
+        cx: &mut Context<'_>,
+        item: &mut Option<Self::Item>,
+    ) -> Poll<Result<(), ExchangeWriteError>> {
+        self.writer.register(cx.waker());
+        if item.is_none() {
+            return Poll::Ready(Ok(()));
+        }
         let mut guard = self.item.lock().unwrap();
         let st = self.state.load(Ordering::Acquire);
         match st {
@@ -130,21 +162,22 @@ impl<ITEM: Send> IoSink<ITEM> for SharedExchange<ITEM> {
                     .compare_exchange(st, EXCH_FULL, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    *guard = Some(item);
+                    *guard = item.take();
                     self.state.store(EXCH_FULL, Ordering::Release);
                     self.reader.wake();
-                    Ok(())
+                    Poll::Ready(Ok(()))
                 } else {
-                    Err(SharedExchangeWriteError::InvalidState)
+                    Poll::Ready(Err(ExchangeWriteError::InvalidState))
                 }
             }
-            EXCH_DROPPED => Err(SharedExchangeWriteError::ReaderDropped),
-            _ => Err(SharedExchangeWriteError::InvalidState),
+            EXCH_FULL | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => Poll::Pending,
+            EXCH_DROPPED => Poll::Ready(Err(ExchangeWriteError::ReaderDropped)),
+            _ => Poll::Ready(Err(ExchangeWriteError::InvalidState)),
         }
     }
-    // Begin a flush. Returns true if flush is complete immediately.
-    // If an item is in flight, transitions to a FLUSH state and waits.
-    fn start_flush(&self) -> bool {
+
+    fn poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+        self.writer.register(cx.waker());
         loop {
             let st = self.state.load(Ordering::Acquire);
             match st {
@@ -155,7 +188,7 @@ impl<ITEM: Send> IoSink<ITEM> for SharedExchange<ITEM> {
                         .is_ok()
                     {
                         self.reader.wake();
-                        break true;
+                        break Poll::Ready(Ok(()));
                     }
                 }
                 EXCH_FULL => {
@@ -171,25 +204,17 @@ impl<ITEM: Send> IoSink<ITEM> for SharedExchange<ITEM> {
                         .is_ok()
                     {
                         self.reader.wake();
-                        break false;
+                        break Poll::Pending;
                     }
                 }
-                EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => break false,
-                _ => break true,
-            }
+                EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => return Poll::Pending,
+                _ => break Poll::Ready(Ok(())),
+            };
         }
     }
-    // Writer side: wait until the flush completes.
-    fn poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), SharedExchangeWriteError>> {
+
+    fn poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
         self.writer.register(cx.waker());
-        match self.start_flush() {
-            true => Poll::Ready(Ok(())),
-            false => Poll::Pending,
-        }
-    }
-    // Begin closing. If empty, move to DONE. If full, mark FULL_CLOSED so
-    // the reader will consume the last item and then finish.
-    fn send_close(&self) -> bool {
         loop {
             let st = self.state.load(Ordering::Acquire);
             match st {
@@ -200,7 +225,7 @@ impl<ITEM: Send> IoSink<ITEM> for SharedExchange<ITEM> {
                         .is_ok()
                     {
                         self.reader.wake();
-                        break true;
+                        break Poll::Ready(Ok(()));
                     }
                 }
                 EXCH_FULL | EXCH_FULL_FLUSH => {
@@ -211,24 +236,15 @@ impl<ITEM: Send> IoSink<ITEM> for SharedExchange<ITEM> {
                         .is_ok()
                     {
                         self.reader.wake();
-                        break false;
+                        break Poll::Pending;
                     }
                 }
-                EXCH_FULL_CLOSED => break false,
-                _ => break true,
+                EXCH_FULL_CLOSED => break Poll::Pending,
+                _ => break Poll::Ready(Ok(())),
             }
         }
     }
-    // Writer side: wait until close is fully observed.
-    fn poll_send_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), SharedExchangeWriteError>> {
-        self.writer.register(cx.waker());
-        match self.send_close() {
-            true => Poll::Ready(Ok(())),
-            false => Poll::Pending,
-        }
-    }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -245,7 +261,7 @@ mod tests {
 
     #[test]
     fn send_receive_single_item() {
-        let r = SharedExchange::new();
+        let r = IoExchange::new();
 
         let pending = with_noop_cx(|cx| r.poll_read(cx));
         assert!(matches!(pending, Poll::Pending));
@@ -253,7 +269,10 @@ mod tests {
         let ready = with_noop_cx(|cx| r.poll_send_ready(cx));
         assert!(matches!(ready, Poll::Ready(Ok(()))));
 
-        r.start_send(42).unwrap();
+        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(42))) {
+            Poll::Ready(Ok(_)) => (),
+            _ => panic!(),
+        }
 
         let pending = with_noop_cx(|cx| r.poll_send_ready(cx));
         assert!(matches!(pending, Poll::Pending));
@@ -270,7 +289,7 @@ mod tests {
 
     #[test]
     fn flush_on_empty_is_immediate() {
-        let r: SharedExchange<i32> = SharedExchange::new();
+        let r: IoExchange<i32> = IoExchange::new();
 
         let flushed = with_noop_cx(|cx| r.poll_flush(cx));
         assert!(matches!(flushed, Poll::Ready(Ok(()))));
@@ -281,8 +300,11 @@ mod tests {
 
     #[test]
     fn flush_waits_for_in_flight_item() {
-        let r = SharedExchange::new();
-        r.start_send(7).unwrap();
+        let r = IoExchange::new();
+        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(7))) {
+            Poll::Ready(Ok(_)) => (),
+            _ => panic!(),
+        }
 
         let pending = with_noop_cx(|cx| r.poll_flush(cx));
         assert!(matches!(pending, Poll::Pending));
@@ -296,9 +318,9 @@ mod tests {
 
     #[test]
     fn close_when_empty_finishes_stream() {
-        let r: SharedExchange<i32> = SharedExchange::new();
+        let r: IoExchange<i32> = IoExchange::new();
 
-        let closed = with_noop_cx(|cx| r.poll_send_close(cx));
+        let closed = with_noop_cx(|cx| r.poll_close(cx));
         assert!(matches!(closed, Poll::Ready(Ok(()))));
 
         let end = with_noop_cx(|cx| r.poll_read(cx));
@@ -307,10 +329,13 @@ mod tests {
 
     #[test]
     fn close_after_full_delivers_last_item() {
-        let r = SharedExchange::new();
-        r.start_send(11).unwrap();
+        let r = IoExchange::new();
+        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(11))) {
+            Poll::Ready(Ok(_)) => (),
+            _ => panic!(),
+        }
 
-        let pending = with_noop_cx(|cx| r.poll_send_close(cx));
+        let pending = with_noop_cx(|cx| r.poll_close(cx));
         assert!(matches!(pending, Poll::Pending));
 
         let next = with_noop_cx(|cx| r.poll_read(cx));
@@ -319,31 +344,37 @@ mod tests {
         let end = with_noop_cx(|cx| r.poll_read(cx));
         assert!(matches!(end, Poll::Ready(None)));
 
-        let closed = with_noop_cx(|cx| r.poll_send_close(cx));
+        let closed = with_noop_cx(|cx| r.poll_close(cx));
         assert!(matches!(closed, Poll::Ready(Ok(()))));
     }
 
     #[test]
     fn start_send_on_full_is_invalid_state() {
-        let r = SharedExchange::new();
-        r.start_send(1).unwrap();
-
-        let err = r.start_send(2).unwrap_err();
-        assert!(matches!(err, SharedExchangeWriteError::InvalidState));
+        let r: IoExchange<i32> = IoExchange::new();
+        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(1))) {
+            Poll::Ready(Ok(_)) => (),
+            _ => panic!(),
+        }
+        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(2))) {
+            Poll::Pending => (),
+            _ => panic!(),
+        }
     }
 
     #[test]
     fn reader_dropped_errors() {
-        let r = SharedExchange::<i32>::new();
+        let r = IoExchange::<i32>::new();
         r.state.store(EXCH_DROPPED, AtomicOrdering::Release);
 
         let ready = with_noop_cx(|cx| r.poll_send_ready(cx));
         assert!(matches!(
             ready,
-            Poll::Ready(Err(SharedExchangeWriteError::ReaderDropped))
+            Poll::Ready(Err(ExchangeWriteError::ReaderDropped))
         ));
-
-        let err = r.start_send(1).unwrap_err();
-        assert!(matches!(err, SharedExchangeWriteError::ReaderDropped));
+        let ready = with_noop_cx(|cx| r.poll_send(cx, &mut Some(1)));
+        assert!(matches!(
+            ready,
+            Poll::Ready(Err(ExchangeWriteError::ReaderDropped))
+        ));
     }
 }

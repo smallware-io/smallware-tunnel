@@ -25,32 +25,33 @@
 //! to waiting `accept()` calls.
 
 use crate::error::TunnelError;
+use crate::io_sink::IoSink;
+use crate::io_stream::IoStream;
 use crate::jwt::{extract_customer_id, JwtManager};
-use crate::proc_machines::LockableSelector;
-use crate::scitemstream::ScItemStream;
-use crate::spitemsink::SpItemSink;
-use crate::spsc::{
-    with_context, yield_once, SimpleSpScItemInner, SpScItem, SpScItemState, SpScMutex,
-};
+use crate::proc_machines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
-use crate::tunnel_protocol::{TunnelIO, TunnelProtocol, create_tunnel_protocol};
+use crate::tunnel_protocol::{
+    create_tunnel_protocol, TunnelProtocol, TunnelSink, TunnelStream,
+};
 use crate::{
     noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN,
     STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS,
 };
 use bytes::Bytes;
 use derivative::Derivative;
+use futures::task::noop_waker_ref;
 use futures::{SinkExt, StreamExt};
+use std::future::poll_fn;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time;
-use tokio_tungstenite::tungstenite::protocol::{self, Message};
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::Instrument;
 
@@ -59,9 +60,6 @@ type WsRawSink = futures::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpSt
 
 /// The underlying WebSocket stream type (read half after split).
 type WsBaseStream = futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
-
-pub type TunnelStream = ScItemStream<TunnelIO, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
-pub type TunnelSink = SpItemSink<TunnelIO, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
 
 /// Configuration for the tunnel listener.
 ///
@@ -612,8 +610,8 @@ impl TunnelListener {
         let protocol = create_tunnel_protocol(coarsetime::Instant::now());
 
         // Create sink and stream that interface with the protocol
-        let sink = TunnelSink::new(protocol.clone(), |io: &TunnelIO| &io.up_in);
-        let stream = TunnelStream::new(protocol.clone(), |io: &TunnelIO| &io.down_out);
+        let sink = TunnelSink::new(protocol.clone());
+        let stream = TunnelStream::new(protocol.clone());
 
         // Spawn the bridge task that connects the protocol to the WebSocket
         let recycle_tx = shared.recycle_tx.clone();
@@ -661,7 +659,6 @@ impl TunnelListener {
     ) {
         let _connection_stat = ScopeStat::new(&stat_counter, STAT_COUNT_CONNECTIONS);
         let mut shutdown_rx = shutdown_rx;
-        let mut protocol_done = false;
         let mut up_open = true;
         let mut down_open = true;
         let mut got_err = false;
@@ -671,66 +668,66 @@ impl TunnelListener {
         let mut need_flush = false;
 
         // Main bridge loop
-        while up_open || down_open {
+        let protocol_done: bool = poll_fn(|cx| {
             // Tick the protocol to advance state
             let now = coarsetime::Instant::now();
             {
-                let g=protocol.lock();
+                let g = protocol.lock();
                 g.clock.advance(now);
             }
             if protocol.is_done() {
-                protocol_done = true;
-                break;
+                return true.into();
+            }
+            if !up_open && !down_open {
+                return false.into();
             }
             let mut did_something = false;
-
             if up_open {
-                match poll_transfer_up(&stat_counter, &mut ws_tx, &protocol).await {
+                match poll_transfer_up(cx, &stat_counter, &mut ws_tx, &protocol) {
                     Poll::Pending => {}
-                    Poll::Ready(Err(SpScItemState::Closed)) => {
+                    Poll::Ready(TransferResult::Closed) => {
                         up_open = false;
+                        need_flush = false;
+                        did_something = true;
                     }
-                    Poll::Ready(res) => {
-                        if res.is_err() {
-                            let g=protocol.lock();
-                            let c_item = &g.up_out;
-                            got_err = true;
-                            up_open = false;
-                            c_item.close();
-                        } else {
-                            last_ping = now;
-                            need_flush = true;
-                        }
+                    Poll::Ready(TransferResult::Data) => {
+                        last_ping = now;
+                        need_flush = true;
+                        did_something = true;
+                    }
+                    _ => {
+                        let g = protocol.lock();
+                        g.up_out.drop_read();
+                        got_err = true;
+                        up_open = false;
+                        need_flush = false;
                         did_something = true;
                     }
                 }
             }
             if down_open {
-                let g=protocol.lock();
-                let p_item = &g.down_in;
-                match poll_transfer_down(&stat_counter, &mut ws_rx, &p_item).await {
+                match poll_transfer_down(cx, &stat_counter, &mut ws_rx, &protocol) {
                     Poll::Pending => {}
-                    Poll::Ready(Err(SpScItemState::Closed)) => {
+                    Poll::Ready(TransferResult::Data) => {
+                        did_something = true;
+                    }
+                    Poll::Ready(TransferResult::Closed) => {
+                        did_something = true;
                         down_open = false;
                     }
-                    Poll::Ready(res) => {
-                        if res.is_err() {
-                            down_open = false;
-                            got_err = true;
-                            p_item.close();
-                        }
+                    _ => {
                         did_something = true;
+                        down_open = false;
+                        got_err = true;
+                        let _ = protocol.lock().down_in.poll_close(cx);
                     }
                 }
             }
-
             if up_open && now - last_ping > coarsetime::Duration::from_secs(60) {
-                match poll_transfer_ping(&mut ws_tx).await {
+                match poll_transfer_ping(cx, &mut ws_tx) {
                     Poll::Pending => {}
                     Poll::Ready(res) => {
                         if res.is_err() {
-                        let g=protocol.lock();
-                        let c_item = &g.up_out;
                             up_open = false;
                             got_err = true;
                         } else {
@@ -742,7 +739,7 @@ impl TunnelListener {
                 }
             }
             if need_flush && !did_something {
-                match poll_transfer_flush(&mut ws_tx).await {
+                match poll_transfer_flush(cx, &mut ws_tx) {
                     Poll::Pending => {}
                     Poll::Ready(Ok(_)) => {
                         need_flush = false;
@@ -751,24 +748,23 @@ impl TunnelListener {
                         need_flush = false;
                         up_open = false;
                         got_err = true;
-                        let g=protocol.lock();
-                        let c_item = &g.up_out;
-                        c_item.close();
+                        protocol.lock().up_out.drop_read();
                         did_something = true;
                     }
                 }
             }
-            if !did_something {
-                let _ = with_context(|cx| ticker.poll_tick(cx)).await;
-                yield_once().await;
+            if did_something || ticker.poll_tick(cx).is_ready() {
+                cx.waker().wake_by_ref();
             }
-        }
+            Poll::Pending
+        }).await;
 
         // Close the protocol channels
         {
             let g = protocol.lock();
-            g.down_in.close();
-            g.up_out.close();
+            let mut cx = Context::from_waker(noop_waker_ref());
+            let _ = g.down_in.poll_close(&mut cx);
+            g.up_out.drop_read();
         }
 
         if !protocol_done || got_err {
@@ -785,61 +781,65 @@ impl TunnelListener {
     }
 }
 
-async fn poll_transfer_up(
+enum TransferResult {
+    Data,
+    Closed,
+    Fail
+}
+
+fn poll_transfer_up(
+    cx: &mut Context<'_>,
     stat_counter: &Arc<dyn StatCounter>,
     ws_tx: &mut WsRawSink,
     protocol: &TunnelProtocol,
-) -> Poll<Result<(), SpScItemState>> {
-    let g=protocol.lock();
-    let c_item = &g.up_out;
-    let rst = c_item.c_check_read(None).await;
-    match rst {
-        SpScItemState::Waiting | SpScItemState::Busy => return Poll::Pending,
-        SpScItemState::Closed | SpScItemState::Failed => return Poll::Ready(Err(rst)),
-        SpScItemState::Full => {}
+) -> Poll<TransferResult> {
+    let g = protocol.lock();
+    let src = &g.up_out;
+    match src.check_read(cx) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(false) => {
+            src.drop_read();
+            return TransferResult::Closed.into();
+        },
+        _ => ()
     };
-    let ready = with_context(|cx| ws_tx.poll_ready_unpin(cx)).await;
-    match ready {
+    match ws_tx.poll_ready_unpin(cx) {
         Poll::Pending => return Poll::Pending,
         Poll::Ready(Err(_)) => {
-            c_item.close();
+            src.drop_read();
             tracing::error!("Websocket write failed");
-            return Poll::Ready(Err(rst));
+            return TransferResult::Fail.into();
         }
-        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Ok(_)) => ()
     };
-    let mut receiver: Option<Message> = None;
-    match c_item.c_try_read(&mut receiver, None).await {
-        SpScItemState::Busy => {
-            if let Some(item) = receiver {
-                tracing::debug!("WS UP");
-                match &item {
-                    Message::Binary(bytes) => {
-                        stat_counter.stat_count(STAT_COUNT_BYTES_UP, bytes.len() as i32);
-                    }
-                    _ => {}
-                }
-                if ws_tx.start_send_unpin(item).is_err() {
-                    c_item.close();
-                    tracing::error!("start_send failed");
-                    return Poll::Ready(Err(rst));
-                }
+    let item = match src.poll_read(cx) {
+        Poll::Pending => {
+            tracing::error!("Pending poll_read after check_read->true");
+            return Poll::Pending
+        },
+        Poll::Ready(bytes) => bytes,
+    };
+    if let Some(item) = item {
+        tracing::debug!("WS UP");
+        match &item {
+            Message::Binary(bytes) => {
+                stat_counter.stat_count(STAT_COUNT_BYTES_UP, bytes.len() as i32);
             }
-            // SUCCESS
+            _ => {}
+        };
+        if ws_tx.start_send_unpin(item).is_err() {
+            src.drop_read();
+            tracing::error!("start_send failed");
+            return TransferResult::Fail.into();
         }
-        _ => {
-            //we can no longer read for some reason
-            tracing::error!("Can't read to start_send");
-            let _ = with_context(|cx| ws_tx.poll_close_unpin(cx)).await;
-            c_item.close();
-            return Poll::Ready(Err(rst));
-        }
+    } else {
+        tracing::error!("poll_read() produced None after check_read()->true");
     }
-    Poll::Ready(Ok(()))
+    TransferResult::Data.into()
 }
 
-async fn poll_transfer_ping(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
-    let ready = with_context(|cx| ws_tx.poll_ready_unpin(cx)).await;
+fn poll_transfer_ping(cx: &mut Context<'_>, ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
+    let ready = ws_tx.poll_ready_unpin(cx);
     match ready {
         Poll::Pending => return Poll::Pending,
         Poll::Ready(Err(_)) => {
@@ -857,8 +857,8 @@ async fn poll_transfer_ping(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
     Poll::Ready(Ok(()))
 }
 
-async fn poll_transfer_flush(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
-    let ready = with_context(|cx| ws_tx.poll_flush_unpin(cx)).await;
+fn poll_transfer_flush(cx: &mut Context<'_>, ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
+    let ready = ws_tx.poll_flush_unpin(cx);
     match ready {
         Poll::Pending => return Poll::Pending,
         Poll::Ready(Err(_)) => {
@@ -871,31 +871,36 @@ async fn poll_transfer_flush(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
     Poll::Ready(Ok(()))
 }
 
-async fn poll_transfer_down(
+fn poll_transfer_down(
+    cx: &mut Context<'_>,
     stat_counter: &Arc<dyn StatCounter>,
     ws_rx: &mut WsBaseStream,
-    p_item: &SpScMutex<SimpleSpScItemInner<Message>>,
-) -> Poll<Result<(), SpScItemState>> {
-    let wst = p_item.p_check_write(None).await;
-    match wst {
-        SpScItemState::Waiting => {}
-        SpScItemState::Busy => return Poll::Pending,
-        SpScItemState::Full => return Poll::Pending,
-        SpScItemState::Closed | SpScItemState::Failed => return Poll::Ready(Err(wst)),
+    protocol: &TunnelProtocol,
+) -> Poll<TransferResult> {
+    let g = protocol.lock();
+    let sink = &g.down_in;
+    match sink.poll_send_ready(cx) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(_)) => {
+            tracing::error!("Protocol write failed");
+            let _ = sink.poll_close(cx);
+            return TransferResult::Fail.into();
+        },
+        _ => ()
     }
-    let ready = with_context(|cx| ws_rx.poll_next_unpin(cx)).await;
-    let mut sender = match ready {
+    let ready = ws_rx.poll_next_unpin(cx);
+    let mut item = match ready {
         Poll::Pending => return Poll::Pending,
         Poll::Ready(Some(Err(_))) => {
-            p_item.close();
+            let _ = sink.poll_close(cx);
             tracing::error!("Websocket read failed");
-            return Poll::Ready(Err(wst));
+            return TransferResult::Fail.into();
         }
         Poll::Ready(None) => {
             // web socket EOF
-            p_item.close();
+            let _ = sink.poll_close(cx);
             tracing::error!("Websocket read EOF");
-            return Poll::Ready(Err(wst));
+            return TransferResult::Closed.into();
         }
         Poll::Ready(Some(Ok(data))) => {
             match &data {
@@ -907,15 +912,15 @@ async fn poll_transfer_down(
             Some(data)
         }
     };
-    match p_item.p_try_write(&mut sender, None).await {
-        SpScItemState::Full => {}
+    match sink.poll_send(cx, &mut item) {
+        Poll::Ready(Ok(_)) => {}
         _ => {
             tracing::error!("Can't write after successful check");
-            p_item.close();
-            return Poll::Ready(Err(wst));
+            let _ = sink.poll_close(cx);
+            return TransferResult::Fail.into();
         }
     };
-    Poll::Ready(Ok(()))
+    return TransferResult::Data.into();
 }
 
 /// Waits until the shutdown signal is received.

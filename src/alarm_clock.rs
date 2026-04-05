@@ -1,6 +1,11 @@
 use parking_lot::Mutex;
 use std::{
-    cell::UnsafeCell, fmt::Debug, future::Future, marker::{PhantomData, PhantomPinned}, pin::Pin, task::{Context, Poll, Waker}
+    cell::UnsafeCell,
+    fmt::Debug,
+    future::Future,
+    marker::{PhantomData, PhantomPinned},
+    pin::Pin,
+    task::{Context, Poll, Waker},
 };
 
 struct UnsafeLink<T> {
@@ -51,11 +56,14 @@ enum NodeType<T: PartialOrd> {
         mutex: Mutex<T>,
     },
     Node {
+        // SAFETY: new_node constructor ensures that target is pinned and has appropriate lifetime
         target: *const AlarmNode<T>,
         val: UnsafeCell<Option<T>>,
         waker: UnsafeCell<Option<Waker>>,
     },
 }
+
+//TODO AlarmNode needs clock lifetime
 struct AlarmNode<T: PartialOrd> {
     typ: NodeType<T>,
     prev: UnsafeLink<AlarmNode<T>>,
@@ -63,6 +71,7 @@ struct AlarmNode<T: PartialOrd> {
     _marker: PhantomPinned,
 }
 unsafe impl<T: PartialOrd> Send for AlarmNode<T> {}
+unsafe impl<T: PartialOrd> Sync for AlarmNode<T> {}
 
 impl<T: PartialOrd> NodeType<T> {
     fn is_head(&self) -> bool {
@@ -222,9 +231,9 @@ impl<T: PartialOrd> AlarmNode<T> {
         return false;
     }
 
-    fn get_clock<'a>(&'a self) -> &'a T{
+    fn get_clock<'a>(&'a self) -> &'a T {
         let guard = self.typ.lock_target();
-        unsafe {&*(&*guard as *const T)}
+        unsafe { &*(&*guard as *const T) }
     }
 
     fn set_clock(&self, val: T, advance_only: bool) -> bool {
@@ -260,7 +269,7 @@ impl<T: PartialOrd> AlarmNode<T> {
                         }
                     }
                 }
-            };
+            }
         }
         true
     }
@@ -293,7 +302,7 @@ impl<T: PartialOrd> AlarmClock<T> {
         self.head.set_clock(val, false);
     }
     #[inline(always)]
-    pub fn get(&self) -> &T{
+    pub fn get(&self) -> &T {
         self.head.get_clock()
     }
     #[inline(always)]
@@ -329,6 +338,13 @@ impl<'a, T: PartialOrd> Alarm<'a, T> {
 
     pub fn get(&self) -> Option<&T> {
         self.node.get_alarm()
+    }
+    pub fn poll_ref(self: &Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let node_pin = unsafe { Pin::new_unchecked(&self.node) };
+        match node_pin.check_alarm(cx) {
+            true => Poll::Ready(()),
+            false => Poll::Pending,
+        }
     }
 }
 

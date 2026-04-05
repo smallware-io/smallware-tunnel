@@ -67,13 +67,20 @@
 //! - When download finishes, it sets `down_result` so upload knows
 //! - If one side fails, the other starts a shutdown timer
 
-
 use bytes::Bytes;
 use coarsetime::{Duration, Instant};
+use futures::task::noop_waker_ref;
+use futures::{future::poll_fn, Future};
+use futures::{Sink, Stream};
+use std::pin::{pin, Pin};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::alarm_clock::AlarmClock;
+use crate::alarm_clock::{Alarm, AlarmClock};
+use crate::io_exchange::{ExchangeWriteError, IoExchange};
+use crate::io_sink::IoSink;
+use crate::io_stream::IoStream;
 use crate::proc_machines::*;
 use crate::spsc::*;
 
@@ -142,19 +149,19 @@ pub struct TunnelIO {
 
     /// WebSocket messages coming in (external → download task).
     /// External code writes Messages received from the WebSocket here.
-    pub down_in: SpScMutex<SimpleSpScItemInner<Message>>,
+    pub down_in: IoExchange<Message>,
 
     /// Application data going out (download task → external).
     /// Download task writes Bytes extracted from Messages here.
-    pub down_out: SpScMutex<SimpleSpScItemInner<Bytes>>,
+    pub down_out: IoExchange<Bytes>,
 
     /// Application data coming in (external → upload task).
     /// External code writes Bytes from the application here.
-    pub up_in: SpScMutex<SimpleSpScItemInner<Bytes>>,
+    pub up_in: IoExchange<Bytes>,
 
     /// WebSocket messages going out (upload task → external).
     /// Upload task writes Messages to be sent to the WebSocket here.
-    pub up_out: SpScMutex<SimpleSpScItemInner<Message>>,
+    pub up_out: IoExchange<Message>,
 
     /// Coordination state between upload and download tasks.
     /// Used to signal when one task completes or fails.
@@ -168,10 +175,10 @@ impl TunnelIO {
     pub fn new(now: Instant) -> Self {
         Self {
             clock: AlarmClock::new(now),
-            down_in: SpScMutex::new(SimpleSpScItemInner::default()),
-            down_out: SpScMutex::new(SimpleSpScItemInner::default()),
-            up_in: SpScMutex::new(SimpleSpScItemInner::default()),
-            up_out: SpScMutex::new(SimpleSpScItemInner::default()),
+            down_in: IoExchange::new(),
+            down_out: IoExchange::new(),
+            up_in: IoExchange::new(),
+            up_out: IoExchange::new(),
             up_to_down: SpScMutex::new(UpToDown::default()),
         }
     }
@@ -192,12 +199,11 @@ impl TunnelIO {
     ///
     /// * `now` - The current timestamp
     pub fn update_clock(&self, now: Instant) {
-        if self.clock.advance(now) {
-            self.down_in.check_timeouts(now);
-            self.down_out.check_timeouts(now);
-            self.up_in.check_timeouts(now);
-            self.up_out.check_timeouts(now);
-        }
+        self.clock.advance(now);
+    }
+
+    pub fn pin_clock<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a AlarmClock<Instant>> {
+        unsafe { Pin::<&'a AlarmClock<Instant>>::new_unchecked(&(*self).clock) }
     }
 }
 
@@ -242,7 +248,7 @@ pub struct UpToDown {
 ///
 /// This async function reads from `up_in` and writes to `up_out` until EOF
 /// or an error occurs. It coordinates with the download task via `up_to_down`.
-async fn up_connected(io: &TunnelIO) -> TaskEnd {
+async fn up_connected(io: Pin<&TunnelIO>) -> TaskEnd {
     let mut got_eof = false;
 
     // Once we're in shutdown mode, we use a read timeout to avoid hanging forever
@@ -294,31 +300,41 @@ async fn up_connected(io: &TunnelIO) -> TaskEnd {
         // If we don't have a shutdown message to send, try to read app data
         if to_send.is_none() {
             let mut data: Option<Bytes> = None;
-            let rst = io.up_in.c_try_read(&mut data, read_timeout).await;
-            match rst {
-                SpScItemState::Busy => {
-                    // Got data! We'll process it below.
-                }
-                SpScItemState::Waiting => {
-                    // No data available yet. Check if output is still valid before yielding.
-                    let out_state = io.up_out.p_get(|w| w.get_state()).await;
-                    if out_state == SpScItemState::Closed || out_state == SpScItemState::Failed {
-                        // Output channel is closed - abort
-                        tracing::info!("Up stream aborting: output channel closed while waiting");
-                        return up_abort(io).await;
+            let read_alarm = pin!(Alarm::new(io.pin_clock(), read_timeout));
+            let err: Option<&str> = poll_fn(|cx| {
+                match io.up_in.poll_read(cx) {
+                    Poll::Ready(item) => {
+                        // Got data! We'll process it below.
+                        data = item;
+                        return Poll::Ready(None);
                     }
-                    yield_once().await;
-                    continue;
-                }
-                _ => {
-                    // Channel closed or failed. Treat as EOF.
-                    tracing::info!("Up stream closing: {}", rst);
-                    got_eof = true;
-                    // Fall through to send EOF message
-                }
+                    Poll::Pending => {
+                        // No data available yet. Check if output is still valid before yielding.
+                        match io.up_out.poll_send_ready(cx) {
+                            Poll::Ready(Err(_)) => {
+                                return Poll::Ready(Some(
+                                    "Up stream aborting: output channel closed while waiting",
+                                ))
+                            }
+                            _ => (),
+                        };
+                        if read_alarm.poll_ref(cx).is_ready() {
+                            return Some(
+                                "Up stream aborting.  Read timed out after down stream shut down",
+                            )
+                            .into();
+                        }
+                    }
+                };
+                Poll::Pending
+            })
+            .await;
+            if let Some(err) = err {
+                tracing::info!(err);
+                return up_abort(io).await;
             }
-
-            // If we successfully read and we're in shutdown mode, extend the timeout
+            // We successfully read data or EOF
+            // If we're in shutdown mode, extend the timeout
             // (we're still getting data, so the app is still alive)
             if read_timeout.is_some() {
                 read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
@@ -343,50 +359,53 @@ async fn up_connected(io: &TunnelIO) -> TaskEnd {
         }
 
         // We have a message to send - write it to up_out
-        let send_timeout = Some(io.now() + SEND_TIMEOUT);
-        loop {
-            let wst = io.up_out.p_try_write(&mut to_send, send_timeout).await;
-            match wst {
-                SpScItemState::Busy => {
-                    // Consumer hasn't taken the previous message yet. Wait.
-                    yield_once().await;
-                }
-                SpScItemState::Full => {
-                    // Message accepted! Continue to next iteration.
-                    break;
-                }
-                SpScItemState::Closed | SpScItemState::Waiting | SpScItemState::Failed => {
-                    // Can't write - abort the whole upload task
-                    tracing::info!("Up stream aborting: Error sending: {}", wst);
-                    return up_abort(io).await;
-                }
+        let send_timeout = pin!(Alarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT)));
+        let ok = poll_fn(|cx| {
+            match io.up_out.poll_send(cx, &mut to_send) {
+                Poll::Ready(Ok(_)) => return Poll::Ready(true),
+                Poll::Ready(Err(_)) => return Poll::Ready(false),
+                Poll::Pending => (),
+            };
+            if send_timeout.poll_ref(cx).is_ready() {
+                return Poll::Ready(false);
             }
+            Poll::Pending
+        })
+        .await;
+        if !ok {
+            // Can't write - abort the whole upload task
+            tracing::info!("Up stream aborting: Error sending");
+            return up_abort(io).await;
         }
     }
 
     // Clean shutdown: we got EOF and sent an EOF message
-    io.up_in.close();
+    io.up_in.drop_read();
 
     // Wait for any pending output to be consumed
-    let flush_timeout = Some(io.now() + SEND_TIMEOUT);
+    let flush_timeout = pin!(Alarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT)));
+    poll_fn(|cx| {
+        if io.up_out.poll_close(cx).is_ready() {
+            Poll::Ready(())
+        } else {
+            flush_timeout.poll_ref(cx)
+        }
+    })
+    .await;
     io.up_to_down.side_check(|x: &mut UpToDown| {
         x.up_result = Some(true); // Signal success
         true
     });
-    while io.up_out.p_try_flush(flush_timeout).await == SpScItemState::Busy {
-        yield_once().await;
-    }
-
-    io.up_out.close();
     TaskEnd()
 }
 
 /// Abort the upload task due to an error.
 ///
 /// Closes both channels and signals failure so the download task aborts too.
-async fn up_abort(io: &TunnelIO) -> TaskEnd {
-    io.up_in.close();
-    io.up_out.close();
+async fn up_abort(io: Pin<&TunnelIO>) -> TaskEnd {
+    let mut cx = Context::from_waker(noop_waker_ref());
+    io.up_in.drop_read();
+    let _ = io.up_out.poll_close(&mut cx);
     io.up_to_down.side_check(|x: &mut UpToDown| {
         x.up_result = Some(false); // Signal failure - download should abort
         true
@@ -418,7 +437,7 @@ async fn up_abort(io: &TunnelIO) -> TaskEnd {
 ///
 /// This async function reads from `down_in` and writes to `down_out` until EOF
 /// or an error occurs. It coordinates with the upload task via `up_to_down`.
-async fn down_connected(io: &TunnelIO) -> TaskEnd {
+async fn down_connected(io: Pin<&TunnelIO>) -> TaskEnd {
     let mut got_eof = false;
 
     // If we can't write to the app, we enter discarding mode:
@@ -451,23 +470,32 @@ async fn down_connected(io: &TunnelIO) -> TaskEnd {
         }
 
         // Try to read a WebSocket message
-        let mut msg: Option<Message> = None;
-        let rst = io.down_in.c_try_read(&mut msg, read_timeout).await;
-        match rst {
-            SpScItemState::Busy => {
-                // Got a message! Process it below.
-            }
-            SpScItemState::Waiting => {
-                // No message available yet. Yield and try again.
-                yield_once().await;
-                continue;
-            }
-            _ => {
-                // Channel closed or failed. Abort.
-                tracing::info!("Down stream aborted: {}", rst);
+        let msg: Result<Option<Message>, ()> = {
+            let read_timeout = Alarm::new(io.pin_clock(), read_timeout);
+            let mut read_timeout = pin!(read_timeout);
+            poll_fn(|cx| {
+                if let Poll::Ready(msg) = io.down_in.poll_read(cx) {
+                    // got a message
+                    return Result::Ok(msg).into();
+                }
+                if read_timeout.as_mut().poll(cx).is_ready() {
+                    return Result::Err(()).into();
+                }
+                Poll::Pending
+            })
+            .await
+        };
+        let msg = match msg {
+            Err(_) => {
+                tracing::info!("Down stream aborted: read error");
                 return down_abort(io).await;
             }
-        }
+            Ok(None) => {
+                tracing::info!("Down stream aborted: EOF");
+                return down_abort(io).await;
+            }
+            Ok(Some(msg)) => msg,
+        };
 
         // If we got data and we're in shutdown mode, extend the timeout
         if read_timeout.is_some() {
@@ -475,21 +503,21 @@ async fn down_connected(io: &TunnelIO) -> TaskEnd {
         }
 
         // Process the WebSocket message
-        let mut to_send: Option<Bytes> = None;
-        match msg {
+        let mut to_send: Option<Bytes> = match msg {
             // WebSocket close frame (unexpected - we should initiate close)
-            None | Some(Message::Close(_)) => {
+            Message::Close(_) => {
                 tracing::info!("Down stream aborted. Got WS close");
                 return down_abort(io).await;
             }
             // Control/text message from the server
-            Some(Message::Text(txt)) => {
+            Message::Text(txt) => {
                 let str = txt.as_str();
                 if str.starts_with("DROP:") {
                     // Server-initiated close with reason
                     tracing::info!("Down stream done: {}", str);
                     got_eof = true;
                     // Fall through to send loop (with to_send = None, which is EOF)
+                    None
                 } else if str.starts_with("CONNECT:") {
                     // CONNECT message shouldn't happen after we're connected
                     tracing::info!("Down stream aborted. Unexpected CONNECT");
@@ -501,15 +529,15 @@ async fn down_connected(io: &TunnelIO) -> TaskEnd {
                 }
             }
             // Binary data message
-            Some(Message::Binary(bytes)) => {
+            Message::Binary(bytes) => {
                 if bytes.is_empty() {
                     // Empty binary = EOF from server
                     got_eof = true;
                     tracing::info!("Down stream done: EOF");
-                    to_send = None;
+                    None
                 } else {
                     // Actual data to forward to app
-                    to_send = Some(bytes);
+                    Some(bytes)
                 }
             }
             // Other message types (Ping, Pong, etc.) - ignore
@@ -524,58 +552,64 @@ async fn down_connected(io: &TunnelIO) -> TaskEnd {
         }
 
         // Write data to the app (if we have any)
-        let send_timeout = Some(io.now() + SEND_TIMEOUT);
-        loop {
-            let wst = io.down_out.p_try_write(&mut to_send, send_timeout).await;
-            match wst {
-                SpScItemState::Busy => {
-                    // Consumer hasn't taken the previous data yet. Wait.
-                    yield_once().await;
+        if to_send.is_some() {
+            let send_timeout = Alarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
+            let mut send_timeout = pin!(send_timeout);
+            let ok = poll_fn(|cx| {
+                if let Poll::Ready(result) = io.down_out.poll_send(cx, &mut to_send) {
+                    return result.is_ok().into();
                 }
-                SpScItemState::Full => {
-                    // Data accepted! Continue to next iteration.
-                    break;
+                if send_timeout.as_mut().poll(cx).is_ready() {
+                    return false.into();
                 }
-                SpScItemState::Closed | SpScItemState::Waiting | SpScItemState::Failed => {
-                    // Can't write to app. Enter discarding mode.
-                    // We still need to drain the WebSocket, so don't abort entirely.
-                    tracing::info!("Down stream discarding: {}", wst);
-                    io.up_to_down
-                        .c(|r| {
-                            r.down_discarding = true;
-                            true
-                        })
-                        .await;
-                    down_discarding = true;
-                    break;
-                }
+                Poll::Pending
+            })
+            .await;
+            if !ok {
+                // Can't write to app. Enter discarding mode.
+                // We still need to drain the WebSocket, so don't abort entirely.
+                tracing::info!("Down stream discarding due to send error");
+                io.up_to_down
+                    .c(|r| {
+                        r.down_discarding = true;
+                        true
+                    })
+                    .await;
+                down_discarding = true;
             }
         }
     }
 
     // Clean shutdown: we got EOF from WebSocket
-    io.down_in.close();
+    io.down_in.drop_read();
     io.up_to_down.side_check(|x: &mut UpToDown| {
         x.down_result = Some(true); // Signal success
         true
     });
 
     // Wait for any pending output to be consumed by the app
-    let flush_timeout = Some(io.now() + SEND_TIMEOUT);
-    while io.down_out.p_try_flush(flush_timeout).await == SpScItemState::Busy {
-        yield_once().await;
-    }
-
-    io.down_out.close();
+    let flush_timeout: Alarm<Instant> = Alarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
+    let mut flush_timeout = pin!(flush_timeout);
+    poll_fn(|cx| {
+        if io.down_out.poll_close(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        if flush_timeout.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    })
+    .await;
     TaskEnd()
 }
 
 /// Abort the download task due to an error.
 ///
 /// Closes both channels and signals failure via down_result.
-async fn down_abort(io: &TunnelIO) -> TaskEnd {
-    io.down_in.close();
-    io.down_out.close();
+async fn down_abort(io: Pin<&TunnelIO>) -> TaskEnd {
+    let mut cx = Context::from_waker(noop_waker_ref());
+    io.down_in.drop_read();
+    let _ = io.down_out.poll_close(&mut cx);
     io.up_to_down.side_check(|x: &mut UpToDown| {
         x.down_result = Some(false); // Signal failure
         true
@@ -589,752 +623,84 @@ async fn down_abort(io: &TunnelIO) -> TaskEnd {
 
 pub type TunnelProtocol = Arc<dyn ProcMachine<TunnelIO>>;
 pub fn create_tunnel_protocol(now: Instant) -> TunnelProtocol {
-    let arc = PROC_MACHINE_JOBS_BASE.with(up_connected).with(down_connected).build(TunnelIO::new(now));
+    let arc = PROC_MACHINE_JOBS_BASE
+        .with(up_connected)
+        .with(down_connected)
+        .build(TunnelIO::new(now));
     arc
 }
 
-// ============================================================================
-// TESTS
-// ============================================================================
+#[derive(Debug, Clone)]
+pub struct TunnelSink {
+    inner: TunnelProtocol,
+}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+impl TunnelSink {
+    pub fn new(proto: TunnelProtocol) -> Self {
+        Self { inner: proto }
+    }
+}
 
-    // ========================================================================
-    // TEST HELPERS
-    // ========================================================================
+impl Sink<Bytes> for TunnelSink {
+    type Error = ExchangeWriteError;
 
-    /// A test harness for driving the TunnelProtocol in a sans-io manner.
-    ///
-    /// The key insight is that we need to interleave I/O operations with ticks,
-    /// and collect output messages as they become available (before channels close).
-    struct TestHarness {
-        protocol: TunnelProtocol,
-        now: Instant,
-        /// Messages collected from up_out (to WebSocket)
-        ws_out_msgs: Vec<Message>,
-        /// Data collected from down_out (to app)
-        app_out_data: Vec<Option<Bytes>>,
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let guard = self.inner.lock();
+        guard.up_in.poll_send_ready(cx)
     }
 
-    impl TestHarness {
-        fn new() -> Self {
-            let now = Instant::now();
-            Self {
-                protocol: create_tunnel_protocol(now),
-                now,
-                ws_out_msgs: Vec::new(),
-                app_out_data: Vec::new(),
-            }
-        }
-
-
-        /// Drain all available output from both output channels
-        fn drain_outputs(&mut self) {
-            // Drain WebSocket output (up_out)
-            loop {
-                let mut item = None;
-                let state = {
-                    let g = self.protocol.lock();
-                    block_on(g.up_out.c_try_read(&mut item, None))
-                };
-                match state {
-                    SpScItemState::Busy => {
-                        if let Some(msg) = item {
-                            self.ws_out_msgs.push(msg);
-                        }
-                    }
-                    _ => break,
-                }
-            }
-
-            // Drain app output (down_out)
-            loop {
-                let mut item = None;
-
-                let state = {
-                    let g = self.protocol.lock();
-                    block_on(g.down_out.c_try_read(&mut item, None))
-                };
-                match state {
-                    SpScItemState::Busy => {
-                        self.app_out_data.push(item);
-                    }
-                    _ => break,
-                }
-            }
-        }
-
-        /// Advance time by the given duration and tick
-        fn advance_and_tick(&mut self, duration: Duration) {
-            self.now += duration;
-            let g = self.protocol.lock();
-            g.update_clock(self.now);
-        }
-
-        /// Write data from "app" into the upload channel
-        fn app_write(&mut self, data: Bytes) -> SpScItemState {
-            let mut item = Some(data);
-            let g=self.protocol.lock();
-            block_on(g.up_in.p_try_write(&mut item, None))
-        }
-        fn app_write_eof(&mut self) -> SpScItemState {
-            let mut item: Option<Bytes> = None;
-            let g=self.protocol.lock();
-            let result = block_on(g.up_in.p_try_write(&mut item, None));
-            result
-        }
-
-        /// Close the app's upload channel (simulate app EOF)
-        fn app_close_upload(&mut self) {
-            let g=self.protocol.lock();
-            g.up_in.close();
-            g.clock.advance(self.now);
-        }
-
-        /// Close the app's download channel (simulate app closed for reading)
-        fn app_close_download(&mut self) {
-            let g=self.protocol.lock();
-            g.down_out.close();
-            g.clock.advance(self.now);
-        }
-
-        fn is_done(&self) -> bool {
-            self.protocol.is_done()
-        }
-
-        /// Write a WebSocket message into the download channel
-        fn ws_write(&mut self, msg: Message) -> SpScItemState {
-            let mut item = Some(msg);
-            let g=self.protocol.lock();
-            let result = block_on(g.down_in.p_try_write(&mut item, None));
-            g.clock.advance(self.now);
-            result
-        }
-
-        /// Close the WebSocket input channel
-        fn ws_close_input(&mut self) {
-            let g=self.protocol.lock();
-            g.down_in.close();
-            g.clock.advance(self.now);
-        }
-
-        /// Close the WebSocket output channel
-        fn ws_close_output(&mut self) {
-            let g=self.protocol.lock();
-            g.up_out.close();
-            g.clock.advance(self.now);
-        }
-
-        /// Get collected WebSocket output messages
-        fn take_ws_msgs(&mut self) -> Vec<Message> {
-            std::mem::take(&mut self.ws_out_msgs)
-        }
-
-        /// Get collected app output data
-        fn take_app_data(&mut self) -> Vec<Option<Bytes>> {
-            std::mem::take(&mut self.app_out_data)
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let guard = self.inner.lock();
+        let mut to_send = Some(item);
+        match guard.up_in.poll_send(&mut cx, &mut to_send) {
+            Poll::Ready(res) => res,
+            Poll::Pending => Err(ExchangeWriteError::InvalidState),
         }
     }
 
-    /// Block on a future using a no-op waker (for testing SpScItem operations).
-    fn block_on<F: Future>(fut: F) -> F::Output {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = std::pin::pin!(fut);
-        loop {
-            match fut.as_mut().poll(&mut cx) {
-                Poll::Ready(val) => return val,
-                Poll::Pending => {}
-            }
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let guard = self.inner.lock();
+        guard.up_in.poll_flush(cx)
     }
 
-    /// Create a no-op waker for testing
-    fn noop_waker() -> Waker {
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(
-            |_| RawWaker::new(std::ptr::null(), &VTABLE),
-            |_| {},
-            |_| {},
-            |_| {},
-        );
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let guard = self.inner.lock();
+        guard.up_in.poll_close(cx)
     }
+}
 
-    // ========================================================================
-    // BASIC DATA TRANSFER TESTS
-    // ========================================================================
-
-    /// Test basic upload: app sends data, it appears on WebSocket
-    #[test]
-    fn test_upload_single_message() {
-        let mut h = TestHarness::new();
-
-        // App writes data - don't use c_get here as it would overwrite the task's waker!
-        let data = Bytes::from_static(b"hello");
-        h.app_write(data.clone());
-
-        // Check WebSocket received the message
-        let msgs = h.take_ws_msgs();
-        assert_eq!(msgs.len(), 1);
-        match &msgs[0] {
-            Message::Binary(b) => assert_eq!(b, &data),
-            _ => panic!("Expected binary message, got {:?}", msgs[0]),
-        }
+impl Drop for TunnelSink {
+    fn drop(&mut self) {
+        let guard = self.inner.lock();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let _ = guard.up_in.poll_close(&mut cx);
     }
+}
 
-    /// Test basic download: WebSocket sends data, it appears on app
-    #[test]
-    fn test_download_single_message() {
-        let mut h = TestHarness::new();
+#[derive(Debug, Clone)]
+pub struct TunnelStream {
+    inner: TunnelProtocol,
+}
 
-        // WebSocket writes data
-        let data = Bytes::from_static(b"world");
-        h.ws_write(Message::Binary(data.clone()));
-
-        // Check app received the data
-        let app_data = h.take_app_data();
-        assert_eq!(app_data.len(), 1);
-        assert_eq!(app_data[0], Some(data));
+impl TunnelStream {
+    pub fn new(proto: TunnelProtocol) -> Self {
+        Self { inner: proto }
     }
+}
 
-    /// Test multiple messages in both directions
-    #[test]
-    fn test_bidirectional_transfer() {
-        let mut h = TestHarness::new();
+impl Stream for TunnelStream {
+    type Item = Bytes;
 
-        // Send 3 messages in each direction
-        for i in 0..3 {
-            let up_data = Bytes::from(format!("up{}", i));
-            let down_data = Bytes::from(format!("down{}", i));
-
-            // App writes
-            h.app_write(up_data.clone());
-
-            // WebSocket writes
-            h.ws_write(Message::Binary(down_data.clone()));
-
-            // Check WebSocket output
-            let ws_msgs = h.take_ws_msgs();
-            assert!(
-                ws_msgs
-                    .iter()
-                    .any(|m| matches!(m, Message::Binary(b) if *b == up_data)),
-                "Expected up_data in ws_msgs"
-            );
-
-            // Check app output
-            let app_data = h.take_app_data();
-            assert!(
-                app_data.iter().any(|d| *d == Some(down_data.clone())),
-                "Expected down_data in app_data"
-            );
-        }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let guard = self.inner.lock();
+        guard.down_out.poll_read(cx)
     }
-
-    // ========================================================================
-    // EOF AND SHUTDOWN TESTS
-    // ========================================================================
-
-    /// Test clean shutdown: app closes upload, WebSocket receives EOF
-    #[test]
-    fn test_app_eof_sends_ws_eof() {
-        let mut h = TestHarness::new();
-
-        // App closes its upload
-        h.app_close_upload();
-
-        // WebSocket should receive an empty binary (EOF)
-        let msgs = h.take_ws_msgs();
-        assert!(
-            msgs.iter()
-                .any(|m| matches!(m, Message::Binary(b) if b.is_empty())),
-            "Expected empty binary EOF message, got {:?}",
-            msgs
-        );
-    }
-
-    /// Test clean shutdown: WebSocket sends EOF (empty binary), app receives None
-    #[test]
-    fn test_ws_eof_forwards_to_app() {
-        let mut h = TestHarness::new();
-
-        // WebSocket sends EOF
-        h.ws_write(Message::Binary(Bytes::new()));
-
-        // App should receive None (EOF signal)
-        let app_data = h.take_app_data();
-        assert!(
-            app_data.iter().any(|d| d.is_none()),
-            "Expected None (EOF) in app_data, got {:?}",
-            app_data
-        );
-    }
-
-    /// Test DROP message from server triggers EOF
-    #[test]
-    fn test_drop_message_triggers_eof() {
-        let mut h = TestHarness::new();
-
-        // Server sends DROP
-        h.ws_write(Message::Text("DROP: connection closed by remote".into()));
-
-        // App should receive EOF (None)
-        let app_data = h.take_app_data();
-        // DROP causes EOF which means None is written to down_out
-        assert!(
-            app_data.iter().any(|d| d.is_none()),
-            "Expected None (EOF) after DROP message, got {:?}",
-            app_data
-        );
-    }
-
-    /// Test full clean shutdown sequence
-    #[test]
-    fn test_full_clean_shutdown() {
-        let mut h = TestHarness::new();
-
-        // 1. App closes upload
-        h.app_close_upload();
-
-        // 2. Check EOF was sent to WebSocket
-        let ws_msgs = h.take_ws_msgs();
-        assert!(
-            ws_msgs
-                .iter()
-                .any(|m| matches!(m, Message::Binary(b) if b.is_empty())),
-            "Expected EOF message"
-        );
-
-        // 3. WebSocket sends EOF back
-        h.ws_write(Message::Binary(Bytes::new()));
-
-        // 4. Run to completion
-        assert!(h.is_done(), "Protocol should have completed");
-    }
-
-    // ========================================================================
-    // ERROR HANDLING TESTS
-    // ========================================================================
-
-    /// Test CONNECT message after connection is established (should abort)
-    #[test]
-    fn test_unexpected_connect_aborts() {
-        let mut h = TestHarness::new();
-
-        // Send unexpected CONNECT
-        h.ws_write(Message::Text("CONNECT:foo".into()));
-
-        // The protocol should eventually terminate (download task aborts)
-        assert!(
-            h.is_done(),
-            "Protocol should terminate after unexpected CONNECT"
-        );
-    }
-
-    /// Test WebSocket close frame causes abort
-    #[test]
-    fn test_ws_close_frame_aborts() {
-        let mut h = TestHarness::new();
-
-        // Send close frame
-        h.ws_write(Message::Close(None));
-
-        // Should terminate
-        assert!(
-            h.is_done(),
-            "Protocol should terminate after close frame"
-        );
-    }
-
-    /// Test WebSocket input channel closing causes abort
-    #[test]
-    fn test_ws_input_close_aborts_download() {
-        let mut h = TestHarness::new();
-
-        // Close WebSocket input
-        h.ws_close_input();
-
-        // Should terminate eventually
-        assert!(
-            h.is_done(),
-            "Protocol should terminate after ws_input close"
-        );
-    }
-
-    /// Test WebSocket output channel closing aborts upload
-    #[test]
-    fn test_ws_output_close_aborts_upload() {
-        let mut h = TestHarness::new();
-
-        // App writes some data
-        h.app_write(Bytes::from_static(b"test"));
-
-        // Close WebSocket output before it can be fully processed
-        h.ws_close_output();
-
-        // Protocol should terminate
-        assert!(
-            h.is_done(),
-            "Protocol should terminate after ws_output close"
-        );
-    }
-
-    // ========================================================================
-    // DISCARDING MODE TESTS
-    // ========================================================================
-
-    /// Test download enters discarding mode when app closes down_out
-    #[test]
-    fn test_download_discarding_mode() {
-        let mut h = TestHarness::new();
-
-        // Send some data from WebSocket
-        h.ws_write(Message::Binary(Bytes::from_static(b"data1")));
-
-        // App reads it (drain outputs already does this)
-        let app_data = h.take_app_data();
-        assert!(app_data
-            .iter()
-            .any(|d| *d == Some(Bytes::from_static(b"data1"))));
-
-        // App closes its read side
-        h.app_close_download();
-
-        // WebSocket sends more data (should be discarded)
-        h.ws_write(Message::Binary(Bytes::from_static(b"data2")));
-
-        // Send EOF from WebSocket (download process finished)
-        h.ws_write(Message::Binary(Bytes::new()));
-
-        h.app_write_eof();
-
-        // Should eventually complete
-        assert!(
-            h.is_done(),
-            "Protocol should complete in discarding mode"
-        );
-    }
-
-    // ========================================================================
-    // TIMEOUT TESTS
-    // ========================================================================
-
-    /// Test that read timeout triggers after one side completes
-    #[test]
-    fn test_shutdown_read_timeout() {
-        let mut h = TestHarness::new();
-
-        // App closes upload (sends EOF to WebSocket)
-        h.app_close_upload();
-
-        // Verify EOF was sent
-        let ws_msgs = h.take_ws_msgs();
-        assert!(ws_msgs
-            .iter()
-            .any(|m| matches!(m, Message::Binary(b) if b.is_empty())));
-
-        // Now WebSocket should be sending data to app, but we don't send EOF back.
-        // The upload task has finished, so download task should have started a timeout.
-
-        // Advance time past the shutdown timeout
-        for _ in 0..70 {
-            h.advance_and_tick(Duration::from_secs(1));
-        }
-
-        // Protocol should eventually terminate due to timeout
-        assert!(
-            h.is_done(),
-            "Protocol should terminate due to timeout"
-        );
-    }
-
-    /// Test that send timeout causes abort
-    #[test]
-    fn test_send_timeout() {
-        let mut h = TestHarness::new();
-
-        // Write data but don't drain outputs (simulate slow consumer)
-        {
-            let mut item = Some(Bytes::from_static(b"test1"));
-            let g=h.protocol.lock();
-            block_on(g.up_in.p_try_write(&mut item, None));
-        }
-        // Write more data
-        {
-            let mut item = Some(Bytes::from_static(b"test2"));
-            let g=h.protocol.lock();
-            block_on(g.up_in.p_try_write(&mut item, None));
-        }
-
-        // Advance time past the send timeout without consuming
-        for _ in 0..70 {
-            let g= h.protocol.lock();
-            h.now += Duration::from_secs(1);
-            g.clock.advance(h.now);
-        }
-
-        // Now drain and check protocol terminates
-        h.drain_outputs();
-        assert!(
-            h.is_done(),
-            "Protocol should fail due to send timeout"
-        );
-    }
-
-    // ========================================================================
-    // EDGE CASE TESTS
-    // ========================================================================
-
-    /// Test empty data from app is ignored (not sent as EOF)
-    #[test]
-    fn test_empty_app_data_ignored() {
-        let mut h = TestHarness::new();
-
-        // App writes empty data
-        h.app_write(Bytes::new());
-
-        // WebSocket should NOT have received an empty binary (that would be EOF)
-        let ws_msgs = h.take_ws_msgs();
-        assert!(
-            !ws_msgs
-                .iter()
-                .any(|m| matches!(m, Message::Binary(b) if b.is_empty())),
-            "Empty app data should be ignored, not sent as EOF"
-        );
-
-        // Now write real data
-        h.app_write(Bytes::from_static(b"real"));
-
-        // Should get the real data
-        let ws_msgs = h.take_ws_msgs();
-        assert!(
-            ws_msgs
-                .iter()
-                .any(|m| matches!(m, Message::Binary(b) if b.as_ref() == b"real")),
-            "Expected real data message"
-        );
-    }
-
-    /// Test unknown text messages are ignored
-    #[test]
-    fn test_unknown_text_message_ignored() {
-        let mut h = TestHarness::new();
-
-        // Send unknown text message
-        h.ws_write(Message::Text("UNKNOWN:something".into()));
-
-        // App should not have received anything
-        let app_data = h.take_app_data();
-        assert!(app_data.is_empty(), "Unknown messages should be ignored");
-
-        // Protocol should still be running
-        assert!(!h.is_done(), "Protocol should still be running");
-    }
-
-    /// Test Ping/Pong messages are ignored
-    #[test]
-    fn test_ping_pong_ignored() {
-        let mut h = TestHarness::new();
-
-        // Send Ping
-        h.ws_write(Message::Ping(Bytes::from_static(b"ping")));
-
-        // App should not have received anything
-        let app_data = h.take_app_data();
-        assert!(app_data.is_empty(), "Ping should be ignored");
-
-        // Send Pong
-        h.ws_write(Message::Pong(Bytes::from_static(b"pong")));
-
-        // Still nothing
-        let app_data = h.take_app_data();
-        assert!(app_data.is_empty(), "Pong should be ignored");
-    }
-
-    /// Test RDSD message is sent when download completes first
-    #[test]
-    fn test_rdsd_sent_on_download_complete() {
-        let mut h = TestHarness::new();
-
-        // WebSocket sends EOF
-        h.ws_write(Message::Binary(Bytes::new()));
-
-        // Check if RDSD was sent
-        let ws_msgs = h.take_ws_msgs();
-        assert!(
-            ws_msgs
-                .iter()
-                .any(|m| matches!(m, Message::Text(t) if t.as_str() == "RDSD")),
-            "RDSD message should have been sent, got {:?}",
-            ws_msgs
-        );
-    }
-
-    // ========================================================================
-    // STRESS TESTS
-    // ========================================================================
-
-    /// Test many messages in sequence
-    #[test]
-    fn test_many_messages() {
-        let mut h = TestHarness::new();
-
-        for i in 0..100 {
-            let data = Bytes::from(format!("message{}", i));
-
-            // Write from app
-            h.app_write(data.clone());
-
-            // Verify WebSocket received it
-            let ws_msgs = h.take_ws_msgs();
-            assert!(
-                ws_msgs
-                    .iter()
-                    .any(|m| matches!(m, Message::Binary(b) if *b == data)),
-                "Expected message {} in ws_msgs",
-                i
-            );
-        }
-    }
-
-    /// Test rapid back-and-forth
-    #[test]
-    fn test_rapid_bidirectional() {
-        let mut h = TestHarness::new();
-
-        for i in 0..50 {
-            // App sends
-            let up = Bytes::from(format!("up{}", i));
-            h.app_write(up.clone());
-
-            // WebSocket sends
-            let down = Bytes::from(format!("down{}", i));
-            h.ws_write(Message::Binary(down.clone()));
-
-            // Verify both directions
-            let ws_msgs = h.take_ws_msgs();
-            let app_data = h.take_app_data();
-
-            assert!(
-                ws_msgs
-                    .iter()
-                    .any(|m| matches!(m, Message::Binary(b) if *b == up)),
-                "Expected up{} in ws_msgs",
-                i
-            );
-            assert!(
-                app_data.iter().any(|d| *d == Some(down.clone())),
-                "Expected down{} in app_data",
-                i
-            );
-        }
-    }
-
-    // ========================================================================
-    // COORDINATION TESTS
-    // ========================================================================
-
-    /// Test that download failure causes upload to close
-    #[test]
-    fn test_download_failure_closes_upload() {
-        let mut h = TestHarness::new();
-
-        // Close WebSocket input (causes download to fail)
-        h.ws_close_input();
-
-        // Protocol should terminate
-        assert!(
-            h.is_done(),
-            "Protocol should have terminated after download failure"
-        );
-    }
-
-    /// Test that upload abort is signaled to download
-    #[test]
-    fn test_upload_abort_signals_download() {
-        let mut h = TestHarness::new();
-
-        // Write data from app
-        h.app_write(Bytes::from_static(b"test"));
-
-        // Close WebSocket output (causes upload to fail when trying to send more)
-        h.ws_close_output();
-
-        // Write more to trigger failure
-        {
-            let mut item = Some(Bytes::from_static(b"more"));
-            let g=h.protocol.lock();
-            block_on(g.up_in.p_try_write(&mut item, None));
-        }
-
-        // Download should eventually notice and terminate
-        assert!(
-            h.is_done(),
-            "Protocol should have completed after upload abort"
-        );
-    }
-
-    // ========================================================================
-    // BUG REGRESSION TESTS
-    // ========================================================================
-
-    /// Regression test: down_result=Some(false) should set got_eof=true
-    /// (Previously this caused infinite EOF messages)
-    #[test]
-    fn test_download_failure_doesnt_cause_infinite_eof() {
-        let mut h = TestHarness::new();
-
-        // Close WebSocket input to make download fail
-        h.ws_close_input();
-
-        // Count EOF messages sent to WebSocket
-        let ws_msgs = h.take_ws_msgs();
-        let eof_count = ws_msgs
-            .iter()
-            .filter(|m| matches!(m, Message::Binary(b) if b.is_empty()))
-            .count();
-
-        // Should only have at most one EOF message
-        assert!(
-            eof_count <= 1,
-            "Should have at most 1 EOF message, got {}",
-            eof_count
-        );
-    }
-
-    /// Regression test: up_connected should flush up_out, not down_out
-    #[test]
-    fn test_upload_flushes_correct_channel() {
-        let mut h = TestHarness::new();
-
-        // Send some data through upload
-        h.app_write(Bytes::from_static(b"test"));
-
-        // Close app upload
-        h.app_close_upload();
-
-        // All messages should be on the WebSocket side
-        let ws_msgs = h.take_ws_msgs();
-        assert!(ws_msgs.len() >= 2, "Should have data + EOF messages");
-
-        // Check we got the data message
-        assert!(
-            ws_msgs
-                .iter()
-                .any(|m| matches!(m, Message::Binary(b) if b.as_ref() == b"test")),
-            "Should have data message"
-        );
-
-        // Check we got EOF
-        assert!(
-            ws_msgs
-                .iter()
-                .any(|m| matches!(m, Message::Binary(b) if b.is_empty())),
-            "Should have EOF message"
-        );
+}
+
+impl Drop for TunnelStream {
+    fn drop(&mut self) {
+        let guard = self.inner.lock();
+        guard.down_out.drop_read();
     }
 }

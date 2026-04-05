@@ -1,33 +1,31 @@
 //! Components for building "procedural state machines" (ProcMachines).
 //!
+use bytemuck::{allocation::TransparentWrapperAlloc, TransparentWrapper};
+use core::fmt::Debug;
+use parking_lot::{lock_api::RawMutex as _, Mutex};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::task::{Context, Wake, Waker};
-use core::fmt::Debug;
-use bytemuck::{allocation::TransparentWrapperAlloc, TransparentWrapper};
-use parking_lot::{Mutex, lock_api::RawMutex as _};
 
 // ============================================================================
 // PROCEDURAL STATE MACHINES
 // ============================================================================
-
 
 // ============================================================================
 // PUBLIC INTERFACE
 // ============================================================================
 
 /// Trait for a procedural state machine that advances synchronously
-/// 
+///
 /// Communication with the ProcMachine is done via an IO struct, which can be accessed
 /// via the `txn()` method, or using the `lock` method on the ProcMachine's Arc
 /// (which provides a temporary guard that holds a lock on the ProcMachine's internal state).
-pub trait ProcMachine<IO: Send + Debug> : Send + Sync + core::fmt::Debug {
-    fn txn(&self, proc: &dyn Fn(&IO)) -> bool;
-    fn is_done(&self) -> bool {
-        !self.txn(&|_| {})
-    }
+pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
+    // TODO external waking internal task
+    fn is_done(&self) -> bool;
     // UNSAFE: &self must be pinned by an Arc.  ProcMachineImpl constructor ensures this
     // UNSAFE: Caller must ensure that the lock is released by calling unsafe_unlock_io() after the critical section.
     unsafe fn unsafe_lock_io(&self) -> *mut IO;
@@ -37,63 +35,71 @@ pub trait ProcMachine<IO: Send + Debug> : Send + Sync + core::fmt::Debug {
     unsafe fn unsafe_unlock_io(&self);
 }
 
-pub trait LockableSelector<T: ?Sized> : Clone {
-    unsafe fn unsafe_lock(&self) -> *mut T;
-    unsafe fn unsafe_unlock(&self);
+/// This trait is implemented on Arc<dyn ProcMachine<IO>> to provide safe access to the IO struct
+pub trait LockableIo<IO: Send + Debug> {
+    fn lock(&self) -> IoGuard<IO>;
+}
+
+impl<IO> LockableIo<IO> for Arc<dyn ProcMachine<IO>>
+where
+    IO: Send + Debug,
+{
     #[inline(always)]
-    fn lock(&self) -> SelectorGuard<T, Self> {
-        SelectorGuard::new(self)
+    fn lock(&self) -> IoGuard<IO> {
+        IoGuard::new(self.clone())
     }
 }
 
-impl<IO: Send + Debug> LockableSelector<IO> for Arc<dyn ProcMachine<IO>> {
-    #[inline(always)]
-    unsafe fn unsafe_lock(&self) -> *mut IO {
-        self.unsafe_lock_io()
-    }
-    #[inline(always)]
-    unsafe fn unsafe_unlock(&self) {
-        self.unsafe_unlock_io()
-    }
+pub struct IoGuard<IO: Send + Debug> {
+    holder: Arc<dyn ProcMachine<IO>>,
+    ptr: *mut IO,
 }
 
-pub struct SelectorGuard<T: ?Sized, S: LockableSelector<T>> {
-    holder: S,
-    ptr: *mut T,
-}
-
-impl<T: ?Sized, S: LockableSelector<T>> SelectorGuard<T,S> {
-    pub fn new(holder: &S) -> Self {
-        let ptr = unsafe { holder.unsafe_lock() };
-        Self { holder: holder.clone(), ptr }
-    }
-}
-
-impl<T: ?Sized, S: LockableSelector<T>> Deref for SelectorGuard<T,S> {
-    type Target = T;
-    #[inline]
-    fn deref(&self) -> &T {
-        unsafe { &*self.ptr }
-    }
-}
-
-impl<T: ?Sized, S: LockableSelector<T>> DerefMut for SelectorGuard<T,S> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.ptr }
-    }
-}
-
-impl<T: ?Sized, S: LockableSelector<T>> Drop for SelectorGuard<T,S> {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            self.holder.unsafe_unlock();
+impl<IO> IoGuard<IO>
+where
+    IO: Send + Debug,
+{
+    pub fn new(holder: Arc<dyn ProcMachine<IO>>) -> Self {
+        let ptr = unsafe { holder.unsafe_lock_io() };
+        Self {
+            holder: holder.clone(),
+            ptr,
         }
     }
 }
 
+impl<IO> Drop for IoGuard<IO>
+where
+    IO: Send + Debug,
+{
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            self.holder.unsafe_unlock_io();
+        }
+    }
+}
 
+impl<IO> Deref for IoGuard<IO>
+where
+    IO: Send + Debug,
+{
+    type Target = IO;
+    #[inline]
+    fn deref(&self) -> &IO {
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<IO> DerefMut for IoGuard<IO>
+where
+    IO: Send + Debug,
+{
+    #[inline]
+    fn deref_mut(&mut self) -> &mut IO {
+        unsafe { &mut *self.ptr }
+    }
+}
 
 // ============================================================================
 // FACTORY IMPLEMENTATION
@@ -106,15 +112,14 @@ impl<T: ?Sized, S: LockableSelector<T>> Drop for SelectorGuard<T,S> {
 /// on shared state (e.g., the IO struct).
 pub struct TaskEnd();
 
-
-trait ProcMachineFutures: Send {
+pub trait ProcMachineFutures: Send {
     const DEPTH: u8;
     /// Polls the futures in this ProcMachine and returns a bitmask of which tasks are still active.
     fn poll<T: MultiWake + 'static>(self: &mut Self, waker: &Arc<T>, depth_mask: u32) -> u32;
     fn new() -> Self;
 }
 
-struct ProcMachineFuturesBase();
+pub struct ProcMachineFuturesBase();
 
 impl ProcMachineFutures for ProcMachineFuturesBase {
     const DEPTH: u8 = 0;
@@ -128,7 +133,7 @@ impl ProcMachineFutures for ProcMachineFuturesBase {
     }
 }
 
-struct ProcMachineFuturesExtension<
+pub struct ProcMachineFuturesExtension<
     PREV: ProcMachineFutures,
     FUT: Future<Output = TaskEnd> + Send + 'static,
 > {
@@ -177,9 +182,15 @@ impl<PREV: ProcMachineFutures, FUT: Future<Output = TaskEnd> + Send + 'static> P
 pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
     const DEPTH: u8;
     type FUTURES: ProcMachineFutures;
-    fn init(&self, io: &'static IO, futures: &mut Self::FUTURES);
-    fn with<FUT: Future<Output = TaskEnd> + Send + 'static>(self: Self, proc: fn(&'static IO)->FUT) -> impl ProcMachineJobs<IO>;
-    fn build(self, io: IO) -> Arc<dyn ProcMachine<IO>> where Self: Sized + 'static {
+    fn init(&self, io: Pin<&'static IO>, futures: &mut Self::FUTURES);
+    fn with<FUT: Future<Output = TaskEnd> + Send + 'static>(
+        self: Self,
+        proc: fn(Pin<&'static IO>) -> FUT,
+    ) -> impl ProcMachineJobs<IO>;
+    fn build(self, io: IO) -> Arc<dyn ProcMachine<IO>>
+    where
+        Self: Sized + 'static,
+    {
         ProcMachineImpl::new(io, self)
     }
 }
@@ -190,9 +201,11 @@ pub struct ProcMachineJobsBase();
 impl<IO: Send + Debug + 'static> ProcMachineJobs<IO> for ProcMachineJobsBase {
     const DEPTH: u8 = 0;
     type FUTURES = ProcMachineFuturesBase;
-    fn init(&self, _io: &'static IO, _futures: &mut Self::FUTURES) {
-    }
-    fn with<FUT: Future<Output = TaskEnd> + Send + 'static>(self: Self, proc: fn(&'static IO)->FUT) -> impl ProcMachineJobs<IO> {
+    fn init(&self, _io: Pin<&'static IO>, _futures: &mut Self::FUTURES) {}
+    fn with<FUT: Future<Output = TaskEnd> + Send + 'static>(
+        self: Self,
+        proc: fn(Pin<&'static IO>) -> FUT,
+    ) -> impl ProcMachineJobs<IO> {
         ProcMachineJobsExtension { prev: self, proc }
     }
 }
@@ -203,24 +216,29 @@ pub struct ProcMachineJobsExtension<
     FUT: Future<Output = TaskEnd> + Send + 'static,
 > {
     prev: PREV,
-    proc: fn(&'static IO) -> FUT,
+    proc: fn(Pin<&'static IO>) -> FUT,
 }
 
-impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> + Send + 'static>
-    ProcMachineJobs<IO> for ProcMachineJobsExtension<IO, PREV, FUT>
+impl<
+        IO: Send + Debug,
+        PREV: ProcMachineJobs<IO>,
+        FUT: Future<Output = TaskEnd> + Send + 'static,
+    > ProcMachineJobs<IO> for ProcMachineJobsExtension<IO, PREV, FUT>
 {
     const DEPTH: u8 = PREV::DEPTH + 1;
     type FUTURES = ProcMachineFuturesExtension<PREV::FUTURES, FUT>;
-    fn init(&self, io: &'static IO, futures: &mut Self::FUTURES) {
+    fn init(&self, io: Pin<&'static IO>, futures: &mut Self::FUTURES) {
         self.prev.init(io, &mut futures.prev);
         futures.fut = Some((self.proc)(io));
     }
-    
-    fn with<FUT2: Future<Output = TaskEnd> + Send + 'static>(self: Self, proc: fn(&'static IO)->FUT2) -> impl ProcMachineJobs<IO> {
-        ProcMachineJobsExtension { prev: self, proc}
+
+    fn with<FUT2: Future<Output = TaskEnd> + Send + 'static>(
+        self: Self,
+        proc: fn(Pin<&'static IO>) -> FUT2,
+    ) -> impl ProcMachineJobs<IO> {
+        ProcMachineJobsExtension { prev: self, proc }
     }
 }
-
 
 #[derive(Debug)]
 struct ProcMachineInner<IO: Send + Debug, FUTURES: ProcMachineFutures> {
@@ -231,7 +249,11 @@ struct ProcMachineInner<IO: Send + Debug, FUTURES: ProcMachineFutures> {
 
 impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
     fn new(io: IO) -> Self {
-        Self { io, futures: FUTURES::new(), alive_mask: 0 }
+        Self {
+            io,
+            futures: FUTURES::new(),
+            alive_mask: 0,
+        }
     }
     fn tick<T: MultiWake + 'static>(&mut self, waker: &Arc<T>, wake_mask: &AtomicU32) -> bool {
         loop {
@@ -247,8 +269,14 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES
 
 pub static PROC_MACHINE_JOBS_BASE: ProcMachineJobsBase = ProcMachineJobsBase();
 
-unsafe impl<IO: Send + Debug,FUTURES: ProcMachineFutures + 'static> Send for ProcMachineImpl<IO,FUTURES> {}
-unsafe impl<IO: Send + Debug,FUTURES: ProcMachineFutures + 'static> Sync for ProcMachineImpl<IO,FUTURES> {}
+unsafe impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Send
+    for ProcMachineImpl<IO, FUTURES>
+{
+}
+unsafe impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Sync
+    for ProcMachineImpl<IO, FUTURES>
+{
+}
 
 struct ProcMachineImpl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> {
     inner: Mutex<ProcMachineInner<IO, FUTURES>>,
@@ -256,7 +284,9 @@ struct ProcMachineImpl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> 
     raw_arc: *const Self,
 }
 
-impl<IO: Send + Debug,FUTURES: ProcMachineFutures> core::fmt::Debug for ProcMachineImpl<IO, FUTURES> {
+impl<IO: Send + Debug, FUTURES: ProcMachineFutures> core::fmt::Debug
+    for ProcMachineImpl<IO, FUTURES>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let guard = self.inner.lock();
         f.debug_struct("ProcMachineImpl")
@@ -266,7 +296,9 @@ impl<IO: Send + Debug,FUTURES: ProcMachineFutures> core::fmt::Debug for ProcMach
     }
 }
 
-impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> MultiWake for ProcMachineImpl<IO, FUTURES> {
+impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> MultiWake
+    for ProcMachineImpl<IO, FUTURES>
+{
     fn wake(&self, n: u8) {
         loop {
             let old = self.wake_mask.load(Ordering::SeqCst);
@@ -274,14 +306,20 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> MultiWake for Proc
             if new == old {
                 break; // Already set, no need to wake again
             }
-            if self.wake_mask.compare_exchange(old, new, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+            if self
+                .wake_mask
+                .compare_exchange(old, new, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
                 break; // Successfully set the bit
             }
         }
     }
 }
 
-impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMachineImpl<IO, FUTURES> {
+impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
+    ProcMachineImpl<IO, FUTURES>
+{
     fn new<JOBS: ProcMachineJobs<IO, FUTURES = FUTURES>>(io: IO, jobs: JOBS) -> Arc<Self> {
         let mut ret = Arc::new(Self {
             inner: Mutex::new(ProcMachineInner::new(io)),
@@ -291,12 +329,14 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
         Arc::get_mut(&mut ret).unwrap().raw_arc = Arc::as_ptr(&ret);
         {
             let mut guard = ret.inner.lock();
-            let ProcMachineInner { io, futures, alive_mask: _ } = &mut *guard;
+            let ProcMachineInner {
+                io,
+                futures,
+                alive_mask: _,
+            } = &mut *guard;
             // UNSAFE: We are extending the lifetime of `io` to 'static, but this is safe because
             // it will only be accessed by futures that stored in this object.
-            let io = unsafe {
-                &*(io as *const IO)
-            };
+            let io = unsafe { Pin::new_unchecked(&*(io as *const IO)) };
             jobs.init(io, futures);
             guard.alive_mask = futures.poll(&ret, 0xFFFFFFFF); // Initial poll to set up wake_mask based on which tasks are active
             guard.tick(&ret, &ret.wake_mask); // Process any tasks that were immediately ready
@@ -305,26 +345,27 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
     }
 }
 
-impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures +'static> ProcMachine<IO> for ProcMachineImpl<IO, FUTURES> {
-    fn txn(&self, proc: &dyn Fn(&IO)) -> bool {
-        let arc: Arc<Self> = unsafe { 
+impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMachine<IO>
+    for ProcMachineImpl<IO, FUTURES>
+{
+    fn is_done(&self) -> bool {
+        let arc: Arc<Self> = unsafe {
             Arc::increment_strong_count(self.raw_arc);
             Arc::from_raw(self.raw_arc)
         };
         let mut guard = self.inner.lock();
-        proc(&guard.io);
-        guard.tick(&arc, &self.wake_mask)
+        !guard.tick(&arc, &self.wake_mask)
     }
-    
+
     unsafe fn unsafe_lock_io(&self) -> *mut IO {
         self.inner.raw().lock();
         let inner_ptr = self.inner.data_ptr();
         let io_ref = unsafe { &mut (*inner_ptr).io };
         io_ref
     }
-    
+
     unsafe fn unsafe_unlock_io(&self) {
-        let arc: Arc<Self> = unsafe { 
+        let arc: Arc<Self> = unsafe {
             Arc::increment_strong_count(self.raw_arc);
             Arc::from_raw(self.raw_arc)
         };
@@ -334,9 +375,8 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures +'static> ProcMachi
     }
 }
 
-
 // ============================================================================
-// MULTI-WAKER SUPPORT VIA POINTER TAGGING
+// MULTI-WAKER SUPPORT
 // ============================================================================
 //
 // We need a way for each task within a ProcMachine to have its own Waker.
@@ -345,7 +385,8 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures +'static> ProcMachi
 //
 // Instead, use variant vtables to get implement multiple Wakers based on the same
 // pointer.
-trait MultiWake: Send + Sync {
+
+pub trait MultiWake: Send + Sync {
     /// Wake the task at index `n` (0-7).
     fn wake(&self, n: u8);
 }
@@ -396,4 +437,3 @@ fn get_multi_waker<T: MultiWake + 'static>(target: &Arc<T>, n: u8) -> Waker {
         _ => panic!("Only task indices 0-7 are supported for get_multi_waker()"),
     }
 }
-
