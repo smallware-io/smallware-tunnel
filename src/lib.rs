@@ -49,7 +49,7 @@
 //! - A new token is generated when the current one has less than 15 minutes remaining
 //! - The customer ID is extracted from the domain name
 
-pub mod alarm_clock;
+pub mod alarms;
 pub mod error;
 pub mod forward;
 pub mod io_exchange;

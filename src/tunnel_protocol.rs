@@ -77,7 +77,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::alarm_clock::{Alarm, AlarmClock};
+use crate::alarm_clock::{AlarmClock, ClockAlarm};
 use crate::io_exchange::{ExchangeWriteError, IoExchange};
 use crate::io_sink::IoSink;
 use crate::io_stream::IoStream;
@@ -300,7 +300,7 @@ async fn up_connected(io: Pin<&TunnelIO>) -> TaskEnd {
         // If we don't have a shutdown message to send, try to read app data
         if to_send.is_none() {
             let mut data: Option<Bytes> = None;
-            let read_alarm = pin!(Alarm::new(io.pin_clock(), read_timeout));
+            let read_alarm = pin!(ClockAlarm::new(io.pin_clock(), read_timeout));
             let err: Option<&str> = poll_fn(|cx| {
                 match io.up_in.poll_read(cx) {
                     Poll::Ready(item) => {
@@ -359,7 +359,10 @@ async fn up_connected(io: Pin<&TunnelIO>) -> TaskEnd {
         }
 
         // We have a message to send - write it to up_out
-        let send_timeout = pin!(Alarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT)));
+        let send_timeout = pin!(ClockAlarm::new(
+            io.pin_clock(),
+            Some(io.now() + SEND_TIMEOUT)
+        ));
         let ok = poll_fn(|cx| {
             match io.up_out.poll_send(cx, &mut to_send) {
                 Poll::Ready(Ok(_)) => return Poll::Ready(true),
@@ -383,7 +386,10 @@ async fn up_connected(io: Pin<&TunnelIO>) -> TaskEnd {
     io.up_in.drop_read();
 
     // Wait for any pending output to be consumed
-    let flush_timeout = pin!(Alarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT)));
+    let flush_timeout = pin!(ClockAlarm::new(
+        io.pin_clock(),
+        Some(io.now() + SEND_TIMEOUT)
+    ));
     poll_fn(|cx| {
         if io.up_out.poll_close(cx).is_ready() {
             Poll::Ready(())
@@ -471,7 +477,7 @@ async fn down_connected(io: Pin<&TunnelIO>) -> TaskEnd {
 
         // Try to read a WebSocket message
         let msg: Result<Option<Message>, ()> = {
-            let read_timeout = Alarm::new(io.pin_clock(), read_timeout);
+            let read_timeout = ClockAlarm::new(io.pin_clock(), read_timeout);
             let mut read_timeout = pin!(read_timeout);
             poll_fn(|cx| {
                 if let Poll::Ready(msg) = io.down_in.poll_read(cx) {
@@ -553,7 +559,7 @@ async fn down_connected(io: Pin<&TunnelIO>) -> TaskEnd {
 
         // Write data to the app (if we have any)
         if to_send.is_some() {
-            let send_timeout = Alarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
+            let send_timeout = ClockAlarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
             let mut send_timeout = pin!(send_timeout);
             let ok = poll_fn(|cx| {
                 if let Poll::Ready(result) = io.down_out.poll_send(cx, &mut to_send) {
@@ -588,7 +594,8 @@ async fn down_connected(io: Pin<&TunnelIO>) -> TaskEnd {
     });
 
     // Wait for any pending output to be consumed by the app
-    let flush_timeout: Alarm<Instant> = Alarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
+    let flush_timeout: ClockAlarm<Instant> =
+        ClockAlarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
     let mut flush_timeout = pin!(flush_timeout);
     poll_fn(|cx| {
         if io.down_out.poll_close(cx).is_ready() {

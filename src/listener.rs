@@ -30,9 +30,7 @@ use crate::io_stream::IoStream;
 use crate::jwt::{extract_customer_id, JwtManager};
 use crate::proc_machines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
-use crate::tunnel_protocol::{
-    create_tunnel_protocol, TunnelProtocol, TunnelSink, TunnelStream,
-};
+use crate::tunnel_protocol::{create_tunnel_protocol, TunnelProtocol, TunnelSink, TunnelStream};
 use crate::{
     noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN,
     STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS,
@@ -757,7 +755,8 @@ impl TunnelListener {
                 cx.waker().wake_by_ref();
             }
             Poll::Pending
-        }).await;
+        })
+        .await;
 
         // Close the protocol channels
         {
@@ -784,7 +783,7 @@ impl TunnelListener {
 enum TransferResult {
     Data,
     Closed,
-    Fail
+    Fail,
 }
 
 fn poll_transfer_up(
@@ -800,8 +799,8 @@ fn poll_transfer_up(
         Poll::Ready(false) => {
             src.drop_read();
             return TransferResult::Closed.into();
-        },
-        _ => ()
+        }
+        _ => (),
     };
     match ws_tx.poll_ready_unpin(cx) {
         Poll::Pending => return Poll::Pending,
@@ -810,13 +809,13 @@ fn poll_transfer_up(
             tracing::error!("Websocket write failed");
             return TransferResult::Fail.into();
         }
-        Poll::Ready(Ok(_)) => ()
+        Poll::Ready(Ok(_)) => (),
     };
     let item = match src.poll_read(cx) {
         Poll::Pending => {
             tracing::error!("Pending poll_read after check_read->true");
-            return Poll::Pending
-        },
+            return Poll::Pending;
+        }
         Poll::Ready(bytes) => bytes,
     };
     if let Some(item) = item {
@@ -885,8 +884,8 @@ fn poll_transfer_down(
             tracing::error!("Protocol write failed");
             let _ = sink.poll_close(cx);
             return TransferResult::Fail.into();
-        },
-        _ => ()
+        }
+        _ => (),
     }
     let ready = ws_rx.poll_next_unpin(cx);
     let mut item = match ready {

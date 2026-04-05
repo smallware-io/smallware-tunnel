@@ -1,6 +1,4 @@
-use std::{
-    task::{Context, Poll},
-};
+use std::task::{Context, Poll};
 
 /// A variant of the `Sink` interface with internal mutability, that can be used
 /// by callers that don't own it.
@@ -31,5 +29,3 @@ pub trait IoSink: Send {
     /// to see if the "close message", if any, has been flushed.
     fn poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 }
-
-

@@ -8,6 +8,17 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+/// The relative order between a "clock" value and an "alarm" value
+#[derive(Clone, Copy, PartialEq)]
+enum AlarmOrder {
+    /// No alarm can every be triggered for the alarm value given
+    Never,
+    /// The clock value triggers alarms with the alarm value
+    Now,
+    /// The clock value does not trigger the alarm, but a future value might
+    Later,
+}
+
 struct UnsafeLink<T> {
     inner: UnsafeCell<*const T>,
 }
@@ -51,20 +62,19 @@ impl<T> UnsafeLink<T> {
     }
 }
 
-enum NodeType<T: PartialOrd> {
+enum NodeType<T> {
     Head {
         mutex: Mutex<T>,
     },
     Node {
-        // SAFETY: new_node constructor ensures that target is pinned and has appropriate lifetime
+        // SAFETY: Alarm constructor ensures that target is pinned and has appropriate lifetime
         target: *const AlarmNode<T>,
-        val: UnsafeCell<Option<T>>,
+        val: UnsafeCell<T>,
         waker: UnsafeCell<Option<Waker>>,
     },
 }
 
-//TODO AlarmNode needs clock lifetime
-struct AlarmNode<T: PartialOrd> {
+struct AlarmNode<T> {
     typ: NodeType<T>,
     prev: UnsafeLink<AlarmNode<T>>,
     next: UnsafeLink<AlarmNode<T>>,
@@ -73,7 +83,7 @@ struct AlarmNode<T: PartialOrd> {
 unsafe impl<T: PartialOrd> Send for AlarmNode<T> {}
 unsafe impl<T: PartialOrd> Sync for AlarmNode<T> {}
 
-impl<T: PartialOrd> NodeType<T> {
+impl<T> NodeType<T> {
     fn is_head(&self) -> bool {
         matches!(self, NodeType::Head { .. })
     }
@@ -99,8 +109,8 @@ impl<T: PartialOrd> NodeType<T> {
     }
 }
 
-impl<T: PartialOrd> AlarmNode<T> {
-    fn new_node<'a>(target: Pin<&'a AlarmNode<T>>, val: Option<T>) -> Self {
+impl<T> AlarmNode<T> {
+    fn new_node<'a>(target: Pin<&'a AlarmNode<T>>, val: T) -> Self {
         if !target.typ.is_head() {
             panic!("AlarmNode target needs to be a head node")
         }
@@ -150,7 +160,10 @@ impl<T: PartialOrd> AlarmNode<T> {
         self.next.clear();
     }
 
-    fn set_alarm(&self, val: Option<T>) {
+    fn set_alarm<F>(&self, cmp: F, val: T)
+    where
+        F: Fn(&T, &T) -> AlarmOrder,
+    {
         let guard = self.typ.lock_target();
         let val_cell = match &self.typ {
             NodeType::Head { .. } => {
@@ -159,26 +172,32 @@ impl<T: PartialOrd> AlarmNode<T> {
             NodeType::Node { val, .. } => val,
         };
         unsafe {
-            if val.is_none() {
-                self.unlink();
-            } else if *guard >= *val.as_ref().unwrap() {
-                // alarm time has already passed
-                self.unlink();
-                self.typ.wake();
-            }
+            match cmp(&*guard, &val) {
+                AlarmOrder::Never => {
+                    self.unlink();
+                }
+                AlarmOrder::Now => {
+                    self.unlink();
+                    self.typ.wake();
+                }
+                AlarmOrder::Later => (),
+            };
             (*val_cell.get()) = val;
         }
     }
 
-    fn get_alarm(&self) -> Option<&T> {
+    fn get_alarm(&self) -> &T {
         let _ = self.typ.lock_target();
         match &self.typ {
-            NodeType::Head { .. } => None,
-            NodeType::Node { val, .. } => unsafe { (*val.get()).as_ref() },
+            NodeType::Head { .. } => panic!("Can't get_alarm on a head node"),
+            NodeType::Node { val, .. } => unsafe { &*val.get() },
         }
     }
 
-    fn check_alarm(self: Pin<&Self>, cx: &Context<'_>) -> bool {
+    fn check_alarm<F>(self: Pin<&Self>, cx: &Context<'_>, f: F) -> bool
+    where
+        F: Fn(&T, &T) -> AlarmOrder,
+    {
         let guard = self.typ.lock_target();
         let (target, val_cell, waker) = match &self.typ {
             NodeType::Head { .. } => {
@@ -188,20 +207,22 @@ impl<T: PartialOrd> AlarmNode<T> {
         };
         unsafe {
             let val = &*val_cell.get();
-            if val.is_none() {
-                if self.is_linked() {
-                    self.unlink();
+            match f(&*guard, val) {
+                AlarmOrder::Never => {
+                    if self.is_linked() {
+                        self.unlink();
+                    }
+                    return false;
                 }
-                *waker = None;
-                return false;
-            } else if *guard >= *val.as_ref().unwrap() {
-                // alarm time has already passed
-                if self.is_linked() {
-                    self.unlink();
+                AlarmOrder::Now => {
+                    if self.is_linked() {
+                        self.unlink();
+                    }
+                    self.typ.wake();
+                    return true;
                 }
-                self.typ.wake();
-                return true;
-            }
+                _ => (),
+            };
             match waker {
                 None => {
                     *waker = Some(cx.waker().clone());
@@ -236,16 +257,16 @@ impl<T: PartialOrd> AlarmNode<T> {
         unsafe { &*(&*guard as *const T) }
     }
 
-    fn set_clock(&self, val: T, advance_only: bool) -> bool {
+    fn set_clock<F>(&self, val: T, f: F, advance_only: bool) -> bool
+    where
+        F: Fn(&T, &T) -> AlarmOrder,
+    {
         if !self.typ.is_head() {
             panic!("Can only set_clock on a head node");
         }
         let mut guard = self.typ.lock_target();
-        if *guard >= val {
-            // old value is as big as new value.  No alarms will fire
-            if !advance_only {
-                *guard = val;
-            }
+        let order = f(&*guard, &val);
+        if advance_only && order != AlarmOrder::Later {
             return false;
         }
         *guard = val;
@@ -258,15 +279,18 @@ impl<T: PartialOrd> AlarmNode<T> {
                 let n = &*pn;
                 pn = n.next.get();
                 if let NodeType::Node { val, waker, .. } = &n.typ {
-                    let val = &*val.get();
-                    if val.is_none() {
-                        // should never happen, because it wouldn't be linked, but just in case
-                        n.unlink();
-                    } else if *guard >= *val.as_ref().unwrap() {
-                        n.unlink();
-                        if let Some(w) = (*waker.get()).take() {
-                            w.wake();
+                    match f(&*guard, &*val.get()) {
+                        AlarmOrder::Never => {
+                            // should never happen, because it wouldn't be linked, but just in case
+                            n.unlink();
                         }
+                        AlarmOrder::Now => {
+                            n.unlink();
+                            if let Some(w) = (*waker.get()).take() {
+                                w.wake();
+                            }
+                        }
+                        AlarmOrder::Later => (),
                     }
                 }
             }
@@ -275,7 +299,7 @@ impl<T: PartialOrd> AlarmNode<T> {
     }
 }
 
-impl<T: PartialOrd> Drop for AlarmNode<T> {
+impl<T> Drop for AlarmNode<T> {
     fn drop(&mut self) {
         unsafe {
             let _ = self.typ.lock_target();
@@ -284,30 +308,50 @@ impl<T: PartialOrd> Drop for AlarmNode<T> {
     }
 }
 
-pub struct AlarmClock<T: PartialOrd> {
-    head: AlarmNode<T>,
+//=======================================================================================
+// AlarmClock and ClockAlarm
+//
+// Alarms triggered when a monotonically increasing value meets or exceeds the alarm threshold
+//=======================================================================================
+
+fn alarm_clock_order<T: PartialOrd>(clock: &Option<T>, alarm: &Option<T>) -> AlarmOrder {
+    match alarm {
+        None => AlarmOrder::Never,
+        Some(a) => match clock {
+            None => AlarmOrder::Later,
+            Some(c) => {
+                if *c >= *a {
+                    AlarmOrder::Now
+                } else {
+                    AlarmOrder::Later
+                }
+            }
+        },
+    }
 }
-unsafe impl<T: PartialOrd> Send for AlarmClock<T> {}
-unsafe impl<T: PartialOrd> Sync for AlarmClock<T> {}
+
+pub struct AlarmClock<T: PartialOrd> {
+    head: AlarmNode<Option<T>>,
+}
 
 impl<T: PartialOrd> AlarmClock<T> {
     pub fn new(val: T) -> Self {
         Self {
-            head: AlarmNode::new_head(val),
+            head: AlarmNode::new_head(Some(val)),
         }
     }
 
     #[inline(always)]
     pub fn set(&self, val: T) {
-        self.head.set_clock(val, false);
+        self.head.set_clock(Some(val), alarm_clock_order, false);
     }
     #[inline(always)]
     pub fn get(&self) -> &T {
-        self.head.get_clock()
+        self.head.get_clock().as_ref().unwrap()
     }
     #[inline(always)]
     pub fn advance(&self, val: T) -> bool {
-        self.head.set_clock(val, true)
+        self.head.set_clock(Some(val), alarm_clock_order, true)
     }
 }
 
@@ -318,12 +362,12 @@ impl<T: PartialOrd + Debug> Debug for AlarmClock<T> {
     }
 }
 
-pub struct Alarm<'a, T: PartialOrd> {
-    node: AlarmNode<T>,
+pub struct ClockAlarm<'a, T: PartialOrd> {
+    node: AlarmNode<Option<T>>,
     _lifetime: PhantomData<&'a AlarmClock<T>>,
 }
 
-impl<'a, T: PartialOrd> Alarm<'a, T> {
+impl<'a, T: PartialOrd> ClockAlarm<'a, T> {
     pub fn new(clock: Pin<&'a AlarmClock<T>>, wake_at: Option<T>) -> Self {
         let head_pin = unsafe { Pin::new_unchecked(&clock.head) };
         Self {
@@ -333,32 +377,28 @@ impl<'a, T: PartialOrd> Alarm<'a, T> {
     }
 
     pub fn set(&self, wake_at: Option<T>) {
-        self.node.set_alarm(wake_at);
+        self.node.set_alarm(alarm_clock_order, wake_at);
     }
 
     pub fn get(&self) -> Option<&T> {
-        self.node.get_alarm()
+        self.node.get_alarm().as_ref()
     }
     pub fn poll_ref(self: &Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         let node_pin = unsafe { Pin::new_unchecked(&self.node) };
-        match node_pin.check_alarm(cx) {
+        match node_pin.check_alarm(cx, alarm_clock_order) {
             true => Poll::Ready(()),
             false => Poll::Pending,
         }
     }
 }
 
-impl<'a, T: PartialOrd> Future for Alarm<'a, T> {
+impl<'a, T: PartialOrd> Future for ClockAlarm<'a, T> {
     type Output = ();
 
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let node_pin = unsafe { Pin::new_unchecked(&self.node) };
-        match node_pin.check_alarm(cx) {
-            true => Poll::Ready(()),
-            false => Poll::Pending,
-        }
+        self.poll_ref(cx)
     }
 }
