@@ -77,7 +77,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::alarm_clock::{AlarmClock, ClockAlarm};
+use crate::alarms::{AlarmClock, ClockAlarm};
 use crate::io_exchange::{ExchangeWriteError, IoExchange};
 use crate::io_sink::IoSink;
 use crate::io_stream::IoStream;
