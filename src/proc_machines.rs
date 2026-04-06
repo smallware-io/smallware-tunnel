@@ -1289,9 +1289,7 @@ mod tests {
 
     #[test]
     fn zero_work_task_completes_at_build() {
-        let machine = PROC_MACHINE_JOBS_BASE
-            .with(task_noop)
-            .build(TestIO::new(0));
+        let machine = PROC_MACHINE_JOBS_BASE.with(task_noop).build(TestIO::new(0));
 
         assert!(machine.is_done());
         let guard = machine.lock();

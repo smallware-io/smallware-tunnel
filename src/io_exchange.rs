@@ -314,12 +314,7 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
                 EXCH_EMPTY => {
                     if self
                         .state
-                        .compare_exchange(
-                            st,
-                            EXCH_EMPTY_FLUSH,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        )
+                        .compare_exchange(st, EXCH_EMPTY_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
                         self.reader.wake();
@@ -384,12 +379,7 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
                     let _guard = self.item.lock().unwrap();
                     if self
                         .state
-                        .compare_exchange(
-                            st,
-                            EXCH_FULL_CLOSED,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        )
+                        .compare_exchange(st, EXCH_FULL_CLOSED, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
                         self.reader.wake();

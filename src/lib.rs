@@ -52,6 +52,7 @@
 pub mod alarms;
 pub mod error;
 pub mod forward;
+pub(crate) mod intrusive_list;
 pub mod io_exchange;
 pub mod io_sink;
 pub mod io_stream;

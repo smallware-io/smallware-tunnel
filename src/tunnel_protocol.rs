@@ -191,7 +191,7 @@ impl TunnelIO {
     ///
     /// This is used by tasks to calculate timeout deadlines.
     pub fn now(&self) -> Instant {
-        *self.clock.get()
+        self.clock.get()
     }
 
     /// Update the clock and check for expired timeouts.
@@ -861,10 +861,7 @@ mod tests {
         for payload in &payloads {
             {
                 let guard = proto.lock();
-                assert!(exchange_send(
-                    &guard.up_in,
-                    Bytes::from(*payload)
-                ));
+                assert!(exchange_send(&guard.up_in, Bytes::from(*payload)));
             }
 
             let msg = read_with_ticks(&proto, |io| &io.up_out, 5);
@@ -988,10 +985,7 @@ mod tests {
         // Send EOF (empty Binary)
         {
             let guard = proto.lock();
-            assert!(exchange_send(
-                &guard.down_in,
-                Message::Binary(Bytes::new())
-            ));
+            assert!(exchange_send(&guard.down_in, Message::Binary(Bytes::new())));
         }
 
         // down_out should eventually close (yield None)
@@ -1039,18 +1033,12 @@ mod tests {
         }
 
         let data = read_with_ticks(&proto, |io| &io.down_out, 5);
-        assert_eq!(
-            data,
-            Poll::Ready(Some(Bytes::from("payload")))
-        );
+        assert_eq!(data, Poll::Ready(Some(Bytes::from("payload"))));
 
         // Send EOF
         {
             let guard = proto.lock();
-            assert!(exchange_send(
-                &guard.down_in,
-                Message::Binary(Bytes::new())
-            ));
+            assert!(exchange_send(&guard.down_in, Message::Binary(Bytes::new())));
         }
 
         let result = read_with_ticks(&proto, |io| &io.down_out, 10);
@@ -1064,10 +1052,7 @@ mod tests {
         // Send a WebSocket Close frame
         {
             let guard = proto.lock();
-            assert!(exchange_send(
-                &guard.down_in,
-                Message::Close(None)
-            ));
+            assert!(exchange_send(&guard.down_in, Message::Close(None)));
         }
 
         // down_out should close (abort)
@@ -1137,10 +1122,7 @@ mod tests {
 
         {
             let guard = proto.lock();
-            assert!(exchange_send(
-                &guard.down_in,
-                Message::Pong(vec![].into())
-            ));
+            assert!(exchange_send(&guard.down_in, Message::Pong(vec![].into())));
         }
 
         {
@@ -1217,10 +1199,7 @@ mod tests {
         }
 
         let down_data = read_with_ticks(&proto, |io| &io.down_out, 5);
-        assert_eq!(
-            down_data,
-            Poll::Ready(Some(Bytes::from("down_data")))
-        );
+        assert_eq!(down_data, Poll::Ready(Some(Bytes::from("down_data"))));
     }
 
     // -----------------------------------------------------------------------
@@ -1234,10 +1213,7 @@ mod tests {
         // Complete the download by sending EOF
         {
             let guard = proto.lock();
-            assert!(exchange_send(
-                &guard.down_in,
-                Message::Binary(Bytes::new())
-            ));
+            assert!(exchange_send(&guard.down_in, Message::Binary(Bytes::new())));
         }
 
         // Drain down_out (the close notification)
@@ -1353,7 +1329,10 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(saw_eof, "expected upload to send EOF after download failure");
+        assert!(
+            saw_eof,
+            "expected upload to send EOF after download failure"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1375,10 +1354,7 @@ mod tests {
         // Send download EOF
         {
             let guard = proto.lock();
-            assert!(exchange_send(
-                &guard.down_in,
-                Message::Binary(Bytes::new())
-            ));
+            assert!(exchange_send(&guard.down_in, Message::Binary(Bytes::new())));
         }
 
         // Tick to process
@@ -1430,7 +1406,9 @@ mod tests {
             assert!(Pin::new(&mut sink).poll_ready(&mut cx).is_ready());
         }
         {
-            assert!(Pin::new(&mut sink).start_send(Bytes::from("via_sink")).is_ok());
+            assert!(Pin::new(&mut sink)
+                .start_send(Bytes::from("via_sink"))
+                .is_ok());
         }
 
         // Verify it arrives in up_out as a Binary message
