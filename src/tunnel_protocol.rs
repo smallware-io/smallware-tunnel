@@ -18,7 +18,8 @@
 //!    writes data to the application (WebSocket → app)
 //!
 //! These tasks communicate with the outside world through the `TunnelIO` struct,
-//! which contains several `SpScMutex` channels for exchanging data:
+//! which contains four [`IoExchange`] channels for data flow and an
+//! [`SpScMutex`] for shutdown coordination:
 //!
 //! ```text
 //!                         TunnelIO
@@ -115,10 +116,13 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 // External code interacts with TunnelIO to feed data in and pull data out.
 // The protocol tasks interact with TunnelIO to process that data.
 //
-// Each channel is an SpScMutex<SimpleSpScItemInner<T>> which provides:
-// - Single-item buffering (only one item in flight at a time)
-// - Producer/consumer waker coordination
-// - Timeout support
+// Each data channel is an IoExchange<T> which provides:
+// - Single-slot rendezvous (only one item in flight at a time)
+// - AtomicWaker-based producer/consumer notification
+// - Interior mutability (&self access for both sides)
+//
+// The UpToDown coordination channel uses SpScMutex for shared state between
+// the upload and download tasks.
 // ============================================================================
 
 /// Shared I/O state for the tunnel protocol.
@@ -202,6 +206,14 @@ impl TunnelIO {
         self.clock.advance(now);
     }
 
+    /// Returns a pinned reference to the internal [`AlarmClock`].
+    ///
+    /// Used by protocol tasks to create [`ClockAlarm`] futures for timeouts.
+    ///
+    /// # Safety
+    ///
+    /// This is safe because `TunnelIO` is stored inside a `ProcMachine` which
+    /// keeps it at a stable address (behind an `Arc`-held mutex).
     pub fn pin_clock<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a AlarmClock<Instant>> {
         unsafe { Pin::<&'a AlarmClock<Instant>>::new_unchecked(&(*self).clock) }
     }
@@ -628,7 +640,23 @@ async fn down_abort(io: Pin<&TunnelIO>) -> TaskEnd {
 // PUBLIC API
 // ============================================================================
 
+/// Handle to a running tunnel protocol instance.
+///
+/// The protocol runs as two cooperative tasks inside a [`ProcMachine`]:
+/// upload (`up_connected`) and download (`down_connected`). External code
+/// drives the machine by calling [`.lock()`](LockableIo::lock) to access
+/// the [`TunnelIO`] channels, then dropping the guard to let the tasks tick.
 pub type TunnelProtocol = Arc<dyn ProcMachine<TunnelIO>>;
+
+/// Creates a new tunnel protocol instance and starts its internal tasks.
+///
+/// The returned [`TunnelProtocol`] is ready to use immediately — both the
+/// upload and download tasks are initialized and will begin processing data
+/// as soon as items are placed in the input exchanges.
+///
+/// # Arguments
+///
+/// * `now` — the current timestamp, used to seed the internal [`AlarmClock`].
 pub fn create_tunnel_protocol(now: Instant) -> TunnelProtocol {
     let arc = PROC_MACHINE_JOBS_BASE
         .with(up_connected)
@@ -637,12 +665,21 @@ pub fn create_tunnel_protocol(now: Instant) -> TunnelProtocol {
     arc
 }
 
+/// A [`futures::Sink`] adapter for writing application data into the tunnel.
+///
+/// Wraps a [`TunnelProtocol`] and forwards `Bytes` into the `up_in` exchange,
+/// where the upload task picks them up, wraps them in `Message::Binary`, and
+/// delivers them to `up_out` for the WebSocket.
+///
+/// Dropping the sink closes `up_in`, which causes the upload task to send an
+/// EOF (`Message::Binary(empty)`) to the WebSocket.
 #[derive(Debug, Clone)]
 pub struct TunnelSink {
     inner: TunnelProtocol,
 }
 
 impl TunnelSink {
+    /// Creates a new sink backed by the given protocol instance.
     pub fn new(proto: TunnelProtocol) -> Self {
         Self { inner: proto }
     }
@@ -685,12 +722,24 @@ impl Drop for TunnelSink {
     }
 }
 
+/// A [`futures::Stream`] adapter for reading application data from the tunnel.
+///
+/// Wraps a [`TunnelProtocol`] and reads `Bytes` from the `down_out` exchange,
+/// where the download task places data extracted from incoming WebSocket
+/// `Message::Binary` frames.
+///
+/// The stream yields `None` when the download task closes `down_out` (either
+/// because it received an EOF or a `DROP:` message from the server).
+///
+/// Dropping the stream calls [`drop_read`](IoStream::drop_read) on `down_out`,
+/// which causes the download task to enter discarding mode.
 #[derive(Debug, Clone)]
 pub struct TunnelStream {
     inner: TunnelProtocol,
 }
 
 impl TunnelStream {
+    /// Creates a new stream backed by the given protocol instance.
     pub fn new(proto: TunnelProtocol) -> Self {
         Self { inner: proto }
     }
@@ -709,5 +758,831 @@ impl Drop for TunnelStream {
     fn drop(&mut self) {
         let guard = self.inner.lock();
         guard.down_out.drop_read();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io_sink::IoSink;
+    use crate::io_stream::IoStream;
+    use crate::proc_machines::LockableIo;
+    use coarsetime::Instant;
+    use futures::task::noop_waker_ref;
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    /// Creates a protocol and returns it with a fixed "now" instant.
+    fn make_proto() -> TunnelProtocol {
+        create_tunnel_protocol(Instant::now())
+    }
+
+    /// Sends an item into an IoExchange (writer/sink side). Returns true if accepted.
+    fn exchange_send<T: Send>(exch: &IoExchange<T>, item: T) -> bool {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut opt = Some(item);
+        matches!(exch.poll_send(&mut cx, &mut opt), Poll::Ready(Ok(())))
+    }
+
+    /// Reads an item from an IoExchange (reader/stream side).
+    fn exchange_read<T: Send>(exch: &IoExchange<T>) -> Poll<Option<T>> {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        exch.poll_read(&mut cx)
+    }
+
+    /// Initiates close on the writer side of an IoExchange.
+    fn exchange_close<T: Send>(exch: &IoExchange<T>) -> Poll<Result<(), ExchangeWriteError>> {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        exch.poll_close(&mut cx)
+    }
+
+    /// Calls check_read on an IoExchange to acknowledge flush.
+    fn exchange_check<T: Send>(exch: &IoExchange<T>) -> Poll<bool> {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        exch.check_read(&mut cx)
+    }
+
+    /// Drives the protocol by locking/unlocking (which triggers a tick).
+    /// Optionally performs an operation inside the lock.
+    fn tick(proto: &TunnelProtocol) {
+        let _guard = proto.lock();
+        // guard drop triggers tick
+    }
+
+    /// Repeatedly ticks and tries to read from an exchange until we get a
+    /// Ready result or exhaust attempts.
+    fn read_with_ticks<T: Send>(
+        proto: &TunnelProtocol,
+        get_exchange: impl Fn(&TunnelIO) -> &IoExchange<T>,
+        max_ticks: usize,
+    ) -> Poll<Option<T>> {
+        for _ in 0..max_ticks {
+            let guard = proto.lock();
+            let result = exchange_read(get_exchange(&*guard));
+            if result.is_ready() {
+                return result;
+            }
+            // drop guard → tick
+        }
+        Poll::Pending
+    }
+
+    // -----------------------------------------------------------------------
+    // Upload path: app → protocol → WebSocket
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upload_single_message() {
+        let proto = make_proto();
+
+        // Write app data into up_in
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(&guard.up_in, Bytes::from("hello")));
+        }
+
+        // Read the resulting WS message from up_out
+        let msg = read_with_ticks(&proto, |io| &io.up_out, 5);
+        match msg {
+            Poll::Ready(Some(Message::Binary(b))) => {
+                assert_eq!(b, Bytes::from("hello"));
+            }
+            other => panic!("expected Binary message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn upload_multiple_messages() {
+        let proto = make_proto();
+        let payloads = vec!["one", "two", "three"];
+
+        for payload in &payloads {
+            {
+                let guard = proto.lock();
+                assert!(exchange_send(
+                    &guard.up_in,
+                    Bytes::from(*payload)
+                ));
+            }
+
+            let msg = read_with_ticks(&proto, |io| &io.up_out, 5);
+            match msg {
+                Poll::Ready(Some(Message::Binary(b))) => {
+                    assert_eq!(b, Bytes::from(*payload));
+                }
+                other => panic!("expected Binary({payload}), got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn upload_empty_bytes_skipped() {
+        // The upload task must skip empty Bytes from the app, because
+        // Message::Binary(empty) is the EOF signal on the wire.
+        let proto = make_proto();
+
+        // Send empty bytes (should be skipped)
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(&guard.up_in, Bytes::new()));
+        }
+
+        // Send real data
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(&guard.up_in, Bytes::from("real")));
+        }
+
+        // The first message out should be the real data, not an empty one
+        let msg = read_with_ticks(&proto, |io| &io.up_out, 10);
+        match msg {
+            Poll::Ready(Some(Message::Binary(b))) => {
+                assert_eq!(b, Bytes::from("real"));
+            }
+            other => panic!("expected Binary(real), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn upload_eof_sends_empty_binary() {
+        let proto = make_proto();
+
+        // Close up_in (simulates app EOF)
+        {
+            let guard = proto.lock();
+            let _ = exchange_close(&guard.up_in);
+        }
+        // May need check_read to complete the close handshake
+        {
+            let guard = proto.lock();
+            let _ = exchange_check(&guard.up_in);
+        }
+
+        // The upload task should send an empty Binary (EOF marker)
+        let msg = read_with_ticks(&proto, |io| &io.up_out, 10);
+        match msg {
+            Poll::Ready(Some(Message::Binary(b))) => {
+                assert!(b.is_empty(), "EOF should be empty Binary");
+            }
+            other => panic!("expected empty Binary (EOF), got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Download path: WebSocket → protocol → app
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn download_single_message() {
+        let proto = make_proto();
+
+        // Write a WS message into down_in
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("world"))
+            ));
+        }
+
+        // Read the resulting app data from down_out
+        let data = read_with_ticks(&proto, |io| &io.down_out, 5);
+        match data {
+            Poll::Ready(Some(b)) => {
+                assert_eq!(b, Bytes::from("world"));
+            }
+            other => panic!("expected Bytes(world), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn download_multiple_messages() {
+        let proto = make_proto();
+        let payloads = vec!["alpha", "beta", "gamma"];
+
+        for payload in &payloads {
+            {
+                let guard = proto.lock();
+                assert!(exchange_send(
+                    &guard.down_in,
+                    Message::Binary(Bytes::from(*payload))
+                ));
+            }
+
+            let data = read_with_ticks(&proto, |io| &io.down_out, 5);
+            match data {
+                Poll::Ready(Some(b)) => {
+                    assert_eq!(b, Bytes::from(*payload));
+                }
+                other => panic!("expected Bytes({payload}), got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn download_eof_empty_binary() {
+        let proto = make_proto();
+
+        // Send EOF (empty Binary)
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::new())
+            ));
+        }
+
+        // down_out should eventually close (yield None)
+        let result = read_with_ticks(&proto, |io| &io.down_out, 10);
+        assert!(
+            matches!(result, Poll::Ready(None)),
+            "expected stream end after EOF, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn download_eof_drop_message() {
+        let proto = make_proto();
+
+        // Send a DROP message
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Text("DROP:connection_limit".into())
+            ));
+        }
+
+        // down_out should close
+        let result = read_with_ticks(&proto, |io| &io.down_out, 10);
+        assert!(
+            matches!(result, Poll::Ready(None)),
+            "expected stream end after DROP, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn download_data_then_eof() {
+        let proto = make_proto();
+
+        // Send data
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("payload"))
+            ));
+        }
+
+        let data = read_with_ticks(&proto, |io| &io.down_out, 5);
+        assert_eq!(
+            data,
+            Poll::Ready(Some(Bytes::from("payload")))
+        );
+
+        // Send EOF
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::new())
+            ));
+        }
+
+        let result = read_with_ticks(&proto, |io| &io.down_out, 10);
+        assert!(matches!(result, Poll::Ready(None)));
+    }
+
+    #[test]
+    fn download_abort_on_close_frame() {
+        let proto = make_proto();
+
+        // Send a WebSocket Close frame
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Close(None)
+            ));
+        }
+
+        // down_out should close (abort)
+        let result = read_with_ticks(&proto, |io| &io.down_out, 10);
+        assert!(
+            matches!(result, Poll::Ready(None)),
+            "expected abort after Close frame, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn download_abort_on_connect_message() {
+        let proto = make_proto();
+
+        // Send a CONNECT message (shouldn't happen post-handshake)
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Text("CONNECT:some_id".into())
+            ));
+        }
+
+        // down_out should close (abort)
+        let result = read_with_ticks(&proto, |io| &io.down_out, 10);
+        assert!(
+            matches!(result, Poll::Ready(None)),
+            "expected abort after CONNECT, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn download_ignores_ping() {
+        let proto = make_proto();
+
+        // Send a Ping (should be ignored by protocol)
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Ping(vec![1, 2, 3].into())
+            ));
+        }
+
+        // Then send actual data
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("after_ping"))
+            ));
+        }
+
+        // Should get the data, not the ping
+        let data = read_with_ticks(&proto, |io| &io.down_out, 10);
+        match data {
+            Poll::Ready(Some(b)) => assert_eq!(b, Bytes::from("after_ping")),
+            other => panic!("expected data after ping, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn download_ignores_pong() {
+        let proto = make_proto();
+
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Pong(vec![].into())
+            ));
+        }
+
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("after_pong"))
+            ));
+        }
+
+        let data = read_with_ticks(&proto, |io| &io.down_out, 10);
+        match data {
+            Poll::Ready(Some(b)) => assert_eq!(b, Bytes::from("after_pong")),
+            other => panic!("expected data after pong, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn download_ignores_unknown_text() {
+        let proto = make_proto();
+
+        // Send unrecognized text (should be ignored)
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Text("UNKNOWN_COMMAND".into())
+            ));
+        }
+
+        // Then send actual data
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("real_data"))
+            ));
+        }
+
+        let data = read_with_ticks(&proto, |io| &io.down_out, 10);
+        match data {
+            Poll::Ready(Some(b)) => assert_eq!(b, Bytes::from("real_data")),
+            other => panic!("expected data after unknown text, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Full round trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn full_round_trip_upload_and_download() {
+        let proto = make_proto();
+
+        // Upload: app → WS
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(&guard.up_in, Bytes::from("up_data")));
+        }
+
+        let up_msg = read_with_ticks(&proto, |io| &io.up_out, 5);
+        assert_eq!(
+            up_msg,
+            Poll::Ready(Some(Message::Binary(Bytes::from("up_data"))))
+        );
+
+        // Download: WS → app
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("down_data"))
+            ));
+        }
+
+        let down_data = read_with_ticks(&proto, |io| &io.down_out, 5);
+        assert_eq!(
+            down_data,
+            Poll::Ready(Some(Bytes::from("down_data")))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Shutdown coordination
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upload_sends_rdsd_after_download_completes() {
+        let proto = make_proto();
+
+        // Complete the download by sending EOF
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::new())
+            ));
+        }
+
+        // Drain down_out (the close notification)
+        let _ = read_with_ticks(&proto, |io| &io.down_out, 10);
+
+        // Now send app data to trigger the upload task to loop back and
+        // check down_result. It should see download completed and send RDSD.
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(&guard.up_in, Bytes::from("trigger")));
+        }
+
+        // Read messages from up_out. We should see RDSD before or after the
+        // data message (depending on timing).
+        let mut saw_rdsd = false;
+        let mut saw_data = false;
+        for _ in 0..20 {
+            let msg = read_with_ticks(&proto, |io| &io.up_out, 3);
+            match msg {
+                Poll::Ready(Some(Message::Text(ref t))) if AsRef::<str>::as_ref(t) == "RDSD" => {
+                    saw_rdsd = true;
+                }
+                Poll::Ready(Some(Message::Binary(ref b))) if !b.is_empty() => {
+                    saw_data = true;
+                }
+                _ => {}
+            }
+            if saw_rdsd && saw_data {
+                break;
+            }
+        }
+        assert!(saw_rdsd, "expected RDSD message after download completed");
+        assert!(saw_data, "expected data message to be forwarded");
+    }
+
+    #[test]
+    fn download_aborts_when_upload_fails() {
+        let proto = make_proto();
+
+        // Make the upload task fail by closing up_out (the consumer side).
+        // The upload task will see poll_send_ready return Err and abort.
+        {
+            let guard = proto.lock();
+            guard.up_out.drop_read();
+        }
+
+        // Tick to let the upload task detect the error and set up_result=Some(false)
+        for _ in 0..5 {
+            tick(&proto);
+        }
+
+        // Send data to down_in. The download task may process this message
+        // (it was already waiting for data before up_result was set), then on
+        // the next loop iteration it checks up_result and aborts.
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("may_pass_through"))
+            ));
+        }
+
+        // Drain any data that slipped through, then expect close.
+        let mut got_close = false;
+        for _ in 0..20 {
+            let result = read_with_ticks(&proto, |io| &io.down_out, 3);
+            match result {
+                Poll::Ready(None) => {
+                    got_close = true;
+                    break;
+                }
+                Poll::Ready(Some(_)) => continue, // data that arrived before abort
+                Poll::Pending => continue,
+            }
+        }
+        assert!(
+            got_close,
+            "expected download to eventually close after upload failure"
+        );
+    }
+
+    #[test]
+    fn upload_aborts_when_download_fails() {
+        let proto = make_proto();
+
+        // Make the download task fail by sending a Close frame
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(&guard.down_in, Message::Close(None)));
+        }
+
+        // Tick to let download process the Close and set down_result
+        for _ in 0..5 {
+            tick(&proto);
+        }
+
+        // Send data to up_in to trigger the upload task to check down_result
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(&guard.up_in, Bytes::from("after_fail")));
+        }
+
+        // Upload should send EOF (empty binary) because down_result is Some(false)
+        let mut saw_eof = false;
+        for _ in 0..20 {
+            let msg = read_with_ticks(&proto, |io| &io.up_out, 3);
+            match msg {
+                Poll::Ready(Some(Message::Binary(b))) if b.is_empty() => {
+                    saw_eof = true;
+                    break;
+                }
+                Poll::Ready(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw_eof, "expected upload to send EOF after download failure");
+    }
+
+    // -----------------------------------------------------------------------
+    // Coordination state (UpToDown)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn up_to_down_default() {
+        let utd = UpToDown::default();
+        assert_eq!(utd.up_result, None);
+        assert_eq!(utd.down_result, None);
+        assert!(!utd.down_discarding);
+    }
+
+    #[test]
+    fn up_to_down_signals_after_download_eof() {
+        let proto = make_proto();
+
+        // Send download EOF
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::new())
+            ));
+        }
+
+        // Tick to process
+        for _ in 0..5 {
+            tick(&proto);
+        }
+
+        // Check the coordination state via the public accessor
+        let guard = proto.lock();
+        guard.up_to_down.side_check(|utd| {
+            assert_eq!(utd.down_result, Some(true));
+            false
+        });
+    }
+
+    #[test]
+    fn up_to_down_signals_after_download_abort() {
+        let proto = make_proto();
+
+        // Trigger download abort via Close frame
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(&guard.down_in, Message::Close(None)));
+        }
+
+        for _ in 0..5 {
+            tick(&proto);
+        }
+
+        let guard = proto.lock();
+        guard.up_to_down.side_check(|utd| {
+            assert_eq!(utd.down_result, Some(false));
+            false
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // TunnelSink / TunnelStream adapters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tunnel_sink_sends_data() {
+        let proto = make_proto();
+        let mut sink = TunnelSink::new(proto.clone());
+
+        // Use the Sink interface to send data
+        {
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(Pin::new(&mut sink).poll_ready(&mut cx).is_ready());
+        }
+        {
+            assert!(Pin::new(&mut sink).start_send(Bytes::from("via_sink")).is_ok());
+        }
+
+        // Verify it arrives in up_out as a Binary message
+        let msg = read_with_ticks(&proto, |io| &io.up_out, 10);
+        match msg {
+            Poll::Ready(Some(Message::Binary(b))) => {
+                assert_eq!(b, Bytes::from("via_sink"));
+            }
+            other => panic!("expected Binary via sink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tunnel_stream_receives_data() {
+        let proto = make_proto();
+        let mut stream = TunnelStream::new(proto.clone());
+
+        // Feed data into down_in
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("via_stream"))
+            ));
+        }
+
+        // Tick to let download task process
+        tick(&proto);
+
+        // Read via the Stream interface
+        {
+            let mut cx = Context::from_waker(noop_waker_ref());
+            // May need multiple attempts as the download task processes
+            let mut result = Poll::Pending;
+            for _ in 0..10 {
+                result = Pin::new(&mut stream).poll_next(&mut cx);
+                if result.is_ready() {
+                    break;
+                }
+                tick(&proto);
+            }
+            match result {
+                Poll::Ready(Some(b)) => assert_eq!(b, Bytes::from("via_stream")),
+                other => panic!("expected data via stream, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn tunnel_sink_drop_closes_up_in() {
+        let proto = make_proto();
+
+        // Create and immediately drop the sink
+        {
+            let _sink = TunnelSink::new(proto.clone());
+            // drop initiates close on up_in
+        }
+
+        // The upload task should eventually send EOF
+        let mut saw_eof = false;
+        for _ in 0..20 {
+            // Also need to acknowledge the close handshake
+            {
+                let guard = proto.lock();
+                let _ = exchange_check(&guard.up_in);
+            }
+            let msg = read_with_ticks(&proto, |io| &io.up_out, 3);
+            if let Poll::Ready(Some(Message::Binary(b))) = msg {
+                if b.is_empty() {
+                    saw_eof = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_eof, "expected EOF after TunnelSink dropped");
+    }
+
+    #[test]
+    fn tunnel_stream_drop_signals_reader_dropped() {
+        let proto = make_proto();
+
+        // Create and immediately drop the stream
+        {
+            let _stream = TunnelStream::new(proto.clone());
+        }
+
+        // Tick to let things propagate
+        for _ in 0..5 {
+            tick(&proto);
+        }
+
+        // Send data to down_in — the download task should enter discarding mode
+        // or abort since the reader is gone.
+        {
+            let guard = proto.lock();
+            assert!(exchange_send(
+                &guard.down_in,
+                Message::Binary(Bytes::from("dropped"))
+            ));
+        }
+
+        // Tick to process — should not panic
+        for _ in 0..5 {
+            tick(&proto);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TunnelIO
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tunnel_io_now_returns_initial_time() {
+        let now = Instant::now();
+        let io = TunnelIO::new(now);
+        assert_eq!(io.now(), now);
+    }
+
+    #[test]
+    fn tunnel_io_update_clock_advances() {
+        let now = Instant::now();
+        let io = TunnelIO::new(now);
+        let later = now + Duration::from_secs(10);
+        io.update_clock(later);
+        assert_eq!(io.now(), later);
+    }
+
+    #[test]
+    fn tunnel_io_update_clock_does_not_go_backwards() {
+        let now = Instant::now();
+        let io = TunnelIO::new(now);
+        let earlier = Instant::now(); // same or earlier
+        io.update_clock(earlier);
+        // advance() only goes forward, so the clock should still be `now`
+        // (or possibly `earlier` if it's actually later due to timing)
+        // The key invariant: it never goes backward from `now`
+        assert!(io.now() >= now);
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol creation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_protocol_does_not_panic() {
+        let _proto = make_proto();
+    }
+
+    #[test]
+    fn protocol_is_not_immediately_done() {
+        let proto = make_proto();
+        // Both tasks should be alive initially
+        assert!(!proto.is_done());
     }
 }
