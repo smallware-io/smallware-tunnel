@@ -293,7 +293,7 @@ impl<V: IntrusiveNodeValue> IntrusiveListNode<V> {
     /// # Safety
     ///
     /// Caller must hold the head mutex.
-    unsafe fn is_linked(&self) -> bool {
+    pub unsafe fn is_linked(&self) -> bool {
         !self.prev.is_null() && !self.next.is_null()
     }
 }

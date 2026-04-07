@@ -49,7 +49,7 @@
 //! - A new token is generated when the current one has less than 15 minutes remaining
 //! - The customer ID is extracted from the domain name
 
-pub mod alarms;
+pub mod alarm_clock;
 pub mod error;
 pub mod forward;
 pub(crate) mod intrusive_list;
@@ -59,10 +59,10 @@ pub mod io_stream;
 pub mod jwt;
 pub mod listener;
 pub mod proc_machines;
-mod spsc;
 mod stat_counter;
 pub mod trace_id;
 pub mod tunnel_protocol;
+pub mod watchable_value;
 
 pub use error::TunnelError;
 pub use forward::{forward_tunnel, forward_tunnel_tcp, ForwardStats};

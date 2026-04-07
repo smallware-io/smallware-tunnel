@@ -375,11 +375,18 @@ impl TunnelListener {
 
                 let (ws_tx, ws_rx) = match self.connect_or_recycle().await {
                     Ok(conn) => {
-                        tracing::info!(
-                            "got server after {} ms",
-                            chrono::Utc::now().timestamp_millis() - now_millis
-                        );
-                        conn
+                        if conn.2 {
+                            tracing::info!(
+                                "recycled server after {} ms",
+                                chrono::Utc::now().timestamp_millis() - now_millis
+                            );
+                        } else {
+                            tracing::info!(
+                                "got new server after {} ms",
+                                chrono::Utc::now().timestamp_millis() - now_millis
+                            );
+                        }
+                        (conn.0, conn.1)
                     }
                     Err(e) => {
                         // Connection failed, update retry state
@@ -486,18 +493,20 @@ impl TunnelListener {
     ///
     /// The returned WebSocket is in a "fresh" state: either just connected or just reset.
     /// The server will send a CONNECT message when a client connects to the tunnel.
-    async fn connect_or_recycle(&self) -> Result<(WsRawSink, WsBaseStream), TunnelError> {
+    async fn connect_or_recycle(&self) -> Result<(WsRawSink, WsBaseStream, bool), TunnelError> {
         let shared = self.shared.clone();
         let mut shutdown_rx = shared.shutdown_rx.clone();
         if *shutdown_rx.borrow_and_update() {
             return Err(TunnelError::ListenerClosed);
         }
+        let mut is_recycled = false;
         let (ws_tx, ws_rx) = if let Ok(recycled) = shared.recycle_rx.try_recv() {
             // Send RESET message to tell the server we're ready for a new proxy client.
             // This must be sent before the server will accept new connections on this WebSocket.
             let reset_msg = Message::Text("RESET".into());
             let mut ws_tx = recycled.ws_tx;
             ws_tx.send(reset_msg).await.map_err(TunnelError::from)?;
+            is_recycled = true;
             (ws_tx, recycled.ws_rx)
         } else {
             // No recycled connection available, create a new one
@@ -514,7 +523,7 @@ impl TunnelListener {
                 }
             }
         };
-        Ok((ws_tx, ws_rx))
+        Ok((ws_tx, ws_rx, is_recycled))
     }
 
     /// Waits for a `CONNECT` message on the WebSocket indicating a client has connected.
@@ -673,11 +682,8 @@ impl TunnelListener {
                 let g = protocol.lock();
                 g.clock.advance(now);
             }
-            if protocol.is_done() {
-                return true.into();
-            }
-            if !up_open && !down_open {
-                return false.into();
+            if !up_open && !down_open && !need_flush {
+                return protocol.is_done().into();
             }
             let mut did_something = false;
             if up_open {
@@ -685,7 +691,6 @@ impl TunnelListener {
                     Poll::Pending => {}
                     Poll::Ready(TransferResult::Closed) => {
                         up_open = false;
-                        need_flush = false;
                         did_something = true;
                     }
                     Poll::Ready(TransferResult::Data) => {
@@ -819,13 +824,19 @@ fn poll_transfer_up(
         Poll::Ready(bytes) => bytes,
     };
     if let Some(item) = item {
-        tracing::debug!("WS UP");
+        let mut is_eof = false;
         match &item {
             Message::Binary(bytes) => {
                 stat_counter.stat_count(STAT_COUNT_BYTES_UP, bytes.len() as i32);
+                is_eof = bytes.len() == 0;
             }
             _ => {}
         };
+        if is_eof {
+            tracing::debug!("WS UP EOS");
+        } else {
+            tracing::debug!("WS UP");
+        }
         if ws_tx.start_send_unpin(item).is_err() {
             src.drop_read();
             tracing::error!("start_send failed");
@@ -880,11 +891,6 @@ fn poll_transfer_down(
     let sink = &g.down_in;
     match sink.poll_send_ready(cx) {
         Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(_)) => {
-            tracing::error!("Protocol write failed");
-            let _ = sink.poll_close(cx);
-            return TransferResult::Fail.into();
-        }
         _ => (),
     }
     let ready = ws_rx.poll_next_unpin(cx);
@@ -905,6 +911,9 @@ fn poll_transfer_down(
             match &data {
                 Message::Binary(bytes) => {
                     stat_counter.stat_count(STAT_COUNT_BYTES_DOWN, bytes.len() as i32);
+                    if bytes.len() == 0 {
+                        tracing::debug!("WS DOWN EOS");
+                    }
                 }
                 _ => {}
             }
@@ -914,7 +923,7 @@ fn poll_transfer_down(
     match sink.poll_send(cx, &mut item) {
         Poll::Ready(Ok(_)) => {}
         _ => {
-            tracing::error!("Can't write after successful check");
+            tracing::error!("Protocol write failed");
             let _ = sink.poll_close(cx);
             return TransferResult::Fail.into();
         }

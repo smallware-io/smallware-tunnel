@@ -78,12 +78,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::alarms::{AlarmClock, ClockAlarm};
+use crate::alarm_clock::{AlarmClock, ClockAlarm};
 use crate::io_exchange::{ExchangeWriteError, IoExchange};
 use crate::io_sink::IoSink;
 use crate::io_stream::IoStream;
 use crate::proc_machines::*;
-use crate::spsc::*;
+use crate::watchable_value::{ValueWatch, WatchableValue};
 
 // ============================================================================
 // TIMEOUT CONSTANTS
@@ -167,9 +167,10 @@ pub struct TunnelIO {
     /// Upload task writes Messages to be sent to the WebSocket here.
     pub up_out: IoExchange<Message>,
 
-    /// Coordination state between upload and download tasks.
-    /// Used to signal when one task completes or fails.
-    pub up_to_down: SpScMutex<UpToDown>,
+    /// Status of the download process
+    pub down_status: WatchableValue<DownloadStatus>,
+    // Status of the upload process
+    pub up_status: WatchableValue<UploadStatus>,
 }
 
 impl TunnelIO {
@@ -183,7 +184,8 @@ impl TunnelIO {
             down_out: IoExchange::new(),
             up_in: IoExchange::new(),
             up_out: IoExchange::new(),
-            up_to_down: SpScMutex::new(UpToDown::default()),
+            up_status: WatchableValue::new(UploadStatus::Active),
+            down_status: WatchableValue::new(DownloadStatus::Active),
         }
     }
 
@@ -215,26 +217,24 @@ impl TunnelIO {
     /// This is safe because `TunnelIO` is stored inside a `ProcMachine` which
     /// keeps it at a stable address (behind an `Arc`-held mutex).
     pub fn pin_clock<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a AlarmClock<Instant>> {
-        unsafe { Pin::<&'a AlarmClock<Instant>>::new_unchecked(&(*self).clock) }
+        unsafe { Pin::new_unchecked(&(*self).clock) }
+    }
+    pub fn pin_up_status<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a WatchableValue<UploadStatus>> {
+        unsafe { Pin::new_unchecked(&(*self).up_status) }
+    }
+    pub fn pin_down_status<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a WatchableValue<DownloadStatus>> {
+        unsafe { Pin::new_unchecked(&(*self).down_status) }
     }
 }
 
-/// Coordination state between the upload and download tasks.
-///
-/// This struct is shared (via SpScMutex) between the two tasks so they can
-/// coordinate shutdown. When one task finishes or fails, it updates this
-/// state so the other task knows to start its shutdown sequence.
-#[derive(Debug, Clone, Default)]
-pub struct UpToDown {
-    /// Result of the upload task: Some(true) = success, Some(false) = failure, None = still running
-    up_result: Option<bool>,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UploadStatus {
+    Active, Done, Failed
+}
 
-    /// True if the download task has given up on writing to the app (e.g., app closed).
-    /// The upload task checks this to know if it should start its shutdown timer.
-    down_discarding: bool,
-
-    /// Result of the download task: Some(true) = success, Some(false) = failure, None = still running
-    down_result: Option<bool>,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DownloadStatus {
+    Active, Discarding, Done, Failed
 }
 
 // ============================================================================
@@ -266,85 +266,76 @@ async fn up_connected(io: Pin<&TunnelIO>) -> TaskEnd {
     // Once we're in shutdown mode, we use a read timeout to avoid hanging forever
     // waiting for app data that will never come.
     let mut read_timeout: Option<Instant> = None;
+    let down_status_alarm = pin!(ValueWatch::new(io.pin_down_status()));
+    let mut down_status = poll_fn(|cx| Poll::Ready(down_status_alarm.update(cx))).await;
+    let mut to_send: Option<Message> = None;
+    let read_alarm = pin!(ClockAlarm::new(io.pin_clock(), None));
+    let send_alarm = pin!(ClockAlarm::new(io.pin_clock(), None));
 
     // Main loop: transfer data from app to WebSocket
-    while !got_eof {
-        // Message to send to the WebSocket (if any)
-        let mut to_send: Option<Message> = None;
-
-        // Check if the download task has completed or failed.
-        // If so, we need to start our shutdown sequence.
-        let (down_result, down_discarding) = io
-            .up_to_down
-            .p_get(|r| (r.down_result, r.down_discarding))
-            .await;
-        match down_result {
-            Some(true) => {
-                if read_timeout.is_none() {
-                    // Download completed successfully. Start shutdown timer.
-                    tracing::info!("Up stream starting shutdown timer after down stream finished.");
-                    read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
-                    // Tell the server we're shutting down our read side.
-                    to_send = Some(Message::Text("RDSD".into()));
-                }
+    let is_ok = poll_fn(|cx| {
+        if let Poll::Ready(ds) = down_status_alarm.poll_ref(cx) {
+            down_status = ds;
+            cx.waker().wake_by_ref();
+        };
+        if to_send.is_none() {
+            if got_eof {
+                return true.into();
             }
-            Some(false) => {
-                // Download failed. Close immediately.
-                tracing::info!("Up stream closing after down stream failed.");
-                got_eof = true;
-                to_send = Some(Message::Binary(Bytes::new())); // EOF message
-            }
-            _ => {
-                // Download still running, but check if it gave up on writing
-                if down_discarding && read_timeout.is_none() {
-                    // Download can't write to app anymore (app closed?).
-                    // Start shutdown timer.
-                    tracing::info!(
-                        "Up stream starting shutdown timer after down stream failed write."
-                    );
-                    read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
-                    // Tell the server we're shutting down our read side.
-                    to_send = Some(Message::Text("RDSD".into()));
+            // check for discarding or EOF message
+            match down_status {
+                DownloadStatus::Active => {},
+                DownloadStatus::Discarding => {
+                    if read_timeout.is_none() {
+                        // Download can't write to app anymore (app closed?).
+                        // Start shutdown timer.
+                        tracing::info!(
+                            "Up stream starting shutdown timer after down stream failed write."
+                        );
+                        read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
+                        // Tell the server we're shutting down our read side.
+                        to_send = Some(Message::Text("RDSD".into()));
+                    }
+                },
+                DownloadStatus::Done => {
+                    if read_timeout.is_none() {
+                        // Download completed successfully. Start shutdown timer.
+                        tracing::info!("Up stream starting shutdown timer after down stream finished.");
+                        read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
+                        // Tell the server we're shutting down our read side.
+                        to_send = Some(Message::Text("RDSD".into()));
+                    }
+                },
+                DownloadStatus::Failed => {
+                    // Download failed. Close immediately.
+                    tracing::info!("Up stream closing after down stream failed.");
+                    got_eof = true;
+                    to_send = Some(Message::Binary(Bytes::new())); // EOF message
                 }
             }
         }
-
-        // If we don't have a shutdown message to send, try to read app data
+        // If we don't have a status message to send, try to read app data
         if to_send.is_none() {
-            let mut data: Option<Bytes> = None;
-            let read_alarm = pin!(ClockAlarm::new(io.pin_clock(), read_timeout));
-            let err: Option<&str> = poll_fn(|cx| {
-                match io.up_in.poll_read(cx) {
-                    Poll::Ready(item) => {
-                        // Got data! We'll process it below.
-                        data = item;
-                        return Poll::Ready(None);
-                    }
-                    Poll::Pending => {
-                        // No data available yet. Check if output is still valid before yielding.
-                        match io.up_out.poll_send_ready(cx) {
-                            Poll::Ready(Err(_)) => {
-                                return Poll::Ready(Some(
-                                    "Up stream aborting: output channel closed while waiting",
-                                ))
-                            }
-                            _ => (),
-                        };
-                        if read_alarm.poll_ref(cx).is_ready() {
-                            return Some(
-                                "Up stream aborting.  Read timed out after down stream shut down",
-                            )
-                            .into();
+            (&*read_alarm).set(read_timeout);
+            let data: Option<Bytes> = match io.up_in.poll_read(cx) {
+                Poll::Ready(item) => item,
+                Poll::Pending => {
+                    // No data available yet. Check if output is still valid before yielding.
+                    match io.up_out.poll_send_ready(cx) {
+                        Poll::Ready(Err(_)) => {
+                            tracing::error!("Up stream aborting: output channel closed while waiting");
+                            return false.into();
                         }
+                        _ => (),
+                    };
+                    if read_alarm.poll_ref(cx).is_ready() {
+                        tracing::error!("Up stream aborting.  Read timed out after down stream shut down");
+                        return false.into();
                     }
-                };
-                Poll::Pending
-            })
-            .await;
-            if let Some(err) = err {
-                tracing::info!(err);
-                return up_abort(io).await;
-            }
+                    return Poll::Pending;
+                }
+            };
+
             // We successfully read data or EOF
             // If we're in shutdown mode, extend the timeout
             // (we're still getting data, so the app is still alive)
@@ -360,40 +351,37 @@ async fn up_connected(io: Pin<&TunnelIO>) -> TaskEnd {
                     to_send = Some(Message::Binary(Bytes::new()));
                 }
                 Some(bin) => {
-                    if bin.is_empty() {
-                        // Empty data is not EOF, just skip it.
-                        // (We can't send empty Binary - that looks like EOF!)
-                        continue;
+                    // If data is empty, just skip it
+                    // (We can't send empty Binary - that looks like EOF!)
+                    if !bin.is_empty() {
+                        to_send = Some(Message::Binary(bin));
                     }
-                    to_send = Some(Message::Binary(bin));
                 }
             }
         }
-
-        // We have a message to send - write it to up_out
-        let send_timeout = pin!(ClockAlarm::new(
-            io.pin_clock(),
-            Some(io.now() + SEND_TIMEOUT)
-        ));
-        let ok = poll_fn(|cx| {
+        if to_send.is_some() {
+            (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
             match io.up_out.poll_send(cx, &mut to_send) {
-                Poll::Ready(Ok(_)) => return Poll::Ready(true),
-                Poll::Ready(Err(_)) => return Poll::Ready(false),
-                Poll::Pending => (),
+                Poll::Ready(Ok(_)) => {
+                    cx.waker().wake_by_ref();
+                },
+                Poll::Ready(Err(_)) => {
+                    tracing::info!("Up stream aborting: Error sending");
+                    return false.into();
+                },
+                Poll::Pending => {
+                    if send_alarm.poll_ref(cx).is_ready() {
+                        return Poll::Ready(false);
+                    }
+                },
             };
-            if send_timeout.poll_ref(cx).is_ready() {
-                return Poll::Ready(false);
-            }
-            Poll::Pending
-        })
-        .await;
-        if !ok {
-            // Can't write - abort the whole upload task
-            tracing::info!("Up stream aborting: Error sending");
-            return up_abort(io).await;
         }
-    }
+        Poll::Pending
+    }).await;
 
+    if !is_ok {
+        return up_abort(io).await;
+    }
     // Clean shutdown: we got EOF and sent an EOF message
     io.up_in.drop_read();
 
@@ -410,10 +398,7 @@ async fn up_connected(io: Pin<&TunnelIO>) -> TaskEnd {
         }
     })
     .await;
-    io.up_to_down.side_check(|x: &mut UpToDown| {
-        x.up_result = Some(true); // Signal success
-        true
-    });
+    io.up_status.set(UploadStatus::Done);
     TaskEnd()
 }
 
@@ -424,10 +409,7 @@ async fn up_abort(io: Pin<&TunnelIO>) -> TaskEnd {
     let mut cx = Context::from_waker(noop_waker_ref());
     io.up_in.drop_read();
     let _ = io.up_out.poll_close(&mut cx);
-    io.up_to_down.side_check(|x: &mut UpToDown| {
-        x.up_result = Some(false); // Signal failure - download should abort
-        true
-    });
+    io.up_status.set(UploadStatus::Failed);
     TaskEnd()
 }
 
@@ -464,68 +446,86 @@ async fn down_connected(io: Pin<&TunnelIO>) -> TaskEnd {
 
     // Timeout for reading from WebSocket (set when upload task completes)
     let mut read_timeout: Option<Instant> = None;
+    let read_alarm = pin!(ClockAlarm::new(io.pin_clock(), None));
+    let send_alarm = pin!(ClockAlarm::new(io.pin_clock(), None));
+    let up_status_alarm = pin!(ValueWatch::new(io.pin_up_status()));
+    let mut to_send: Option<Bytes> = None;
 
     // Main loop: transfer data from WebSocket to app
-    while !got_eof {
-        // Check if the upload task has completed or failed
+    let is_ok = poll_fn(|cx| {
         if read_timeout.is_none() {
-            let up_result = io.up_to_down.c_get(|r| r.up_result).await;
-            match up_result {
-                Some(true) => {
-                    // Upload completed successfully. Start shutdown timer.
+            match up_status_alarm.poll_ref(cx) {
+                Poll::Ready(UploadStatus::Done) => {
                     tracing::info!("Down stream starting shutdown timer after up stream finished.");
                     read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
-                }
-                Some(false) => {
+                },
+                Poll::Ready(UploadStatus::Failed) => {
                     // Upload failed. Abort immediately.
                     tracing::info!("Down stream aborted after up stream.");
-                    return down_abort(io).await;
+                    return false.into();
+                },
+                _ => {}
+            }
+        };
+
+        if to_send.is_some() {
+            // We've got some data that we're trying to send
+            (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
+            match io.down_out.poll_send(cx, &mut to_send) {
+                Poll::Pending => {
+                    return Poll::Pending;
                 }
-                _ => {
-                    // Upload still running, continue normally
+                Poll::Ready(Err(_)) => {
+                    // Can't write to app. Enter discarding mode.
+                    // We still need to drain the WebSocket, so don't abort entirely.
+                    tracing::info!("Down stream discarding due to send error");
+                    down_discarding = true;
+                    io.down_status.set(DownloadStatus::Discarding);
+                    return false.into();
                 }
+                Poll::Ready(Ok(_)) => {}
             }
         }
 
+        if got_eof {
+            return true.into();
+        }
+
         // Try to read a WebSocket message
-        let msg: Result<Option<Message>, ()> = {
-            let read_timeout = ClockAlarm::new(io.pin_clock(), read_timeout);
-            let mut read_timeout = pin!(read_timeout);
-            poll_fn(|cx| {
-                if let Poll::Ready(msg) = io.down_in.poll_read(cx) {
-                    // got a message
-                    return Result::Ok(msg).into();
+        (*read_alarm).set(read_timeout);
+        let msg: Result<Option<Message>, ()> = match io.down_in.poll_read(cx) {
+            Poll::Ready(msg) => Ok(msg),
+            Poll::Pending => {
+                if read_alarm.poll_ref(cx).is_ready() {
+                    tracing::info!("Down stream aborted: read error");
+                    return false.into();
                 }
-                if read_timeout.as_mut().poll(cx).is_ready() {
-                    return Result::Err(()).into();
-                }
-                Poll::Pending
-            })
-            .await
+                return Poll::Pending;
+            }
         };
         let msg = match msg {
             Err(_) => {
                 tracing::info!("Down stream aborted: read error");
-                return down_abort(io).await;
+                return false.into();
             }
             Ok(None) => {
                 tracing::info!("Down stream aborted: EOF");
-                return down_abort(io).await;
+                return false.into();
             }
             Ok(Some(msg)) => msg,
         };
 
-        // If we got data and we're in shutdown mode, extend the timeout
+        // We got some data. If we're in shutdown mode, extend the timeout
         if read_timeout.is_some() {
             read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
         }
 
         // Process the WebSocket message
-        let mut to_send: Option<Bytes> = match msg {
+        to_send = match msg {
             // WebSocket close frame (unexpected - we should initiate close)
             Message::Close(_) => {
                 tracing::info!("Down stream aborted. Got WS close");
-                return down_abort(io).await;
+                return false.into();
             }
             // Control/text message from the server
             Message::Text(txt) => {
@@ -539,11 +539,12 @@ async fn down_connected(io: Pin<&TunnelIO>) -> TaskEnd {
                 } else if str.starts_with("CONNECT:") {
                     // CONNECT message shouldn't happen after we're connected
                     tracing::info!("Down stream aborted. Unexpected CONNECT");
-                    return down_abort(io).await;
+                    return false.into();
                 } else {
                     // Unknown text message - ignore and continue
                     tracing::info!("Down stream: unrecognized: {}", str);
-                    continue;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
             }
             // Binary data message
@@ -560,50 +561,26 @@ async fn down_connected(io: Pin<&TunnelIO>) -> TaskEnd {
             }
             // Other message types (Ping, Pong, etc.) - ignore
             _ => {
-                continue;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
         };
 
         // If we're discarding (can't write to app), skip the write
         if down_discarding {
-            continue;
+            to_send = None;
         }
-
-        // Write data to the app (if we have any)
-        if to_send.is_some() {
-            let send_timeout = ClockAlarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
-            let mut send_timeout = pin!(send_timeout);
-            let ok = poll_fn(|cx| {
-                if let Poll::Ready(result) = io.down_out.poll_send(cx, &mut to_send) {
-                    return result.is_ok().into();
-                }
-                if send_timeout.as_mut().poll(cx).is_ready() {
-                    return false.into();
-                }
-                Poll::Pending
-            })
-            .await;
-            if !ok {
-                // Can't write to app. Enter discarding mode.
-                // We still need to drain the WebSocket, so don't abort entirely.
-                tracing::info!("Down stream discarding due to send error");
-                io.up_to_down
-                    .c(|r| {
-                        r.down_discarding = true;
-                        true
-                    })
-                    .await;
-                down_discarding = true;
-            }
-        }
+        // Since we processed a message, loop around to the next iteration to send it or get more
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }).await;
+    if !is_ok {
+        return down_abort(io).await;
     }
 
     // Clean shutdown: we got EOF from WebSocket
     io.down_in.drop_read();
-    io.up_to_down.side_check(|x: &mut UpToDown| {
-        x.down_result = Some(true); // Signal success
-        true
-    });
+    io.down_status.set(DownloadStatus::Done);
 
     // Wait for any pending output to be consumed by the app
     let flush_timeout: ClockAlarm<Instant> =
@@ -629,10 +606,7 @@ async fn down_abort(io: Pin<&TunnelIO>) -> TaskEnd {
     let mut cx = Context::from_waker(noop_waker_ref());
     io.down_in.drop_read();
     let _ = io.down_out.poll_close(&mut cx);
-    io.up_to_down.side_check(|x: &mut UpToDown| {
-        x.down_result = Some(false); // Signal failure
-        true
-    });
+    io.down_status.set(DownloadStatus::Failed);
     TaskEnd()
 }
 
@@ -1265,12 +1239,10 @@ mod tests {
             tick(&proto);
         }
 
-        // Send data to down_in. The download task may process this message
-        // (it was already waiting for data before up_result was set), then on
-        // the next loop iteration it checks up_result and aborts.
+        // Send data to down_in. This should fail because the download process is done
         {
             let guard = proto.lock();
-            assert!(exchange_send(
+            assert!(!exchange_send(
                 &guard.down_in,
                 Message::Binary(Bytes::from("may_pass_through"))
             ));
@@ -1310,12 +1282,6 @@ mod tests {
             tick(&proto);
         }
 
-        // Send data to up_in to trigger the upload task to check down_result
-        {
-            let guard = proto.lock();
-            assert!(exchange_send(&guard.up_in, Bytes::from("after_fail")));
-        }
-
         // Upload should send EOF (empty binary) because down_result is Some(false)
         let mut saw_eof = false;
         for _ in 0..20 {
@@ -1340,14 +1306,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn up_to_down_default() {
-        let utd = UpToDown::default();
-        assert_eq!(utd.up_result, None);
-        assert_eq!(utd.down_result, None);
-        assert!(!utd.down_discarding);
-    }
-
-    #[test]
     fn up_to_down_signals_after_download_eof() {
         let proto = make_proto();
 
@@ -1364,10 +1322,7 @@ mod tests {
 
         // Check the coordination state via the public accessor
         let guard = proto.lock();
-        guard.up_to_down.side_check(|utd| {
-            assert_eq!(utd.down_result, Some(true));
-            false
-        });
+        assert_eq!(guard.down_status.get(), DownloadStatus::Done);
     }
 
     #[test]
@@ -1385,10 +1340,7 @@ mod tests {
         }
 
         let guard = proto.lock();
-        guard.up_to_down.side_check(|utd| {
-            assert_eq!(utd.down_result, Some(false));
-            false
-        });
+        assert_eq!(guard.down_status.get(), DownloadStatus::Failed);
     }
 
     // -----------------------------------------------------------------------
