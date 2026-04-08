@@ -230,7 +230,7 @@ pub struct TaskEnd();
 /// Each node knows how many tasks are in the chain ([`DEPTH`](Self::DEPTH)),
 /// can poll them selectively via a bitmask, and returns an updated bitmask
 /// indicating which tasks are still alive.
-pub trait ProcMachineFutures: Send {
+pub trait ProcMachineFutures {
     /// Number of tasks in this chain (0 for the base, N for N tasks).
     const DEPTH: u8;
 
@@ -267,13 +267,13 @@ impl ProcMachineFutures for ProcMachineFuturesBase {
 /// after it completes.
 pub struct ProcMachineFuturesExtension<
     PREV: ProcMachineFutures,
-    FUT: Future<Output = TaskEnd> + Send + 'static,
+    FUT: Future<Output = TaskEnd> + 'static,
 > {
     prev: PREV,
     fut: Option<FUT>,
 }
 
-impl<PREV: ProcMachineFutures, FUT: Future<Output = TaskEnd> + Send + 'static> ProcMachineFutures
+impl<PREV: ProcMachineFutures, FUT: Future<Output = TaskEnd> + 'static> ProcMachineFutures
     for ProcMachineFuturesExtension<PREV, FUT>
 {
     const DEPTH: u8 = PREV::DEPTH + 1;
@@ -360,7 +360,7 @@ pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
     fn init(&self, io: Pin<&'static IO>, futures: &mut Self::FUTURES);
 
     /// Appends a new task and returns an extended builder.
-    fn with<FUT: Future<Output = TaskEnd> + Send + 'static>(
+    fn with<FUT: Future<Output = TaskEnd> + 'static>(
         self: Self,
         proc: fn(Pin<&'static IO>) -> FUT,
     ) -> impl ProcMachineJobs<IO>;
@@ -386,7 +386,7 @@ impl<IO: Send + Debug + 'static> ProcMachineJobs<IO> for ProcMachineJobsBase {
 
     fn init(&self, _io: Pin<&'static IO>, _futures: &mut Self::FUTURES) {}
 
-    fn with<FUT: Future<Output = TaskEnd> + Send + 'static>(
+    fn with<FUT: Future<Output = TaskEnd> + 'static>(
         self: Self,
         proc: fn(Pin<&'static IO>) -> FUT,
     ) -> impl ProcMachineJobs<IO> {
@@ -398,7 +398,7 @@ impl<IO: Send + Debug + 'static> ProcMachineJobs<IO> for ProcMachineJobsBase {
 pub struct ProcMachineJobsExtension<
     IO: Send + Debug + 'static,
     PREV: ProcMachineJobs<IO>,
-    FUT: Future<Output = TaskEnd> + Send + 'static,
+    FUT: Future<Output = TaskEnd> + 'static,
 > {
     prev: PREV,
     /// Constructor function: given a pinned IO ref, returns the task future.
@@ -408,7 +408,7 @@ pub struct ProcMachineJobsExtension<
 impl<
         IO: Send + Debug,
         PREV: ProcMachineJobs<IO>,
-        FUT: Future<Output = TaskEnd> + Send + 'static,
+        FUT: Future<Output = TaskEnd> + 'static,
     > ProcMachineJobs<IO> for ProcMachineJobsExtension<IO, PREV, FUT>
 {
     const DEPTH: u8 = PREV::DEPTH + 1;
@@ -420,7 +420,7 @@ impl<
         futures.fut = Some((self.proc)(io));
     }
 
-    fn with<FUT2: Future<Output = TaskEnd> + Send + 'static>(
+    fn with<FUT2: Future<Output = TaskEnd> + 'static>(
         self: Self,
         proc: fn(Pin<&'static IO>) -> FUT2,
     ) -> impl ProcMachineJobs<IO> {
