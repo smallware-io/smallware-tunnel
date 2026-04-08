@@ -69,4 +69,4 @@ pub use forward::{forward_tunnel, forward_tunnel_tcp, ForwardStats};
 pub use jwt::JwtManager;
 pub use listener::{parse_key, TunnelClientInfo, TunnelConfig, TunnelListener};
 pub use stat_counter::*;
-pub use tunnel_protocol::{TunnelSink, TunnelStream};
+pub use tunnel_protocol::{ExchangeServerLinks, TunnelSink, TunnelStream};

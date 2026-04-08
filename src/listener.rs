@@ -30,7 +30,7 @@ use crate::io_stream::IoStream;
 use crate::jwt::{extract_customer_id, JwtManager};
 use crate::proc_machines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
-use crate::tunnel_protocol::{create_tunnel_protocol, TunnelProtocol, TunnelSink, TunnelStream};
+use crate::tunnel_protocol::{create_tunnel_protocol, ExchangeServerLinks, TunnelProtocol, TunnelSink, TunnelStream};
 use crate::{
     noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN,
     STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS,
@@ -648,8 +648,8 @@ impl TunnelListener {
     /// Background task that bridges the sans-IO protocol with the WebSocket.
     ///
     /// This task:
-    /// 1. Reads from WebSocket and feeds messages into the protocol (down_in)
-    /// 2. Reads from protocol output and sends to WebSocket (up_out)
+    /// 1. Reads from WebSocket and feeds messages into the protocol (server_links.down_in)
+    /// 2. Reads from protocol output and sends to WebSocket (server_links.up_out)
     /// 3. Calls protocol.tick() to advance the state machine
     /// 4. Sends periodic ping messages to keep the WebSocket alive
     /// 5. When protocol completes, offers the connection for recycling
@@ -657,7 +657,7 @@ impl TunnelListener {
     /// The rendezvous channel (capacity 0) ensures synchronous handoff: a recycled
     /// connection is only kept alive if an `accept()` call is ready to receive it.
     async fn protocol_bridge_task(
-        protocol: TunnelProtocol,
+        protocol: TunnelProtocol<ExchangeServerLinks>,
         stat_counter: Arc<dyn StatCounter>,
         mut ws_tx: WsRawSink,
         mut ws_rx: WsBaseStream,
@@ -700,7 +700,7 @@ impl TunnelListener {
                     }
                     _ => {
                         let g = protocol.lock();
-                        g.up_out.drop_read();
+                        g.server_links.up_out.drop_read();
                         got_err = true;
                         up_open = false;
                         need_flush = false;
@@ -722,7 +722,7 @@ impl TunnelListener {
                         did_something = true;
                         down_open = false;
                         got_err = true;
-                        let _ = protocol.lock().down_in.poll_close(cx);
+                        let _ = protocol.lock().server_links.down_in.poll_close(cx);
                     }
                 }
             }
@@ -751,7 +751,7 @@ impl TunnelListener {
                         need_flush = false;
                         up_open = false;
                         got_err = true;
-                        protocol.lock().up_out.drop_read();
+                        protocol.lock().server_links.up_out.drop_read();
                         did_something = true;
                     }
                 }
@@ -767,8 +767,8 @@ impl TunnelListener {
         {
             let g = protocol.lock();
             let mut cx = Context::from_waker(noop_waker_ref());
-            let _ = g.down_in.poll_close(&mut cx);
-            g.up_out.drop_read();
+            let _ = g.server_links.down_in.poll_close(&mut cx);
+            g.server_links.up_out.drop_read();
         }
 
         if !protocol_done || got_err {
@@ -795,10 +795,10 @@ fn poll_transfer_up(
     cx: &mut Context<'_>,
     stat_counter: &Arc<dyn StatCounter>,
     ws_tx: &mut WsRawSink,
-    protocol: &TunnelProtocol,
+    protocol: &TunnelProtocol<ExchangeServerLinks>,
 ) -> Poll<TransferResult> {
     let g = protocol.lock();
-    let src = &g.up_out;
+    let src = &g.server_links.up_out;
     match src.check_read(cx) {
         Poll::Pending => return Poll::Pending,
         Poll::Ready(false) => {
@@ -885,10 +885,10 @@ fn poll_transfer_down(
     cx: &mut Context<'_>,
     stat_counter: &Arc<dyn StatCounter>,
     ws_rx: &mut WsBaseStream,
-    protocol: &TunnelProtocol,
+    protocol: &TunnelProtocol<ExchangeServerLinks>,
 ) -> Poll<TransferResult> {
     let g = protocol.lock();
-    let sink = &g.down_in;
+    let sink = &g.server_links.down_in;
     match sink.poll_send_ready(cx) {
         Poll::Pending => return Poll::Pending,
         _ => (),
