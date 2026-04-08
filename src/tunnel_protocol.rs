@@ -309,60 +309,93 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
         // waiting for app data that will never come.
         let mut read_timeout: Option<Instant> = None;
         let down_status_alarm = pin!(ValueWatch::new(io.pin_down_status()));
-        let mut down_status = poll_fn(|cx| Poll::Ready(down_status_alarm.update(cx))).await;
         let mut to_send: Option<Message> = None;
         let read_alarm = pin!(ClockAlarm::new(io.pin_clock(), None));
         let send_alarm = pin!(ClockAlarm::new(io.pin_clock(), None));
+        let mut down_status = DownloadStatus::Active;
+        let mut need_flush = false;
 
         // Main loop: transfer data from app to WebSocket
         let is_ok = poll_fn(|cx| {
+            if to_send.is_some() {
+                (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
+                match sink.poll_send(cx, &mut to_send) {
+                    Poll::Ready(Ok(_)) => {}
+                    Poll::Ready(Err(_)) => {
+                        tracing::info!("Up stream aborting: Error sending");
+                        return false.into();
+                    }
+                    Poll::Pending => {
+                        if send_alarm.poll_ref(cx).is_ready() {
+                            return Poll::Ready(false);
+                        }
+                        return Poll::Pending;
+                    }
+                };
+                need_flush = true;
+                to_send = None;
+                cx.waker().wake_by_ref();
+            }
             if let Poll::Ready(ds) = down_status_alarm.poll_ref(cx) {
                 down_status = ds;
                 cx.waker().wake_by_ref();
             };
-            if to_send.is_none() {
-                if got_eof {
-                    return true.into();
+
+            if got_eof {
+                return true.into();
+            }
+            // check for discarding or EOF message
+            match down_status {
+                DownloadStatus::Active => {}
+                DownloadStatus::Discarding => {
+                    if read_timeout.is_none() {
+                        // Download can't write to app anymore (app closed?).
+                        // Start shutdown timer.
+                        tracing::info!(
+                            "Up stream starting shutdown timer after down stream failed write."
+                        );
+                        read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
+                        // Tell the server we're shutting down our read side.
+                        to_send = Some(Message::Text("RDSD".into()));
+                    }
                 }
-                // check for discarding or EOF message
-                match down_status {
-                    DownloadStatus::Active => {}
-                    DownloadStatus::Discarding => {
-                        if read_timeout.is_none() {
-                            // Download can't write to app anymore (app closed?).
-                            // Start shutdown timer.
-                            tracing::info!(
-                                "Up stream starting shutdown timer after down stream failed write."
-                            );
-                            read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
-                            // Tell the server we're shutting down our read side.
-                            to_send = Some(Message::Text("RDSD".into()));
-                        }
+                DownloadStatus::Done => {
+                    if read_timeout.is_none() {
+                        // Download completed successfully. Start shutdown timer.
+                        tracing::info!(
+                            "Up stream starting shutdown timer after down stream finished."
+                        );
+                        read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
+                        // Tell the server we're shutting down our read side.
+                        to_send = Some(Message::Text("RDSD".into()));
                     }
-                    DownloadStatus::Done => {
-                        if read_timeout.is_none() {
-                            // Download completed successfully. Start shutdown timer.
-                            tracing::info!(
-                                "Up stream starting shutdown timer after down stream finished."
-                            );
-                            read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
-                            // Tell the server we're shutting down our read side.
-                            to_send = Some(Message::Text("RDSD".into()));
-                        }
-                    }
-                    DownloadStatus::Failed => {
-                        // Download failed. Close immediately.
-                        tracing::info!("Up stream closing after down stream failed.");
-                        got_eof = true;
-                        to_send = Some(Message::Binary(Bytes::new())); // EOF message
-                    }
+                }
+                DownloadStatus::Failed => {
+                    // Download failed. Close immediately.
+                    tracing::info!("Up stream closing after down stream failed.");
+                    got_eof = true;
+                    to_send = Some(Message::Binary(Bytes::new())); // EOF message
                 }
             }
+
             // If we don't have a status message to send, try to read app data
             if to_send.is_none() {
                 (&*read_alarm).set(read_timeout);
                 let data: Option<Bytes> = match io.up_in.poll_read(cx) {
-                    Poll::Ready(item) => item,
+                    Poll::Ready(item) => {
+                        // We successfully read data or EOF
+                        // If we're in shutdown mode, extend the timeout
+                        // (we're still getting data, so the app is still alive)
+                        if read_timeout.is_some() {
+                            read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
+                        }
+                        if item.is_none() {
+                            // EOF from app - send EOF to WebSocket
+                            got_eof = true;
+                            to_send = Some(Message::Binary(Bytes::new()));
+                        }
+                        item
+                    }
                     Poll::Pending => {
                         // No data available yet. Check if output is still valid before yielding.
                         match sink.poll_send_ready(cx) {
@@ -380,24 +413,13 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                             );
                             return false.into();
                         }
-                        return Poll::Pending;
+                        None
                     }
                 };
 
-                // We successfully read data or EOF
-                // If we're in shutdown mode, extend the timeout
-                // (we're still getting data, so the app is still alive)
-                if read_timeout.is_some() {
-                    read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
-                }
-
                 // Process the data we read
                 match data {
-                    None => {
-                        // EOF from app - send EOF to WebSocket
-                        got_eof = true;
-                        to_send = Some(Message::Binary(Bytes::new()));
-                    }
+                    None => {}
                     Some(bin) => {
                         // If data is empty, just skip it
                         // (We can't send empty Binary - that looks like EOF!)
@@ -408,21 +430,11 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                 }
             }
             if to_send.is_some() {
-                (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
-                match sink.poll_send(cx, &mut to_send) {
-                    Poll::Ready(Ok(_)) => {
-                        cx.waker().wake_by_ref();
-                    }
-                    Poll::Ready(Err(_)) => {
-                        tracing::info!("Up stream aborting: Error sending");
-                        return false.into();
-                    }
-                    Poll::Pending => {
-                        if send_alarm.poll_ref(cx).is_ready() {
-                            return Poll::Ready(false);
-                        }
-                    }
-                };
+                cx.waker().wake_by_ref();
+            } else if need_flush {
+                if sink.poll_flush(cx).is_ready() {
+                    need_flush = false;
+                }
             }
             Poll::Pending
         })
@@ -434,19 +446,21 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
         // Clean shutdown: we got EOF and sent an EOF message
         io.up_in.drop_read();
 
+        if need_flush {
+            let flush_alarm = pin!(ClockAlarm::new(
+                io.pin_clock(),
+                Some(io.now() + SEND_TIMEOUT)
+            ));
+            poll_fn(|cx| {
+                if sink.poll_flush(cx).is_ready() {
+                    Poll::Ready(())
+                } else {
+                    flush_alarm.poll_ref(cx)
+                }
+            })
+            .await;
+        }
         // Wait for any pending output to be consumed
-        let flush_timeout = pin!(ClockAlarm::new(
-            io.pin_clock(),
-            Some(io.now() + SEND_TIMEOUT)
-        ));
-        poll_fn(|cx| {
-            if sink.poll_close(cx).is_ready() {
-                Poll::Ready(())
-            } else {
-                flush_timeout.poll_ref(cx)
-            }
-        })
-        .await;
         io.up_status.set(UploadStatus::Done);
         TaskEnd()
     }
@@ -456,9 +470,19 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
     /// Closes both channels and signals failure so the download task aborts too.
     async fn up_abort(io: Pin<&Self>) -> TaskEnd {
         let sink = io.server_links.sink();
-        let mut cx = Context::from_waker(noop_waker_ref());
         io.up_in.drop_read();
-        let _ = sink.poll_close(&mut cx);
+        let flush_alarm = pin!(ClockAlarm::new(
+            io.pin_clock(),
+            Some(io.now() + SEND_TIMEOUT)
+        ));
+        poll_fn(|cx| {
+            if sink.poll_close(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                flush_alarm.poll_ref(cx)
+            }
+        })
+        .await;
         io.up_status.set(UploadStatus::Failed);
         TaskEnd()
     }
@@ -489,6 +513,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
     /// until EOF or an error occurs.
     async fn down_connected(io: Pin<&Self>) -> TaskEnd {
         let stream = io.server_links.stream();
+        let sink = &io.down_out;
         let mut got_eof = false;
 
         // If we can't write to the app, we enter discarding mode:
@@ -501,6 +526,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
         let send_alarm = pin!(ClockAlarm::new(io.pin_clock(), None));
         let up_status_alarm = pin!(ValueWatch::new(io.pin_up_status()));
         let mut to_send: Option<Bytes> = None;
+        let mut need_flush = false;
 
         // Main loop: transfer data from WebSocket to app
         let is_ok = poll_fn(|cx| {
@@ -524,7 +550,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             if to_send.is_some() {
                 // We've got some data that we're trying to send
                 (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
-                match io.down_out.poll_send(cx, &mut to_send) {
+                match sink.poll_send(cx, &mut to_send) {
                     Poll::Pending => {
                         return Poll::Pending;
                     }
@@ -536,7 +562,11 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         io.down_status.set(DownloadStatus::Discarding);
                         return false.into();
                     }
-                    Poll::Ready(Ok(_)) => {}
+                    Poll::Ready(Ok(_)) => {
+                        need_flush = true;
+                        cx.waker().wake_by_ref();
+                        to_send = None;
+                    }
                 }
             }
 
@@ -553,9 +583,17 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         tracing::info!("Down stream aborted: read error");
                         return false.into();
                     }
+                    if need_flush {
+                        if sink.poll_flush(cx).is_ready() {
+                            need_flush = false;
+                            cx.waker().wake_by_ref();
+                        }
+                    }
                     return Poll::Pending;
                 }
             };
+
+            // read a message
             let msg = match msg {
                 Err(_) => {
                     tracing::info!("Down stream aborted: read error");
@@ -569,6 +607,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             };
 
             // We got some data. If we're in shutdown mode, extend the timeout
+            cx.waker().wake_by_ref();
             if read_timeout.is_some() {
                 read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
             }
@@ -587,7 +626,6 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         // Server-initiated close with reason
                         tracing::info!("Down stream done: {}", str);
                         got_eof = true;
-                        // Fall through to send loop (with to_send = None, which is EOF)
                         None
                     } else if str.starts_with("CONNECT:") {
                         // CONNECT message shouldn't happen after we're connected
@@ -596,8 +634,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                     } else {
                         // Unknown text message - ignore and continue
                         tracing::info!("Down stream: unrecognized: {}", str);
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                        None
                     }
                 }
                 // Binary data message
@@ -613,10 +650,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                     }
                 }
                 // Other message types (Ping, Pong, etc.) - ignore
-                _ => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
+                _ => None
             };
 
             // If we're discarding (can't write to app), skip the write
@@ -628,20 +662,17 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             Poll::Pending
         })
         .await;
-        if !is_ok {
-            return Self::down_abort(io).await;
-        }
 
-        // Clean shutdown: we got EOF from WebSocket
-        stream.drop_read();
-        io.down_status.set(DownloadStatus::Done);
+        if !is_ok {
+            stream.drop_read();
+        }
 
         // Wait for any pending output to be consumed by the app
         let flush_timeout: ClockAlarm<Instant> =
             ClockAlarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
         let mut flush_timeout = pin!(flush_timeout);
         poll_fn(|cx| {
-            if io.down_out.poll_close(cx).is_ready() {
+            if sink.poll_close(cx).is_ready() {
                 return Poll::Ready(());
             }
             if flush_timeout.as_mut().poll(cx).is_ready() {
@@ -650,18 +681,12 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             Poll::Pending
         })
         .await;
-        TaskEnd()
-    }
-
-    /// Abort the download task due to an error.
-    ///
-    /// Closes both channels and signals failure via down_result.
-    async fn down_abort(io: Pin<&Self>) -> TaskEnd {
-        let stream = io.server_links.stream();
-        let mut cx = Context::from_waker(noop_waker_ref());
-        stream.drop_read();
-        let _ = io.down_out.poll_close(&mut cx);
-        io.down_status.set(DownloadStatus::Failed);
+        if !is_ok {
+            io.down_status.set(DownloadStatus::Failed);
+        } else {
+            // Clean shutdown: we got EOF from WebSocket
+            io.down_status.set(DownloadStatus::Done);
+        }
         TaskEnd()
     }
 }

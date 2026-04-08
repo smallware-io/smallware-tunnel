@@ -176,10 +176,10 @@ impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
         let mut guard = self.item.lock().unwrap();
         let st = self.state.load(Ordering::Acquire);
         let nextst = match st {
-            EXCH_EMPTY | EXCH_EMPTY_FLUSHED => {
+            EXCH_EMPTY_FLUSHED => {
                 return Poll::Pending;
             }
-            EXCH_EMPTY_FLUSH => {
+            EXCH_EMPTY | EXCH_EMPTY_FLUSH => {
                 // Acknowledge the flush (reader has seen the empty slot).
                 let _ = self.state.compare_exchange(
                     st,

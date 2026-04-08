@@ -149,14 +149,14 @@ impl IoSink for WsServerLinks {
     }
 
     fn poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
-        let mut sink = self.sink.borrow_mut();
-        let Some(sink) = sink.as_mut() else {
+        let mut sink_ref = self.sink.borrow_mut();
+        let Some(sink) = sink_ref.as_mut() else {
             return Poll::Ready(Ok(()));
         };
         match Pin::new(sink).poll_close(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(_) => {
-                *self.sink.borrow_mut() = None;
+                *sink_ref = None;
                 tracing::debug!("WS UP CLOSE");
                 Poll::Ready(Ok(()))
             }
@@ -169,17 +169,18 @@ impl IoStream<Message> for WsServerLinks {
         if self.buffered.borrow().is_some() {
             return Poll::Ready(true);
         }
-        let mut stream = self.stream.borrow_mut();
-        let Some(stream) = stream.as_mut() else {
-            return Poll::Ready(false);
+        let mut stream_ref = self.stream.borrow_mut();
+        let result = match stream_ref.as_mut() {
+            None => return Poll::Ready(false),
+            Some(stream) => Pin::new(stream).poll_next(cx),
         };
-        match Pin::new(stream).poll_next(cx) {
+        match result {
             Poll::Ready(Some(Ok(msg))) => {
                 *self.buffered.borrow_mut() = Some(msg);
                 Poll::Ready(true)
             }
             Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                *self.stream.borrow_mut() = None;
+                *stream_ref = None;
                 Poll::Ready(false)
             }
             Poll::Pending => Poll::Pending,
@@ -190,11 +191,12 @@ impl IoStream<Message> for WsServerLinks {
         if let Some(msg) = self.buffered.borrow_mut().take() {
             return Poll::Ready(Some(msg));
         }
-        let mut stream = self.stream.borrow_mut();
-        let Some(stream) = stream.as_mut() else {
-            return Poll::Ready(None);
+        let mut stream_ref = self.stream.borrow_mut();
+        let result = match stream_ref.as_mut() {
+            None => return Poll::Ready(None),
+            Some(stream) => Pin::new(stream).poll_next(cx),
         };
-        match Pin::new(stream).poll_next(cx) {
+        match result {
             Poll::Ready(Some(Ok(msg))) => {
                 match &msg {
                     Message::Binary(bytes) => {
@@ -212,12 +214,12 @@ impl IoStream<Message> for WsServerLinks {
                 Poll::Ready(Some(msg))
             }
             Poll::Ready(None) => {
-                *self.stream.borrow_mut() = None;
+                *stream_ref = None;
                 tracing::debug!("WS DOWN CLOSE");
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(_))) => {
-                *self.stream.borrow_mut() = None;
+                *stream_ref = None;
                 tracing::error!("Websocket read error");
                 Poll::Ready(None)
             }
