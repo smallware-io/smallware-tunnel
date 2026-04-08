@@ -245,9 +245,7 @@ impl<'a, T: Clone> ValueWatch<'a, T> {
                     // Value has changed since last poll.
                     Poll::Ready((*guard).clone())
                 }
-                false => {
-                    Poll::Pending
-                }
+                false => Poll::Pending,
             }
         }
     }
@@ -291,10 +289,7 @@ mod tests {
         }
     }
 
-    fn poll_watch<T: Clone>(
-        watch: &mut Pin<&mut ValueWatch<'_, T>>,
-        waker: &Waker,
-    ) -> Poll<T> {
+    fn poll_watch<T: Clone>(watch: &mut Pin<&mut ValueWatch<'_, T>>, waker: &Waker) -> Poll<T> {
         let mut cx = Context::from_waker(waker);
         watch.as_mut().poll(&mut cx)
     }
@@ -405,7 +400,6 @@ mod tests {
         assert_eq!(tw.count(), 2);
         assert_eq!(poll_watch(&mut watch, &waker), Poll::Pending);
     }
-
 
     // -----------------------------------------------------------------------
     // Wake notification tests

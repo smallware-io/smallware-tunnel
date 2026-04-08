@@ -264,12 +264,17 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UploadStatus {
-    Active, Done, Failed
+    Active,
+    Done,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DownloadStatus {
-    Active, Discarding, Done, Failed
+    Active,
+    Discarding,
+    Done,
+    Failed,
 }
 
 impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
@@ -321,7 +326,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                 }
                 // check for discarding or EOF message
                 match down_status {
-                    DownloadStatus::Active => {},
+                    DownloadStatus::Active => {}
                     DownloadStatus::Discarding => {
                         if read_timeout.is_none() {
                             // Download can't write to app anymore (app closed?).
@@ -333,16 +338,18 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                             // Tell the server we're shutting down our read side.
                             to_send = Some(Message::Text("RDSD".into()));
                         }
-                    },
+                    }
                     DownloadStatus::Done => {
                         if read_timeout.is_none() {
                             // Download completed successfully. Start shutdown timer.
-                            tracing::info!("Up stream starting shutdown timer after down stream finished.");
+                            tracing::info!(
+                                "Up stream starting shutdown timer after down stream finished."
+                            );
                             read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
                             // Tell the server we're shutting down our read side.
                             to_send = Some(Message::Text("RDSD".into()));
                         }
-                    },
+                    }
                     DownloadStatus::Failed => {
                         // Download failed. Close immediately.
                         tracing::info!("Up stream closing after down stream failed.");
@@ -360,13 +367,17 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         // No data available yet. Check if output is still valid before yielding.
                         match sink.poll_send_ready(cx) {
                             Poll::Ready(Err(_)) => {
-                                tracing::error!("Up stream aborting: output channel closed while waiting");
+                                tracing::error!(
+                                    "Up stream aborting: output channel closed while waiting"
+                                );
                                 return false.into();
                             }
                             _ => (),
                         };
                         if read_alarm.poll_ref(cx).is_ready() {
-                            tracing::error!("Up stream aborting.  Read timed out after down stream shut down");
+                            tracing::error!(
+                                "Up stream aborting.  Read timed out after down stream shut down"
+                            );
                             return false.into();
                         }
                         return Poll::Pending;
@@ -401,20 +412,21 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                 match sink.poll_send(cx, &mut to_send) {
                     Poll::Ready(Ok(_)) => {
                         cx.waker().wake_by_ref();
-                    },
+                    }
                     Poll::Ready(Err(_)) => {
                         tracing::info!("Up stream aborting: Error sending");
                         return false.into();
-                    },
+                    }
                     Poll::Pending => {
                         if send_alarm.poll_ref(cx).is_ready() {
                             return Poll::Ready(false);
                         }
-                    },
+                    }
                 };
             }
             Poll::Pending
-        }).await;
+        })
+        .await;
 
         if !is_ok {
             return Self::up_abort(io).await;
@@ -495,14 +507,16 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             if read_timeout.is_none() {
                 match up_status_alarm.poll_ref(cx) {
                     Poll::Ready(UploadStatus::Done) => {
-                        tracing::info!("Down stream starting shutdown timer after up stream finished.");
+                        tracing::info!(
+                            "Down stream starting shutdown timer after up stream finished."
+                        );
                         read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
-                    },
+                    }
                     Poll::Ready(UploadStatus::Failed) => {
                         // Upload failed. Abort immediately.
                         tracing::info!("Down stream aborted after up stream.");
                         return false.into();
-                    },
+                    }
                     _ => {}
                 }
             };
@@ -612,7 +626,8 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             // Since we processed a message, loop around to the next iteration to send it or get more
             cx.waker().wake_by_ref();
             Poll::Pending
-        }).await;
+        })
+        .await;
         if !is_ok {
             return Self::down_abort(io).await;
         }
@@ -1003,7 +1018,10 @@ mod tests {
         // Send EOF (empty Binary)
         {
             let guard = proto.lock();
-            assert!(exchange_send(&guard.server_links.down_in, Message::Binary(Bytes::new())));
+            assert!(exchange_send(
+                &guard.server_links.down_in,
+                Message::Binary(Bytes::new())
+            ));
         }
 
         // down_out should eventually close (yield None)
@@ -1056,7 +1074,10 @@ mod tests {
         // Send EOF
         {
             let guard = proto.lock();
-            assert!(exchange_send(&guard.server_links.down_in, Message::Binary(Bytes::new())));
+            assert!(exchange_send(
+                &guard.server_links.down_in,
+                Message::Binary(Bytes::new())
+            ));
         }
 
         let result = read_with_ticks(&proto, |io| &io.down_out, 10);
@@ -1070,7 +1091,10 @@ mod tests {
         // Send a WebSocket Close frame
         {
             let guard = proto.lock();
-            assert!(exchange_send(&guard.server_links.down_in, Message::Close(None)));
+            assert!(exchange_send(
+                &guard.server_links.down_in,
+                Message::Close(None)
+            ));
         }
 
         // down_out should close (abort)
@@ -1140,7 +1164,10 @@ mod tests {
 
         {
             let guard = proto.lock();
-            assert!(exchange_send(&guard.server_links.down_in, Message::Pong(vec![].into())));
+            assert!(exchange_send(
+                &guard.server_links.down_in,
+                Message::Pong(vec![].into())
+            ));
         }
 
         {
@@ -1231,7 +1258,10 @@ mod tests {
         // Complete the download by sending EOF
         {
             let guard = proto.lock();
-            assert!(exchange_send(&guard.server_links.down_in, Message::Binary(Bytes::new())));
+            assert!(exchange_send(
+                &guard.server_links.down_in,
+                Message::Binary(Bytes::new())
+            ));
         }
 
         // Drain down_out (the close notification)
@@ -1318,7 +1348,10 @@ mod tests {
         // Make the download task fail by sending a Close frame
         {
             let guard = proto.lock();
-            assert!(exchange_send(&guard.server_links.down_in, Message::Close(None)));
+            assert!(exchange_send(
+                &guard.server_links.down_in,
+                Message::Close(None)
+            ));
         }
 
         // Tick to let download process the Close and set down_result
@@ -1356,7 +1389,10 @@ mod tests {
         // Send download EOF
         {
             let guard = proto.lock();
-            assert!(exchange_send(&guard.server_links.down_in, Message::Binary(Bytes::new())));
+            assert!(exchange_send(
+                &guard.server_links.down_in,
+                Message::Binary(Bytes::new())
+            ));
         }
 
         // Tick to process
@@ -1376,7 +1412,10 @@ mod tests {
         // Trigger download abort via Close frame
         {
             let guard = proto.lock();
-            assert!(exchange_send(&guard.server_links.down_in, Message::Close(None)));
+            assert!(exchange_send(
+                &guard.server_links.down_in,
+                Message::Close(None)
+            ));
         }
 
         for _ in 0..5 {

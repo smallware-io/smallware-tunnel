@@ -28,11 +28,12 @@ use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
 use crate::proc_machines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
-use crate::tunnel_protocol::{create_tunnel_protocol, DownloadStatus, TunnelProtocol, TunnelSink, TunnelStream, UploadStatus};
+use crate::tunnel_protocol::{
+    create_tunnel_protocol, DownloadStatus, TunnelProtocol, TunnelSink, TunnelStream, UploadStatus,
+};
 use crate::ws_links::{WsBaseStream, WsRawSink, WsServerLinks};
 use crate::{
-    noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING,
-    STAT_COUNT_CONNECTIONS,
+    noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_CONNECTIONS,
 };
 use bytes::Bytes;
 use derivative::Derivative;
@@ -606,7 +607,7 @@ impl TunnelListener {
         // Create the sans-io protocol state machine with direct WebSocket access
         let protocol = create_tunnel_protocol(
             coarsetime::Instant::now(),
-            WsServerLinks::new(ws_tx, ws_rx),
+            WsServerLinks::new(ws_tx, ws_rx, self.shared.stat_counter.clone()),
         );
 
         // Create sink and stream that interface with the protocol
@@ -681,8 +682,7 @@ impl TunnelListener {
         // not failed) — only then can we recycle the WebSocket.
         let can_recycle = {
             let g = protocol.lock();
-            g.up_status.get() == UploadStatus::Done
-                && g.down_status.get() == DownloadStatus::Done
+            g.up_status.get() == UploadStatus::Done && g.down_status.get() == DownloadStatus::Done
         };
 
         if !can_recycle {

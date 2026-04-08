@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::fmt::{self, Binary};
+use std::fmt::{self};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -9,13 +9,14 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::{STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP, StatCounter};
 use crate::io_sink::IoSink;
 use crate::io_stream::IoStream;
 use crate::tunnel_protocol::ServerLinks;
+use crate::{StatCounter, STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP};
 
 /// The underlying WebSocket sink type (write half after split).
-pub type WsRawSink = futures::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+pub type WsRawSink =
+    futures::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 /// The underlying WebSocket stream type (read half after split).
 pub type WsBaseStream = futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
@@ -99,11 +100,7 @@ impl IoSink for WsServerLinks {
         Pin::new(sink).poll_ready(cx).map_err(|_| ())
     }
 
-    fn poll_send(
-        &self,
-        cx: &mut Context<'_>,
-        item: &mut Option<Message>,
-    ) -> Poll<Result<(), ()>> {
+    fn poll_send(&self, cx: &mut Context<'_>, item: &mut Option<Message>) -> Poll<Result<(), ()>> {
         if item.is_none() {
             return Poll::Ready(Ok(()));
         }
@@ -119,7 +116,7 @@ impl IoSink for WsServerLinks {
         }
         let len = match item {
             Some(Message::Binary(bytes)) => Some(bytes.len()),
-            _ => None
+            _ => None,
         };
         let msg = item.take().unwrap();
         Pin::new(&mut *sink).start_send(msg).map_err(|_| ())?;
@@ -131,9 +128,10 @@ impl IoSink for WsServerLinks {
             if len == 0 {
                 tracing::debug!("WS UP EOS");
             } else {
-                self.stat_counter.stat_count(STAT_COUNT_BYTES_UP, len as i32);
+                self.stat_counter
+                    .stat_count(STAT_COUNT_BYTES_UP, len as i32);
                 tracing::debug!("WS UP {}", len);
-            }            
+            }
         }
         Poll::Ready(Ok(()))
     }
@@ -203,21 +201,22 @@ impl IoStream<Message> for WsServerLinks {
                         let len = bytes.len();
                         if len == 0 {
                             tracing::debug!("WS DOWN EOS");
-                        }else {
-                            self.stat_counter.stat_count(STAT_COUNT_BYTES_DOWN, len as i32);
+                        } else {
+                            self.stat_counter
+                                .stat_count(STAT_COUNT_BYTES_DOWN, len as i32);
                             tracing::debug!("WS DOWN {}", len);
                         }
                     }
                     _ => {}
                 }
                 Poll::Ready(Some(msg))
-            },
+            }
             Poll::Ready(None) => {
                 *self.stream.borrow_mut() = None;
                 tracing::debug!("WS DOWN CLOSE");
                 Poll::Ready(None)
-            },
-            Poll::Ready(Some(Err(_)))  => {
+            }
+            Poll::Ready(Some(Err(_))) => {
                 *self.stream.borrow_mut() = None;
                 tracing::error!("Websocket read error");
                 Poll::Ready(None)
