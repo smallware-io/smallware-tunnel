@@ -63,6 +63,7 @@ mod stat_counter;
 pub mod trace_id;
 pub mod tunnel_protocol;
 pub mod watchable_value;
+pub mod ws_links;
 
 pub use error::TunnelError;
 pub use forward::{forward_tunnel, forward_tunnel_tcp, ForwardStats};

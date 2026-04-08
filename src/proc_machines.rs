@@ -75,13 +75,14 @@
 
 use bytemuck::{allocation::TransparentWrapperAlloc, TransparentWrapper};
 use core::fmt::Debug;
+use futures::task::AtomicWaker;
 use parking_lot::{lock_api::RawMutex as _, Mutex};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 
 // ============================================================================
 // PUBLIC INTERFACE
@@ -100,6 +101,22 @@ pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
     ///
     /// Also ticks the machine, so any pending wakes are processed first.
     fn is_done(&self) -> bool;
+
+    /// Check for external wakes to the internal jobs.
+    ///
+    /// If any of the tasks internal to this `ProcMachine` have been woken
+    /// outside of a `lock()`, then this will execute those tasks until they all block
+    /// or terminate.
+    ///
+    /// Whether or not there were any waiting tasks, `cx` waker is then registered
+    /// to be notified the next time such an external wake happens.
+    ///
+    /// IMPORTANT: Any previously registered waker is discarded, so there MUST be
+    /// at most one task calling this method.
+    ///
+    /// It is only necessary to call this method if the internal tasks could poll
+    /// something "external", that can signal outside of `lock()`
+    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()>;
 
     /// Acquires the inner mutex and returns a raw pointer to the IO struct.
     ///
@@ -405,11 +422,8 @@ pub struct ProcMachineJobsExtension<
     proc: fn(Pin<&'static IO>) -> FUT,
 }
 
-impl<
-        IO: Send + Debug,
-        PREV: ProcMachineJobs<IO>,
-        FUT: Future<Output = TaskEnd> + 'static,
-    > ProcMachineJobs<IO> for ProcMachineJobsExtension<IO, PREV, FUT>
+impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> + 'static>
+    ProcMachineJobs<IO> for ProcMachineJobsExtension<IO, PREV, FUT>
 {
     const DEPTH: u8 = PREV::DEPTH + 1;
     type FUTURES = ProcMachineFuturesExtension<PREV::FUTURES, FUT>;
@@ -470,12 +484,17 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES
     ///
     /// Returns `true` if any tasks are still alive.
     fn tick<T: MultiWake + 'static>(&mut self, waker: &Arc<T>, wake_mask: &AtomicU32) -> bool {
+        // Set the ticking flag so wakes aren't counted as external
         loop {
-            let mask = self.alive_mask & wake_mask.swap(0, Ordering::SeqCst);
-            if mask == 0 {
+            let mask = self.alive_mask & wake_mask.swap(0x80000000, Ordering::SeqCst) & 0x7FFFFFFF;
+            if mask != 0 {
+                self.alive_mask = self.futures.poll(waker, mask);
+            } else if wake_mask
+                .compare_exchange_weak(0x80000000, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
                 break;
             }
-            self.alive_mask = self.futures.poll(waker, mask);
         }
         self.alive_mask != 0
     }
@@ -512,6 +531,7 @@ pub static PROC_MACHINE_JOBS_BASE: ProcMachineJobsBase = ProcMachineJobsBase();
 struct ProcMachineImpl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> {
     inner: Mutex<ProcMachineInner<IO, FUTURES>>,
     wake_mask: AtomicU32,
+    external_waker: AtomicWaker,
     raw_arc: *const Self,
 }
 
@@ -560,6 +580,11 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> MultiWake
                 .compare_exchange(old, new, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
+                if (old & 0x80000000) == 0 {
+                    // We are not inside a locked context that will notice this wake, so
+                    // this wake is 'external', and need to notify the external task
+                    self.external_waker.wake();
+                }
                 break;
             }
             // CAS failed (another thread modified wake_mask) — retry.
@@ -585,6 +610,7 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
         let mut ret = Arc::new(Self {
             inner: Mutex::new(ProcMachineInner::new(io)),
             wake_mask: AtomicU32::new(0),
+            external_waker: AtomicWaker::new(),
             raw_arc: std::ptr::null(),
         });
         // Store a raw self-pointer for later Arc reconstruction in
@@ -647,6 +673,17 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
         (*inner_ptr).tick(&arc, &self.wake_mask);
         // Now release the raw mutex.
         self.inner.raw().unlock();
+    }
+
+    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.external_waker.register(cx.waker());
+        if (self.wake_mask.load(Ordering::Relaxed) & 0x7FFFFFFF) != 0 {
+            unsafe {
+                self.unsafe_lock_io();
+                self.unsafe_unlock_io();
+            }
+        }
+        Poll::Pending
     }
 }
 
@@ -761,8 +798,7 @@ fn get_multi_waker<T: MultiWake + 'static>(target: &Arc<T>, n: u8) -> Waker {
         28 => MultiwakeWrapper::<T, 28>::get_waker(target.clone()),
         29 => MultiwakeWrapper::<T, 29>::get_waker(target.clone()),
         30 => MultiwakeWrapper::<T, 30>::get_waker(target.clone()),
-        31 => MultiwakeWrapper::<T, 31>::get_waker(target.clone()),
-        _ => panic!("Task index {n} out of range (max 31, limited by u32 wake_mask)"),
+        _ => panic!("Task index {n} out of range (max 30, limited by u32 wake_mask)"),
     }
 }
 
@@ -1247,13 +1283,13 @@ mod tests {
     fn multi_waker_high_indices() {
         let mw = TestMultiWaker::new();
 
-        let w31 = get_multi_waker(&mw, 31);
+        let w31 = get_multi_waker(&mw, 30);
         w31.wake_by_ref();
-        assert_eq!(mw.woken_mask(), 1 << 31);
+        assert_eq!(mw.woken_mask(), 1 << 30);
 
         let w16 = get_multi_waker(&mw, 16);
         w16.wake_by_ref();
-        assert_eq!(mw.woken_mask(), (1 << 31) | (1 << 16));
+        assert_eq!(mw.woken_mask(), (1 << 30) | (1 << 16));
     }
 
     #[test]
