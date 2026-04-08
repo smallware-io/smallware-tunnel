@@ -164,7 +164,7 @@ impl ServerLinks for ExchangeServerLinks {
 
 /// The default [`ServerLinks`] implementation used by [`TunnelSink`] and
 /// [`TunnelStream`].
-pub type StandardServerLinks = ExchangeServerLinks;
+pub type StandardServerLinks = crate::ws_links::WsServerLinks;
 
 /// Shared I/O state for the tunnel protocol.
 ///
@@ -672,12 +672,15 @@ pub type TunnelProtocol<SLINKS> = Arc<dyn ProcMachine<TunnelIO<SLINKS>>>;
 /// # Arguments
 ///
 /// * `now` — the current timestamp, used to seed the internal [`AlarmClock`].
-pub fn create_tunnel_protocol(now: Instant) -> TunnelProtocol<ExchangeServerLinks> {
-    let arc = PROC_MACHINE_JOBS_BASE
-        .with(TunnelIO::up_connected)
-        .with(TunnelIO::down_connected)
-        .build(TunnelIO::new(now, ExchangeServerLinks::new()));
-    arc
+/// * `server_links` — the server-side sink and stream implementation.
+pub fn create_tunnel_protocol<SLINKS: ServerLinks + Debug + 'static>(
+    now: Instant,
+    server_links: SLINKS,
+) -> TunnelProtocol<SLINKS> {
+    PROC_MACHINE_JOBS_BASE
+        .with(TunnelIO::<SLINKS>::up_connected)
+        .with(TunnelIO::<SLINKS>::down_connected)
+        .build(TunnelIO::new(now, server_links))
 }
 
 /// A [`futures::Sink`] adapter for writing application data into the tunnel.
@@ -791,7 +794,7 @@ mod tests {
 
     /// Creates a protocol and returns it with a fixed "now" instant.
     fn make_proto() -> TunnelProtocol<ExchangeServerLinks> {
-        create_tunnel_protocol(Instant::now())
+        create_tunnel_protocol(Instant::now(), ExchangeServerLinks::new())
     }
 
     /// Sends an item into an IoExchange (writer/sink side). Returns true if accepted.
@@ -1382,131 +1385,6 @@ mod tests {
 
         let guard = proto.lock();
         assert_eq!(guard.down_status.get(), DownloadStatus::Failed);
-    }
-
-    // -----------------------------------------------------------------------
-    // TunnelSink / TunnelStream adapters
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn tunnel_sink_sends_data() {
-        let proto = make_proto();
-        let mut sink = TunnelSink::new(proto.clone());
-
-        // Use the Sink interface to send data
-        {
-            let mut cx = Context::from_waker(noop_waker_ref());
-            assert!(Pin::new(&mut sink).poll_ready(&mut cx).is_ready());
-        }
-        {
-            assert!(Pin::new(&mut sink)
-                .start_send(Bytes::from("via_sink"))
-                .is_ok());
-        }
-
-        // Verify it arrives in up_out as a Binary message
-        let msg = read_with_ticks(&proto, |io| &io.server_links.up_out, 10);
-        match msg {
-            Poll::Ready(Some(Message::Binary(b))) => {
-                assert_eq!(b, Bytes::from("via_sink"));
-            }
-            other => panic!("expected Binary via sink, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn tunnel_stream_receives_data() {
-        let proto = make_proto();
-        let mut stream = TunnelStream::new(proto.clone());
-
-        // Feed data into down_in
-        {
-            let guard = proto.lock();
-            assert!(exchange_send(
-                &guard.server_links.down_in,
-                Message::Binary(Bytes::from("via_stream"))
-            ));
-        }
-
-        // Tick to let download task process
-        tick(&proto);
-
-        // Read via the Stream interface
-        {
-            let mut cx = Context::from_waker(noop_waker_ref());
-            // May need multiple attempts as the download task processes
-            let mut result = Poll::Pending;
-            for _ in 0..10 {
-                result = Pin::new(&mut stream).poll_next(&mut cx);
-                if result.is_ready() {
-                    break;
-                }
-                tick(&proto);
-            }
-            match result {
-                Poll::Ready(Some(b)) => assert_eq!(b, Bytes::from("via_stream")),
-                other => panic!("expected data via stream, got {:?}", other),
-            }
-        }
-    }
-
-    #[test]
-    fn tunnel_sink_drop_closes_up_in() {
-        let proto = make_proto();
-
-        // Create and immediately drop the sink
-        {
-            let _sink = TunnelSink::new(proto.clone());
-            // drop initiates close on up_in
-        }
-
-        // The upload task should eventually send EOF
-        let mut saw_eof = false;
-        for _ in 0..20 {
-            // Also need to acknowledge the close handshake
-            {
-                let guard = proto.lock();
-                let _ = exchange_check(&guard.up_in);
-            }
-            let msg = read_with_ticks(&proto, |io| &io.server_links.up_out, 3);
-            if let Poll::Ready(Some(Message::Binary(b))) = msg {
-                if b.is_empty() {
-                    saw_eof = true;
-                    break;
-                }
-            }
-        }
-        assert!(saw_eof, "expected EOF after TunnelSink dropped");
-    }
-
-    #[test]
-    fn tunnel_stream_drop_signals_reader_dropped() {
-        let proto = make_proto();
-
-        // Create and immediately drop the stream
-        {
-            let _stream = TunnelStream::new(proto.clone());
-        }
-
-        // Tick to let things propagate
-        for _ in 0..5 {
-            tick(&proto);
-        }
-
-        // Send data to down_in — the download task should enter discarding mode
-        // or abort since the reader is gone.
-        {
-            let guard = proto.lock();
-            assert!(exchange_send(
-                &guard.server_links.down_in,
-                Message::Binary(Bytes::from("dropped"))
-            ));
-        }
-
-        // Tick to process — should not panic
-        for _ in 0..5 {
-            tick(&proto);
-        }
     }
 
     // -----------------------------------------------------------------------

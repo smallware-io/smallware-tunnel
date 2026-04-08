@@ -109,7 +109,8 @@ pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
     /// or terminate.
     ///
     /// Whether or not there were any waiting tasks, `cx` waker is then registered
-    /// to be notified the next time such an external wake happens.
+    /// to be notified the next time such an external wake happens, and Poll::Pending
+    /// is returned.
     ///
     /// IMPORTANT: Any previously registered waker is discarded, so there MUST be
     /// at most one task calling this method.

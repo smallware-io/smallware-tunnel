@@ -25,39 +25,29 @@
 //! to waiting `accept()` calls.
 
 use crate::error::TunnelError;
-use crate::io_sink::IoSink;
-use crate::io_stream::IoStream;
 use crate::jwt::{extract_customer_id, JwtManager};
 use crate::proc_machines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
-use crate::tunnel_protocol::{create_tunnel_protocol, ExchangeServerLinks, TunnelProtocol, TunnelSink, TunnelStream};
+use crate::tunnel_protocol::{create_tunnel_protocol, DownloadStatus, TunnelProtocol, TunnelSink, TunnelStream, UploadStatus};
+use crate::ws_links::{WsBaseStream, WsRawSink, WsServerLinks};
 use crate::{
-    noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN,
-    STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS,
+    noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING,
+    STAT_COUNT_CONNECTIONS,
 };
 use bytes::Bytes;
 use derivative::Derivative;
-use futures::task::noop_waker_ref;
 use futures::{SinkExt, StreamExt};
 use std::future::poll_fn;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::Instrument;
-
-/// The underlying WebSocket sink type (write half after split).
-type WsRawSink = futures::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-
-/// The underlying WebSocket stream type (read half after split).
-type WsBaseStream = futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 /// Configuration for the tunnel listener.
 ///
@@ -613,22 +603,23 @@ impl TunnelListener {
         }
         let conn_id = conn_id.unwrap_or_else(|| "?".into());
 
-        // Create the sans-io protocol state machine
-        let protocol = create_tunnel_protocol(coarsetime::Instant::now());
+        // Create the sans-io protocol state machine with direct WebSocket access
+        let protocol = create_tunnel_protocol(
+            coarsetime::Instant::now(),
+            WsServerLinks::new(ws_tx, ws_rx),
+        );
 
         // Create sink and stream that interface with the protocol
         let sink = TunnelSink::new(protocol.clone());
         let stream = TunnelStream::new(protocol.clone());
 
-        // Spawn the bridge task that connects the protocol to the WebSocket
+        // Spawn the bridge task that drives the protocol
         let recycle_tx = shared.recycle_tx.clone();
         let shutdown_rx = shared.shutdown_rx.clone();
         tokio::spawn(
             Self::protocol_bridge_task(
                 protocol,
                 self.shared.stat_counter.clone(),
-                ws_tx,
-                ws_rx,
                 recycle_tx,
                 shutdown_rx,
             )
@@ -645,290 +636,74 @@ impl TunnelListener {
         ))
     }
 
-    /// Background task that bridges the sans-IO protocol with the WebSocket.
+    /// Background task that drives the tunnel protocol.
     ///
-    /// This task:
-    /// 1. Reads from WebSocket and feeds messages into the protocol (server_links.down_in)
-    /// 2. Reads from protocol output and sends to WebSocket (server_links.up_out)
-    /// 3. Calls protocol.tick() to advance the state machine
-    /// 4. Sends periodic ping messages to keep the WebSocket alive
-    /// 5. When protocol completes, offers the connection for recycling
-    ///
-    /// The rendezvous channel (capacity 0) ensures synchronous handoff: a recycled
-    /// connection is only kept alive if an `accept()` call is ready to receive it.
+    /// The protocol tasks interact directly with the WebSocket through
+    /// [`WsServerLinks`]. This task just needs to:
+    /// 1. Advance the protocol clock periodically
+    /// 2. Call [`poll_external`](ProcMachine::poll_external) to process
+    ///    wakes from the WebSocket's async runtime
+    /// 3. When the protocol completes, offer the connection for recycling
     async fn protocol_bridge_task(
-        protocol: TunnelProtocol<ExchangeServerLinks>,
+        protocol: TunnelProtocol<WsServerLinks>,
         stat_counter: Arc<dyn StatCounter>,
-        mut ws_tx: WsRawSink,
-        mut ws_rx: WsBaseStream,
         recycle_tx: flume::Sender<RecycledConnection>,
         shutdown_rx: watch::Receiver<bool>,
     ) {
         let _connection_stat = ScopeStat::new(&stat_counter, STAT_COUNT_CONNECTIONS);
         let mut shutdown_rx = shutdown_rx;
-        let mut up_open = true;
-        let mut down_open = true;
-        let mut got_err = false;
         let mut ticker = tokio::time::interval(Duration::from_millis(5000));
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        let mut last_ping = coarsetime::Instant::now();
-        let mut need_flush = false;
 
-        // Main bridge loop
-        let protocol_done: bool = poll_fn(|cx| {
-            // Tick the protocol to advance state
-            let now = coarsetime::Instant::now();
+        // TODO signal shutdown
+        poll_fn(|cx| {
+            // Process external wakes (ticks the protocol internally)
+            let _ = protocol.poll_external(cx);
+
+            // Advance clock
             {
                 let g = protocol.lock();
-                g.clock.advance(now);
+                g.clock.advance(coarsetime::Instant::now());
             }
-            if !up_open && !down_open && !need_flush {
-                return protocol.is_done().into();
+            // Check if all protocol tasks have completed
+            if protocol.is_done() {
+                return Poll::Ready(());
             }
-            let mut did_something = false;
-            if up_open {
-                match poll_transfer_up(cx, &stat_counter, &mut ws_tx, &protocol) {
-                    Poll::Pending => {}
-                    Poll::Ready(TransferResult::Closed) => {
-                        up_open = false;
-                        did_something = true;
-                    }
-                    Poll::Ready(TransferResult::Data) => {
-                        last_ping = now;
-                        need_flush = true;
-                        did_something = true;
-                    }
-                    _ => {
-                        let g = protocol.lock();
-                        g.server_links.up_out.drop_read();
-                        got_err = true;
-                        up_open = false;
-                        need_flush = false;
-                        did_something = true;
-                    }
-                }
-            }
-            if down_open {
-                match poll_transfer_down(cx, &stat_counter, &mut ws_rx, &protocol) {
-                    Poll::Pending => {}
-                    Poll::Ready(TransferResult::Data) => {
-                        did_something = true;
-                    }
-                    Poll::Ready(TransferResult::Closed) => {
-                        did_something = true;
-                        down_open = false;
-                    }
-                    _ => {
-                        did_something = true;
-                        down_open = false;
-                        got_err = true;
-                        let _ = protocol.lock().server_links.down_in.poll_close(cx);
-                    }
-                }
-            }
-            if up_open && now - last_ping > coarsetime::Duration::from_secs(60) {
-                match poll_transfer_ping(cx, &mut ws_tx) {
-                    Poll::Pending => {}
-                    Poll::Ready(res) => {
-                        if res.is_err() {
-                            up_open = false;
-                            got_err = true;
-                        } else {
-                            last_ping = now;
-                            need_flush = true;
-                        }
-                        did_something = true;
-                    }
-                }
-            }
-            if need_flush && !did_something {
-                match poll_transfer_flush(cx, &mut ws_tx) {
-                    Poll::Pending => {}
-                    Poll::Ready(Ok(_)) => {
-                        need_flush = false;
-                    }
-                    Poll::Ready(Err(_)) => {
-                        need_flush = false;
-                        up_open = false;
-                        got_err = true;
-                        protocol.lock().server_links.up_out.drop_read();
-                        did_something = true;
-                    }
-                }
-            }
-            if did_something || ticker.poll_tick(cx).is_ready() {
-                cx.waker().wake_by_ref();
-            }
+
+            // Periodic wakeup to advance the clock for timeout detection
+            let _ = ticker.poll_tick(cx);
+
             Poll::Pending
         })
         .await;
 
-        // Close the protocol channels
-        {
+        // Check whether the protocol completed cleanly (both directions done,
+        // not failed) — only then can we recycle the WebSocket.
+        let can_recycle = {
             let g = protocol.lock();
-            let mut cx = Context::from_waker(noop_waker_ref());
-            let _ = g.server_links.down_in.poll_close(&mut cx);
-            g.server_links.up_out.drop_read();
-        }
+            g.up_status.get() == UploadStatus::Done
+                && g.down_status.get() == DownloadStatus::Done
+        };
 
-        if !protocol_done || got_err {
-            // Can't recycle. Just drop everything
+        if !can_recycle {
             return;
         }
 
-        // Offer the recycled connection (with 5-second timeout)
-        tokio::select! {
-            _ = recycle_tx.send_async(RecycledConnection { ws_tx, ws_rx }) => {}
-            _ = time::sleep(time::Duration::from_secs(5)) => {}
-            _ = util_shutdown(&mut shutdown_rx) => {}
-        }
-    }
-}
-
-enum TransferResult {
-    Data,
-    Closed,
-    Fail,
-}
-
-fn poll_transfer_up(
-    cx: &mut Context<'_>,
-    stat_counter: &Arc<dyn StatCounter>,
-    ws_tx: &mut WsRawSink,
-    protocol: &TunnelProtocol<ExchangeServerLinks>,
-) -> Poll<TransferResult> {
-    let g = protocol.lock();
-    let src = &g.server_links.up_out;
-    match src.check_read(cx) {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(false) => {
-            src.drop_read();
-            return TransferResult::Closed.into();
-        }
-        _ => (),
-    };
-    match ws_tx.poll_ready_unpin(cx) {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(_)) => {
-            src.drop_read();
-            tracing::error!("Websocket write failed");
-            return TransferResult::Fail.into();
-        }
-        Poll::Ready(Ok(_)) => (),
-    };
-    let item = match src.poll_read(cx) {
-        Poll::Pending => {
-            tracing::error!("Pending poll_read after check_read->true");
-            return Poll::Pending;
-        }
-        Poll::Ready(bytes) => bytes,
-    };
-    if let Some(item) = item {
-        let mut is_eof = false;
-        match &item {
-            Message::Binary(bytes) => {
-                stat_counter.stat_count(STAT_COUNT_BYTES_UP, bytes.len() as i32);
-                is_eof = bytes.len() == 0;
-            }
-            _ => {}
+        // Extract the WebSocket halves from the protocol for recycling
+        let (ws_tx, ws_rx) = {
+            let g = protocol.lock();
+            g.server_links.take()
         };
-        if is_eof {
-            tracing::debug!("WS UP EOS");
-        } else {
-            tracing::debug!("WS UP");
-        }
-        if ws_tx.start_send_unpin(item).is_err() {
-            src.drop_read();
-            tracing::error!("start_send failed");
-            return TransferResult::Fail.into();
-        }
-    } else {
-        tracing::error!("poll_read() produced None after check_read()->true");
-    }
-    TransferResult::Data.into()
-}
 
-fn poll_transfer_ping(cx: &mut Context<'_>, ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
-    let ready = ws_tx.poll_ready_unpin(cx);
-    match ready {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(_)) => {
-            tracing::error!("Websocket write failed");
-            return Poll::Ready(Err(()));
-        }
-        Poll::Ready(Ok(_)) => {}
-    };
-    let item: Message = Message::Ping(Bytes::new());
-    if ws_tx.start_send_unpin(item).is_err() {
-        tracing::error!("start_send failed");
-        return Poll::Ready(Err(()));
-    }
-    tracing::debug!("WS PING");
-    Poll::Ready(Ok(()))
-}
-
-fn poll_transfer_flush(cx: &mut Context<'_>, ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
-    let ready = ws_tx.poll_flush_unpin(cx);
-    match ready {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(_)) => {
-            tracing::error!("Websocket flush failed");
-            return Poll::Ready(Err(()));
-        }
-        Poll::Ready(Ok(_)) => {}
-    };
-    tracing::debug!("WS FLUSH");
-    Poll::Ready(Ok(()))
-}
-
-fn poll_transfer_down(
-    cx: &mut Context<'_>,
-    stat_counter: &Arc<dyn StatCounter>,
-    ws_rx: &mut WsBaseStream,
-    protocol: &TunnelProtocol<ExchangeServerLinks>,
-) -> Poll<TransferResult> {
-    let g = protocol.lock();
-    let sink = &g.server_links.down_in;
-    match sink.poll_send_ready(cx) {
-        Poll::Pending => return Poll::Pending,
-        _ => (),
-    }
-    let ready = ws_rx.poll_next_unpin(cx);
-    let mut item = match ready {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Some(Err(_))) => {
-            let _ = sink.poll_close(cx);
-            tracing::error!("Websocket read failed");
-            return TransferResult::Fail.into();
-        }
-        Poll::Ready(None) => {
-            // web socket EOF
-            let _ = sink.poll_close(cx);
-            tracing::error!("Websocket read EOF");
-            return TransferResult::Closed.into();
-        }
-        Poll::Ready(Some(Ok(data))) => {
-            match &data {
-                Message::Binary(bytes) => {
-                    stat_counter.stat_count(STAT_COUNT_BYTES_DOWN, bytes.len() as i32);
-                    if bytes.len() == 0 {
-                        tracing::debug!("WS DOWN EOS");
-                    }
-                }
-                _ => {}
+        if let (Some(ws_tx), Some(ws_rx)) = (ws_tx, ws_rx) {
+            // Offer the recycled connection (with 5-second timeout)
+            tokio::select! {
+                _ = recycle_tx.send_async(RecycledConnection { ws_tx, ws_rx }) => {}
+                _ = time::sleep(time::Duration::from_secs(5)) => {}
+                _ = util_shutdown(&mut shutdown_rx) => {}
             }
-            Some(data)
         }
-    };
-    match sink.poll_send(cx, &mut item) {
-        Poll::Ready(Ok(_)) => {}
-        _ => {
-            tracing::error!("Protocol write failed");
-            let _ = sink.poll_close(cx);
-            return TransferResult::Fail.into();
-        }
-    };
-    return TransferResult::Data.into();
+    }
 }
 
 /// Waits until the shutdown signal is received.
