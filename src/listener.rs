@@ -26,41 +26,29 @@
 
 use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
-use crate::scitemstream::ScItemStream;
-use crate::spitemsink::SpItemSink;
-use crate::spsc::{
-    with_context, yield_once, SimpleSpScItemInner, SpScItem, SpScItemState, SpScMutex,
-};
+use crate::proc_machines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
-use crate::tunnel_protocol::TunnelProtocol;
+use crate::tunnel_protocol::{
+    create_tunnel_protocol, DownloadStatus, TunnelProtocol, TunnelSink, TunnelStream, UploadStatus,
+};
+use crate::ws_links::{WsBaseStream, WsRawSink, WsServerLinks};
 use crate::{
-    noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_BYTES_DOWN,
-    STAT_COUNT_BYTES_UP, STAT_COUNT_CONNECTIONS,
+    noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_CONNECTIONS,
 };
 use bytes::Bytes;
 use derivative::Derivative;
 use futures::{SinkExt, StreamExt};
+use std::future::poll_fn;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::Instrument;
-
-/// The underlying WebSocket sink type (write half after split).
-type WsRawSink = futures::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-
-/// The underlying WebSocket stream type (read half after split).
-type WsBaseStream = futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
-
-pub type TunnelStream = ScItemStream<TunnelProtocol, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
-pub type TunnelSink = SpItemSink<TunnelProtocol, SpScMutex<SimpleSpScItemInner<Bytes>>, Bytes>;
 
 /// Configuration for the tunnel listener.
 ///
@@ -378,11 +366,18 @@ impl TunnelListener {
 
                 let (ws_tx, ws_rx) = match self.connect_or_recycle().await {
                     Ok(conn) => {
-                        tracing::info!(
-                            "got server after {} ms",
-                            chrono::Utc::now().timestamp_millis() - now_millis
-                        );
-                        conn
+                        if conn.2 {
+                            tracing::info!(
+                                "recycled server after {} ms",
+                                chrono::Utc::now().timestamp_millis() - now_millis
+                            );
+                        } else {
+                            tracing::info!(
+                                "got new server after {} ms",
+                                chrono::Utc::now().timestamp_millis() - now_millis
+                            );
+                        }
+                        (conn.0, conn.1)
                     }
                     Err(e) => {
                         // Connection failed, update retry state
@@ -489,18 +484,20 @@ impl TunnelListener {
     ///
     /// The returned WebSocket is in a "fresh" state: either just connected or just reset.
     /// The server will send a CONNECT message when a client connects to the tunnel.
-    async fn connect_or_recycle(&self) -> Result<(WsRawSink, WsBaseStream), TunnelError> {
+    async fn connect_or_recycle(&self) -> Result<(WsRawSink, WsBaseStream, bool), TunnelError> {
         let shared = self.shared.clone();
         let mut shutdown_rx = shared.shutdown_rx.clone();
         if *shutdown_rx.borrow_and_update() {
             return Err(TunnelError::ListenerClosed);
         }
+        let mut is_recycled = false;
         let (ws_tx, ws_rx) = if let Ok(recycled) = shared.recycle_rx.try_recv() {
             // Send RESET message to tell the server we're ready for a new proxy client.
             // This must be sent before the server will accept new connections on this WebSocket.
             let reset_msg = Message::Text("RESET".into());
             let mut ws_tx = recycled.ws_tx;
             ws_tx.send(reset_msg).await.map_err(TunnelError::from)?;
+            is_recycled = true;
             (ws_tx, recycled.ws_rx)
         } else {
             // No recycled connection available, create a new one
@@ -517,7 +514,7 @@ impl TunnelListener {
                 }
             }
         };
-        Ok((ws_tx, ws_rx))
+        Ok((ws_tx, ws_rx, is_recycled))
     }
 
     /// Waits for a `CONNECT` message on the WebSocket indicating a client has connected.
@@ -607,22 +604,23 @@ impl TunnelListener {
         }
         let conn_id = conn_id.unwrap_or_else(|| "?".into());
 
-        // Create the sans-io protocol state machine
-        let protocol = TunnelProtocol::new(coarsetime::Instant::now());
+        // Create the sans-io protocol state machine with direct WebSocket access
+        let protocol = create_tunnel_protocol(
+            coarsetime::Instant::now(),
+            WsServerLinks::new(ws_tx, ws_rx, self.shared.stat_counter.clone()),
+        );
 
         // Create sink and stream that interface with the protocol
-        let sink = TunnelSink::new(protocol.clone(), |io| &io.io().up_in);
-        let stream = TunnelStream::new(protocol.clone(), |io| &io.io().down_out);
+        let sink = TunnelSink::new(protocol.clone());
+        let stream = TunnelStream::new(protocol.clone());
 
-        // Spawn the bridge task that connects the protocol to the WebSocket
+        // Spawn the bridge task that drives the protocol
         let recycle_tx = shared.recycle_tx.clone();
         let shutdown_rx = shared.shutdown_rx.clone();
         tokio::spawn(
             Self::protocol_bridge_task(
                 protocol,
                 self.shared.stat_counter.clone(),
-                ws_tx,
-                ws_rx,
                 recycle_tx,
                 shutdown_rx,
             )
@@ -639,269 +637,73 @@ impl TunnelListener {
         ))
     }
 
-    /// Background task that bridges the sans-IO protocol with the WebSocket.
+    /// Background task that drives the tunnel protocol.
     ///
-    /// This task:
-    /// 1. Reads from WebSocket and feeds messages into the protocol (down_in)
-    /// 2. Reads from protocol output and sends to WebSocket (up_out)
-    /// 3. Calls protocol.tick() to advance the state machine
-    /// 4. Sends periodic ping messages to keep the WebSocket alive
-    /// 5. When protocol completes, offers the connection for recycling
-    ///
-    /// The rendezvous channel (capacity 0) ensures synchronous handoff: a recycled
-    /// connection is only kept alive if an `accept()` call is ready to receive it.
+    /// The protocol tasks interact directly with the WebSocket through
+    /// [`WsServerLinks`]. This task just needs to:
+    /// 1. Advance the protocol clock periodically
+    /// 2. Call [`poll_external`](ProcMachine::poll_external) to process
+    ///    wakes from the WebSocket's async runtime
+    /// 3. When the protocol completes, offer the connection for recycling
     async fn protocol_bridge_task(
-        protocol: TunnelProtocol,
+        protocol: TunnelProtocol<WsServerLinks>,
         stat_counter: Arc<dyn StatCounter>,
-        mut ws_tx: WsRawSink,
-        mut ws_rx: WsBaseStream,
         recycle_tx: flume::Sender<RecycledConnection>,
         shutdown_rx: watch::Receiver<bool>,
     ) {
         let _connection_stat = ScopeStat::new(&stat_counter, STAT_COUNT_CONNECTIONS);
-        let io = protocol.io();
         let mut shutdown_rx = shutdown_rx;
-        let mut protocol_done = false;
-        let p_item = &io.down_in;
-        let c_item = &io.up_out;
-        let mut up_open = true;
-        let mut down_open = true;
-        let mut got_err = false;
         let mut ticker = tokio::time::interval(Duration::from_millis(5000));
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        let mut last_ping = coarsetime::Instant::now();
-        let mut need_flush = false;
 
-        // Main bridge loop
-        while up_open || down_open {
-            // Tick the protocol to advance state
-            let now = coarsetime::Instant::now();
-            if !protocol.tick(now) {
-                protocol_done = true;
-                break;
-            }
-            let mut did_something = false;
+        // TODO signal shutdown
+        poll_fn(|cx| {
+            // Process external wakes (ticks the protocol internally)
+            let _ = protocol.poll_external(cx);
 
-            if up_open {
-                match poll_transfer_up(&stat_counter, &mut ws_tx, &c_item).await {
-                    Poll::Pending => {}
-                    Poll::Ready(Err(SpScItemState::Closed)) => {
-                        up_open = false;
-                    }
-                    Poll::Ready(res) => {
-                        if res.is_err() {
-                            got_err = true;
-                            up_open = false;
-                            c_item.close();
-                        } else {
-                            last_ping = now;
-                            need_flush = true;
-                        }
-                        did_something = true;
-                    }
-                }
+            // Advance clock
+            {
+                let g = protocol.lock();
+                g.clock.advance(coarsetime::Instant::now());
             }
-            if down_open {
-                match poll_transfer_down(&stat_counter, &mut ws_rx, &p_item).await {
-                    Poll::Pending => {}
-                    Poll::Ready(Err(SpScItemState::Closed)) => {
-                        down_open = false;
-                    }
-                    Poll::Ready(res) => {
-                        if res.is_err() {
-                            down_open = false;
-                            got_err = true;
-                            p_item.close();
-                        }
-                        did_something = true;
-                    }
-                }
+            // Check if all protocol tasks have completed
+            if protocol.is_done() {
+                return Poll::Ready(());
             }
 
-            if up_open && now - last_ping > coarsetime::Duration::from_secs(60) {
-                match poll_transfer_ping(&mut ws_tx).await {
-                    Poll::Pending => {}
-                    Poll::Ready(res) => {
-                        if res.is_err() {
-                            up_open = false;
-                            got_err = true;
-                            c_item.close();
-                        } else {
-                            last_ping = now;
-                            need_flush = true;
-                        }
-                        did_something = true;
-                    }
-                }
-            }
-            if need_flush && !did_something {
-                match poll_transfer_flush(&mut ws_tx).await {
-                    Poll::Pending => {}
-                    Poll::Ready(Ok(_)) => {
-                        need_flush = false;
-                    }
-                    Poll::Ready(Err(_)) => {
-                        need_flush = false;
-                        up_open = false;
-                        got_err = true;
-                        c_item.close();
-                        did_something = true;
-                    }
-                }
-            }
-            if !did_something {
-                let _ = with_context(|cx| ticker.poll_tick(cx)).await;
-                yield_once().await;
-            }
-        }
+            // Periodic wakeup to advance the clock for timeout detection
+            let _ = ticker.poll_tick(cx);
 
-        // Close the protocol channels
-        io.down_in.close();
-        io.up_out.close();
+            Poll::Pending
+        })
+        .await;
 
-        if !protocol_done || got_err {
-            // Can't recycle. Just drop everything
+        // Check whether the protocol completed cleanly (both directions done,
+        // not failed) — only then can we recycle the WebSocket.
+        let can_recycle = {
+            let g = protocol.lock();
+            g.up_status.get() == UploadStatus::Done && g.down_status.get() == DownloadStatus::Done
+        };
+
+        if !can_recycle {
             return;
         }
 
-        // Offer the recycled connection (with 5-second timeout)
-        tokio::select! {
-            _ = recycle_tx.send_async(RecycledConnection { ws_tx, ws_rx }) => {}
-            _ = time::sleep(time::Duration::from_secs(5)) => {}
-            _ = util_shutdown(&mut shutdown_rx) => {}
-        }
-    }
-}
+        // Extract the WebSocket halves from the protocol for recycling
+        let (ws_tx, ws_rx) = {
+            let g = protocol.lock();
+            g.server_links.take()
+        };
 
-async fn poll_transfer_up(
-    stat_counter: &Arc<dyn StatCounter>,
-    ws_tx: &mut WsRawSink,
-    c_item: &SpScMutex<SimpleSpScItemInner<Message>>,
-) -> Poll<Result<(), SpScItemState>> {
-    let rst = c_item.c_check_read(None).await;
-    match rst {
-        SpScItemState::Waiting | SpScItemState::Busy => return Poll::Pending,
-        SpScItemState::Closed | SpScItemState::Failed => return Poll::Ready(Err(rst)),
-        SpScItemState::Full => {}
-    };
-    let ready = with_context(|cx| ws_tx.poll_ready_unpin(cx)).await;
-    match ready {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(_)) => {
-            c_item.close();
-            tracing::error!("Websocket write failed");
-            return Poll::Ready(Err(rst));
-        }
-        Poll::Ready(Ok(_)) => {}
-    };
-    let mut receiver: Option<Message> = None;
-    match c_item.c_try_read(&mut receiver, None).await {
-        SpScItemState::Busy => {
-            if let Some(item) = receiver {
-                tracing::debug!("WS UP");
-                match &item {
-                    Message::Binary(bytes) => {
-                        stat_counter.stat_count(STAT_COUNT_BYTES_UP, bytes.len() as i32);
-                    }
-                    _ => {}
-                }
-                if ws_tx.start_send_unpin(item).is_err() {
-                    c_item.close();
-                    tracing::error!("start_send failed");
-                    return Poll::Ready(Err(rst));
-                }
+        if let (Some(ws_tx), Some(ws_rx)) = (ws_tx, ws_rx) {
+            // Offer the recycled connection (with 5-second timeout)
+            tokio::select! {
+                _ = recycle_tx.send_async(RecycledConnection { ws_tx, ws_rx }) => {}
+                _ = time::sleep(time::Duration::from_secs(5)) => {}
+                _ = util_shutdown(&mut shutdown_rx) => {}
             }
-            // SUCCESS
-        }
-        _ => {
-            //we can no longer read for some reason
-            tracing::error!("Can't read to start_send");
-            let _ = with_context(|cx| ws_tx.poll_close_unpin(cx)).await;
-            c_item.close();
-            return Poll::Ready(Err(rst));
         }
     }
-    Poll::Ready(Ok(()))
-}
-
-async fn poll_transfer_ping(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
-    let ready = with_context(|cx| ws_tx.poll_ready_unpin(cx)).await;
-    match ready {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(_)) => {
-            tracing::error!("Websocket write failed");
-            return Poll::Ready(Err(()));
-        }
-        Poll::Ready(Ok(_)) => {}
-    };
-    let item: Message = Message::Ping(Bytes::new());
-    if ws_tx.start_send_unpin(item).is_err() {
-        tracing::error!("start_send failed");
-        return Poll::Ready(Err(()));
-    }
-    tracing::debug!("WS PING");
-    Poll::Ready(Ok(()))
-}
-
-async fn poll_transfer_flush(ws_tx: &mut WsRawSink) -> Poll<Result<(), ()>> {
-    let ready = with_context(|cx| ws_tx.poll_flush_unpin(cx)).await;
-    match ready {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(_)) => {
-            tracing::error!("Websocket flush failed");
-            return Poll::Ready(Err(()));
-        }
-        Poll::Ready(Ok(_)) => {}
-    };
-    tracing::debug!("WS FLUSH");
-    Poll::Ready(Ok(()))
-}
-
-async fn poll_transfer_down(
-    stat_counter: &Arc<dyn StatCounter>,
-    ws_rx: &mut WsBaseStream,
-    p_item: &SpScMutex<SimpleSpScItemInner<Message>>,
-) -> Poll<Result<(), SpScItemState>> {
-    let wst = p_item.p_check_write(None).await;
-    match wst {
-        SpScItemState::Waiting => {}
-        SpScItemState::Busy => return Poll::Pending,
-        SpScItemState::Full => return Poll::Pending,
-        SpScItemState::Closed | SpScItemState::Failed => return Poll::Ready(Err(wst)),
-    }
-    let ready = with_context(|cx| ws_rx.poll_next_unpin(cx)).await;
-    let mut sender = match ready {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Some(Err(_))) => {
-            p_item.close();
-            tracing::error!("Websocket read failed");
-            return Poll::Ready(Err(wst));
-        }
-        Poll::Ready(None) => {
-            // web socket EOF
-            p_item.close();
-            tracing::error!("Websocket read EOF");
-            return Poll::Ready(Err(wst));
-        }
-        Poll::Ready(Some(Ok(data))) => {
-            match &data {
-                Message::Binary(bytes) => {
-                    stat_counter.stat_count(STAT_COUNT_BYTES_DOWN, bytes.len() as i32);
-                }
-                _ => {}
-            }
-            Some(data)
-        }
-    };
-    match p_item.p_try_write(&mut sender, None).await {
-        SpScItemState::Full => {}
-        _ => {
-            tracing::error!("Can't write after successful check");
-            p_item.close();
-            return Poll::Ready(Err(wst));
-        }
-    };
-    Poll::Ready(Ok(()))
 }
 
 /// Waits until the shutdown signal is received.

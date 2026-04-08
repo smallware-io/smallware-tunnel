@@ -1,1274 +1,1385 @@
-//! Components for building "procedural state machines" (ProcMachines).
+//! Procedural state machines driven by cooperative async tasks.
 //!
-//! # Overview
+//! A **ProcMachine** bundles one or more `async fn` tasks together with a
+//! shared IO struct, runs them cooperatively under a single mutex, and
+//! exposes the IO struct to external code through a guard-based API.
 //!
-//! This module provides a lightweight executor for running multiple async tasks
-//! **without a real async runtime** like Tokio. Instead, the tasks are polled
-//! synchronously via a single `tick()` method, making this a "sans-IO" approach.
+//! # Motivation
 //!
-//! The key insight is that Rust's async/await is just syntactic sugar for state
-//! machines. By providing our own polling mechanism, we can use async functions
-//! to express complex state machine logic while maintaining full control over
-//! when and how execution happens.
+//! Traditional sans-IO protocol implementations are written as explicit state
+//! machines: an enum of states, a `poll`-style driver, and manual
+//! save/restore of intermediate variables across yield points. This is
+//! correct but painful to write and read.
 //!
-//! # Why "Procedural State Machines"?
+//! ProcMachines let you write the same logic as straight-line `async` code
+//! (loops, branches, `.await`) while retaining the benefits of sans-IO:
 //!
-//! Traditional state machines are defined with explicit states and transitions
-//! (essentially programming with gotos). Async functions let us write the same
-//! logic procedurally - the compiler transforms our sequential code into a state
-//! machine automatically.
+//! - **No runtime dependency.** Tasks are polled synchronously; there is no
+//!   executor, no spawning, no `Send + 'static` requirement beyond what the
+//!   task closures themselves need.
+//! - **Deterministic scheduling.** All tasks run under one mutex, so there
+//!   are no data races and the polling order is fully controlled.
+//! - **External clock.** Timeouts use an [`AlarmClock`](crate::alarms::AlarmClock)
+//!   advanced by the caller, making the protocol testable without real time.
 //!
-//! For example, instead of:
-//! ```ignore
-//! enum State { WaitingForData, ProcessingData, SendingResponse }
-//! fn step(&mut self, event: Event) -> Option<Action> {
-//!     match (&self.state, event) {
-//!         (State::WaitingForData, Event::DataReceived(d)) => { ... }
-//!         ...
-//!     }
-//! }
+//! # Architecture
+//!
+//! ```text
+//!  External code               ProcMachine (behind Arc)
+//! ┌────────────┐      lock()  ┌──────────────────────────────┐
+//! │            │─────────────►│  Mutex<ProcMachineInner>     │
+//! │            │  IoGuard     │  ┌────────────────────────┐  │
+//! │ reads/writes◄────────────►│  │ IO struct              │  │
+//! │ to IO      │  Deref       │  ├────────────────────────┤  │
+//! │            │              │  │ Future 1 (task A)      │  │
+//! │            │◄─────────────│  │ Future 2 (task B)      │  │
+//! │            │  drop guard  │  │ ...                    │  │
+//! │            │  → tick()    │  │ alive_mask: u32        │  │
+//! └────────────┘              │  └────────────────────────┘  │
+//!                             │  wake_mask: AtomicU32        │
+//!                             └──────────────────────────────┘
 //! ```
 //!
-//! We can write:
-//! ```ignore
-//! async fn run(io: &IO) {
-//!     loop {
-//!         let data = io.read().await;    // "WaitingForData"
-//!         process(&data);                 // "ProcessingData"
-//!         io.write(response).await;       // "SendingResponse"
-//!     }
-//! }
+//! 1. External code calls [`LockableIo::lock`] to obtain an [`IoGuard`].
+//! 2. Through the guard it reads/writes the IO struct (e.g. feeding data
+//!    into an [`IoExchange`](crate::io_exchange::IoExchange)).
+//! 3. When the guard is dropped, [`ProcMachineImpl::unsafe_unlock_io`] calls
+//!    [`tick`](ProcMachineInner::tick), which polls every task whose waker
+//!    has fired since the last tick.
+//! 4. Tasks run until they all return `Pending`, then control returns to the
+//!    caller.
+//!
+//! # Wake mechanism
+//!
+//! Each task gets its own [`Waker`] via the [multi-waker system](#multi-waker-support).
+//! When a task registers a waker with an IO primitive (e.g. `IoExchange`)
+//! and that primitive later calls `wake()`, the corresponding bit is set in
+//! the shared `wake_mask: AtomicU32`. The next [`tick`](ProcMachineInner::tick)
+//! intersects `wake_mask` with `alive_mask` to determine which tasks to poll.
+//!
+//! # Building a ProcMachine
+//!
+//! Use the builder pattern starting from [`PROC_MACHINE_JOBS_BASE`]:
+//!
+//! ```rust,ignore
+//! let proto = PROC_MACHINE_JOBS_BASE
+//!     .with(task_a)   // async fn task_a(io: Pin<&'static MyIO>) -> TaskEnd
+//!     .with(task_b)
+//!     .build(MyIO::new());
 //! ```
 //!
-//! # How It Works
-//!
-//! 1. **Custom Wakers**: Each task gets a waker that just sets an `AtomicBool` flag.
-//!    When something calls `waker.wake()`, it sets the flag indicating the task
-//!    should be polled again.
-//!
-//! 2. **Pointer Tagging**: To support multiple wakers per ProcMachine with a single
-//!    Arc, we use pointer tagging. The low 3 bits of the Arc pointer (which are
-//!    always zero due to alignment) encode which task (0-7) the waker is for.
-//!
-//! 3. **Round-Robin Polling**: The `tick()` method polls all tasks repeatedly until
-//!    they're all idle (no wakers fired) or all done (returned `Ready`).
-//!
-//! 4. **Idle Detection**: We track consecutive idle polls. Once all tasks have been
-//!    idle for a full round, `tick()` returns - the caller should wait for external
-//!    events before calling `tick()` again.
-//!
-//! # Usage
-//!
-//! ```ignore
-//! // Create async functions for your tasks
-//! async fn task_a(io: Arc<MyIO>) -> TaskEnd { ... }
-//! async fn task_b(io: Arc<MyIO>) -> TaskEnd { ... }
-//!
-//! // Combine them into a ProcMachine
-//! let machine = create_proc_machine2(task_a(io.clone()), task_b(io.clone()));
-//!
-//! // Drive the state machine externally
-//! loop {
-//!     // Wait for external events (network I/O, timers, etc.)
-//!     let event = wait_for_event();
-//!
-//!     // Feed event into shared state
-//!     io.handle_event(event);
-//!
-//!     // Advance the state machine
-//!     if !machine.tick() {
-//!         break; // All tasks completed
-//!     }
-//! }
-//! ```
+//! Each `.with()` appends a task, building a compile-time linked list of
+//! futures ([`ProcMachineFuturesExtension`] chain). The `.build()` call
+//! allocates the `Arc<ProcMachineImpl>`, pins the IO, initialises the
+//! futures, and performs the first tick.
 
-use std::fmt;
+use bytemuck::{allocation::TransparentWrapperAlloc, TransparentWrapper};
+use core::fmt::Debug;
+use futures::task::AtomicWaker;
+use parking_lot::{lock_api::RawMutex as _, Mutex};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, RawWaker, RawWakerVTable, Waker};
-
-// ============================================================================
-// PROCEDURAL STATE MACHINES
-// ============================================================================
-
-// ============================================================================
-// MULTI-WAKER SUPPORT VIA POINTER TAGGING
-// ============================================================================
-//
-// We need a way for each task within a ProcMachine to have its own Waker.
-// The naive approach would be to allocate a separate Arc for each task's waker
-// data, but that's wasteful when all tasks share the same ProcMachine.
-//
-// Instead, we use "pointer tagging": Since the ProcMachine structs are aligned
-// to at least 8 bytes, the low 3 bits of any pointer to them are always zero.
-// We can use those 3 bits to encode which task (0-7) the waker is for.
-//
-// When a waker is invoked:
-// 1. Extract the tag (task index) from the low 3 bits
-// 2. Clear the tag to get the real pointer
-// 3. Call the appropriate task's wake method
-//
-// This is a common technique in lock-free data structures and GC implementations.
-// ============================================================================
-
-/// Trait for types that can dispatch wakes to multiple tasks (up to 8).
-///
-/// Types implementing this trait MUST have `#[repr(align(8))]` or greater
-/// alignment to ensure the low 3 bits of their address are available for tagging.
-trait MultiWake: Send + Sync {
-    /// Wake the task at index `n` (0-7).
-    fn wake(&self, n: u8);
-}
-
-/// Creates a Waker that targets a specific task index on a MultiWake-capable Arc.
-///
-/// # Arguments
-///
-/// * `target` - The Arc containing the ProcMachine
-/// * `n` - The task index (0-7)
-///
-/// # Safety Requirements
-///
-/// The type T must have alignment of at least 8 bytes (use `#[repr(align(8))]`).
-fn get_multi_waker<T: MultiWake + 'static>(target: &Arc<T>, n: u8) -> Waker {
-    // Step 1: Convert Arc to raw pointer.
-    // This increments the reference count (via clone) so the Arc stays alive.
-    let ptr = Arc::into_raw(target.clone()) as *const ();
-
-    // Step 2: Tag the pointer using the bottom 3 bits.
-    // Masking n with 0x7 ensures we only use 3 bits (indices 0-7).
-    // This works because the pointer is 8-byte aligned, so bits 0-2 are always 0.
-    let tagged_ptr = ((ptr as usize) | (n as usize & 0x7)) as *const ();
-
-    // Step 3: Construct the Waker using our custom vtable.
-    // The vtable functions know how to unpack the tag and dispatch to the right task.
-    unsafe { Waker::from_raw(RawWaker::new(tagged_ptr, multi_waker_vtable::<T>())) }
-}
-
-// --- Pointer Unpacking Logic ---
-
-/// Extract the real pointer and task index from a tagged pointer.
-///
-/// Returns (real_pointer, task_index).
-fn unpack_multi_waker<T>(ptr: *const ()) -> (*const T, u8) {
-    let addr = ptr as usize;
-    let tag = (addr & 0x7) as u8; // Extract low 3 bits as task index
-    let real_ptr = (addr & !0x7) as *const T; // Clear low 3 bits to get real address
-    (real_ptr, tag)
-}
-
-// --- Generic VTable Generator ---
-
-/// Returns the vtable for wakers targeting type T.
-///
-/// The vtable defines how to clone, wake, and drop the waker.
-fn multi_waker_vtable<T: MultiWake + 'static>() -> &'static RawWakerVTable {
-    &RawWakerVTable::new(
-        multi_waker_clone_raw::<T>, // clone
-        multi_wake_raw::<T>,        // wake (consumes waker)
-        multi_wake_by_ref_raw::<T>, // wake_by_ref (doesn't consume)
-        multi_waker_drop_raw::<T>,  // drop
-    )
-}
-
-// --- Waker VTable Implementation Functions ---
-
-/// Clone the waker: increment Arc reference count, preserve the tag.
-unsafe fn multi_waker_clone_raw<T: MultiWake + 'static>(ptr: *const ()) -> RawWaker {
-    let (real_ptr, _) = unpack_multi_waker::<T>(ptr);
-    // Increment the Arc's reference count (don't take ownership)
-    Arc::increment_strong_count(real_ptr);
-    // Return a new RawWaker with the same tagged pointer
-    RawWaker::new(ptr, multi_waker_vtable::<T>())
-}
-
-/// Wake and consume the waker: call wake() and decrement Arc reference count.
-unsafe fn multi_wake_raw<T: MultiWake + 'static>(ptr: *const ()) {
-    let (real_ptr, n) = unpack_multi_waker::<T>(ptr);
-    // Reconstruct the Arc (takes ownership of one reference)
-    let arc = Arc::from_raw(real_ptr);
-    // Dispatch wake to the appropriate task
-    arc.wake(n);
-    // Arc is dropped here, decrementing the reference count
-}
-
-/// Wake without consuming the waker: call wake() but don't decrement count.
-unsafe fn multi_wake_by_ref_raw<T: MultiWake + 'static>(ptr: *const ()) {
-    let (real_ptr, n) = unpack_multi_waker::<T>(ptr);
-    // Just borrow the target, don't take ownership
-    let target = &*real_ptr;
-    target.wake(n);
-}
-
-/// Drop the waker: decrement Arc reference count.
-unsafe fn multi_waker_drop_raw<T: MultiWake + 'static>(ptr: *const ()) {
-    let (real_ptr, _) = unpack_multi_waker::<T>(ptr);
-    // Reconstruct and immediately drop the Arc to decrement reference count
-    drop(Arc::from_raw(real_ptr));
-}
+use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 // ============================================================================
 // PUBLIC INTERFACE
 // ============================================================================
 
-/// Trait for a procedural state machine that can be advanced synchronously.
+/// A procedural state machine that advances synchronously.
 ///
-/// Implementations hold one or more async tasks that are polled together.
-/// The `tick()` method drives all tasks forward until they're idle or complete.
-pub trait ProcMachine: Send + Sync + std::fmt::Debug {
-    /// Advance the state machine by polling all tasks.
+/// External code interacts with the machine by locking the IO struct (via
+/// [`LockableIo::lock`]) and reading/writing its fields. Internal tasks
+/// advance automatically when the lock is released.
+///
+/// Implemented by [`ProcMachineImpl`]; callers work with
+/// `Arc<dyn ProcMachine<IO>>` (type-aliased as e.g. `TunnelProtocol`).
+pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
+    /// Returns `true` when every internal task has completed.
     ///
-    /// This method will poll tasks repeatedly in round-robin fashion until:
-    /// - All tasks are idle (no wakers fired recently), or
-    /// - All tasks are complete
+    /// Also ticks the machine, so any pending wakes are processed first.
+    fn is_done(&self) -> bool;
+
+    /// Check for external wakes to the internal jobs.
     ///
-    /// # Returns
+    /// If any of the tasks internal to this `ProcMachine` have been woken
+    /// outside of a `lock()`, then this will execute those tasks until they all block
+    /// or terminate.
     ///
-    /// - `true`: At least one task is still active (not completed)
-    /// - `false`: All tasks have completed
+    /// Whether or not there were any waiting tasks, `cx` waker is then registered
+    /// to be notified the next time such an external wake happens, and Poll::Pending
+    /// is returned.
     ///
-    /// The caller should wait for external events (I/O, timers) before calling
-    /// `tick()` again when it returns `true`.
-    fn tick(&self) -> bool;
+    /// IMPORTANT: Any previously registered waker is discarded, so there MUST be
+    /// at most one task calling this method.
+    ///
+    /// It is only necessary to call this method if the internal tasks could poll
+    /// something "external", that can signal outside of `lock()`
+    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()>;
+
+    /// Acquires the inner mutex and returns a raw pointer to the IO struct.
+    ///
+    /// # Safety
+    ///
+    /// - `&self` must be pinned by an `Arc` (guaranteed by the
+    ///   [`ProcMachineImpl`] constructor).
+    /// - The caller **must** call [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io)
+    ///   exactly once after the critical section, and must not use the
+    ///   returned pointer after that call.
+    unsafe fn unsafe_lock_io(&self) -> *mut IO;
+
+    /// Ticks the machine and releases the inner mutex.
+    ///
+    /// # Safety
+    ///
+    /// - Must be called exactly once after a corresponding
+    ///   [`unsafe_lock_io`](ProcMachine::unsafe_lock_io).
+    /// - No references derived from the pointer returned by `unsafe_lock_io`
+    ///   may be used after this call.
+    unsafe fn unsafe_unlock_io(&self);
 }
+
+/// Extension trait on `Arc<dyn ProcMachine<IO>>` providing safe lock access.
+pub trait LockableIo<IO: Send + Debug> {
+    /// Locks the machine and returns an [`IoGuard`] that derefs to the IO
+    /// struct. When the guard is dropped the machine ticks.
+    fn lock(&self) -> IoGuard<IO>;
+}
+
+impl<IO> LockableIo<IO> for Arc<dyn ProcMachine<IO>>
+where
+    IO: Send + Debug,
+{
+    #[inline(always)]
+    fn lock(&self) -> IoGuard<IO> {
+        IoGuard::new(self.clone())
+    }
+}
+
+/// RAII guard providing `&IO` / `&mut IO` access to a locked [`ProcMachine`].
+///
+/// Created by [`LockableIo::lock`]. Dropping the guard calls
+/// [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io), which ticks the
+/// machine (polling any tasks whose wakers fired during the critical
+/// section).
+///
+/// The guard is `!Send` because `ptr` is a raw pointer, which is correct —
+/// a mutex guard should not be sent to another thread.
+pub struct IoGuard<IO: Send + Debug> {
+    holder: Arc<dyn ProcMachine<IO>>,
+    ptr: *mut IO,
+}
+
+impl<IO> IoGuard<IO>
+where
+    IO: Send + Debug,
+{
+    /// Acquires the lock and creates a new guard.
+    pub fn new(holder: Arc<dyn ProcMachine<IO>>) -> Self {
+        let ptr = unsafe { holder.unsafe_lock_io() };
+        Self { holder, ptr }
+    }
+}
+
+impl<IO> Drop for IoGuard<IO>
+where
+    IO: Send + Debug,
+{
+    /// Ticks the machine and releases the lock.
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            self.holder.unsafe_unlock_io();
+        }
+    }
+}
+
+impl<IO> Deref for IoGuard<IO>
+where
+    IO: Send + Debug,
+{
+    type Target = IO;
+    #[inline]
+    fn deref(&self) -> &IO {
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<IO> DerefMut for IoGuard<IO>
+where
+    IO: Send + Debug,
+{
+    #[inline]
+    fn deref_mut(&mut self) -> &mut IO {
+        unsafe { &mut *self.ptr }
+    }
+}
+
+// ============================================================================
+// TASK AND FUTURES MACHINERY
+// ============================================================================
+//
+// Tasks are `async fn(Pin<&'static IO>) -> TaskEnd`. They are stored as
+// type-erased futures inside a compile-time linked list built from
+// ProcMachineFuturesBase (empty) and ProcMachineFuturesExtension (one task
+// + the rest).
+//
+// The linked list is *not* a runtime linked list — it is a nested struct
+// whose shape is fully known at compile time. This means polling the list
+// is a static chain of monomorphised function calls with no indirection.
+//
+// Each extension layer has a DEPTH constant (1-based) that doubles as:
+//   - The bit index in alive_mask / wake_mask (1 << DEPTH)
+//   - The task index passed to get_multi_waker for Waker creation
+//
+// Depth 0 is the base (no task). Real tasks start at depth 1.
+// ============================================================================
 
 /// Marker type returned by async tasks when they complete.
 ///
-/// Tasks in a ProcMachine must return `TaskEnd` to signal completion.
-/// This is just a unit type - the interesting work happens via side effects
-/// on shared state (e.g., the IO struct).
+/// The actual result of a task is communicated via side effects on the
+/// shared IO struct (e.g. setting a field in [`UpToDown`](crate::tunnel_protocol::UpToDown)).
 pub struct TaskEnd();
 
-// ============================================================================
-// SINGLE TASK WRAPPER
-// ============================================================================
-//
-// ProcMachineTask wraps a single async future and provides:
-// 1. A signal flag (AtomicBool) that the waker sets when the task should be polled
-// 2. Storage for the future and its waker
-// 3. The tick() logic for polling the future
-// ============================================================================
-
-/// Wrapper for a single async task within a ProcMachine.
+/// Trait for the compile-time linked list of futures inside a ProcMachine.
 ///
-/// This struct holds the future to be polled, its waker, and a signal flag
-/// that indicates whether the task has been woken (and should be polled again).
-struct ProcMachineTask<FUT>
-where
-    FUT: Future<Output = TaskEnd> + Send,
-{
-    /// Set to true by the task's waker
-    /// If `false` when we go to poll, the task is considered "idle".
-    sig: AtomicBool,
+/// Each node knows how many tasks are in the chain ([`DEPTH`](Self::DEPTH)),
+/// can poll them selectively via a bitmask, and returns an updated bitmask
+/// indicating which tasks are still alive.
+pub trait ProcMachineFutures {
+    /// Number of tasks in this chain (0 for the base, N for N tasks).
+    const DEPTH: u8;
 
-    /// The future and its waker, or None if the task has completed.
-    /// Protected by a Mutex to allow safe access from multiple threads
-    /// (though typically only one thread polls at a time).
-    fut: Mutex<Option<(Waker, FUT)>>,
+    /// Polls every task whose bit is set in `depth_mask`.
+    ///
+    /// Returns a bitmask with a bit set for every task that is still alive
+    /// (i.e. has a future and has not yet returned `Ready`).
+    fn poll<T: MultiWake + 'static>(self: &mut Self, waker: &Arc<T>, depth_mask: u32) -> u32;
+
+    /// Creates an uninitialised instance (futures are `None`).
+    fn new() -> Self;
 }
 
-impl<FUT> ProcMachineTask<FUT>
-where
-    FUT: Future<Output = TaskEnd> + Send,
+/// Base case: an empty chain with no tasks.
+pub struct ProcMachineFuturesBase();
+
+impl ProcMachineFutures for ProcMachineFuturesBase {
+    const DEPTH: u8 = 0;
+
+    #[inline(always)]
+    fn poll<T: MultiWake + 'static>(self: &mut Self, _waker: &Arc<T>, _depth_mask: u32) -> u32 {
+        0 // no tasks → nothing alive
+    }
+
+    #[inline(always)]
+    fn new() -> Self {
+        ProcMachineFuturesBase()
+    }
+}
+
+/// One task appended to a `PREV` chain.
+///
+/// The future is `Option<FUT>` — `Some` while the task is alive, `None`
+/// after it completes.
+pub struct ProcMachineFuturesExtension<
+    PREV: ProcMachineFutures,
+    FUT: Future<Output = TaskEnd> + 'static,
+> {
+    prev: PREV,
+    fut: Option<FUT>,
+}
+
+impl<PREV: ProcMachineFutures, FUT: Future<Output = TaskEnd> + 'static> ProcMachineFutures
+    for ProcMachineFuturesExtension<PREV, FUT>
 {
-    /// Creates a new task wrapper (uninitialized - call `init()` to set the future).
-    pub fn new() -> Self {
-        ProcMachineTask {
-            sig: AtomicBool::new(false),
-            fut: Mutex::new(None),
+    const DEPTH: u8 = PREV::DEPTH + 1;
+
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            prev: PREV::new(),
+            fut: None,
         }
     }
 
-    /// Poll this task and update the idle/done counters.
-    ///
-    /// # Arguments
-    ///
-    /// * `idle_and_done_count` - Tuple of (consecutive_idle_count, consecutive_done_count)
-    ///
-    /// # Counter Logic
-    ///
-    /// - If the task was NOT signaled (idle): increment idle count, reset done count
-    /// - If the task WAS signaled (woken): reset both counts (task made progress)
-    /// - If the task has already completed (None): increment both counts
-    ///
-    /// The outer `tick()` loop uses these counters to detect when all tasks are
-    /// idle (idle_count >= num_tasks) or all done (done_count >= num_tasks).
-    ///
-    /// Note: We only poll tasks that were woken. Idle tasks are not polled because
-    /// nothing has changed since their last poll - they would just return Pending again.
-    pub fn tick(&self, idle_and_done_count: &mut (u8, u8)) {
-        let mut guard = self.fut.lock().unwrap();
-        if let Some((w, f)) = guard.as_mut() {
-            // Task exists and hasn't completed yet
-            if self.sig.swap(false, Ordering::SeqCst) {
-                // Waking task - reset counts since we're making progress
-                *idle_and_done_count = (0, 0);
-                // SAFETY: We never move the future after init(), so Pin is safe.
-                let pinned = unsafe { std::pin::Pin::new_unchecked(f) };
-                let mut cx = Context::from_waker(&w);
+    #[inline(always)]
+    fn poll<T: MultiWake + 'static>(self: &mut Self, waker: &Arc<T>, depth_mask: u32) -> u32 {
+        // Poll all tasks in the chain before this one.
+        let parent_result = self.prev.poll(waker, depth_mask);
 
-                if pinned.poll(&mut cx).is_ready() {
-                    // Task completed! Remove it from storage.
-                    *guard = None;
+        match &mut self.fut {
+            // Task already completed — propagate parent result unchanged.
+            None => parent_result,
+            Some(fut) => {
+                if (depth_mask & (1 << Self::DEPTH)) == 0 {
+                    // This task is idle (its waker hasn't fired) — skip
+                    // polling, but keep its bit in the alive mask so future
+                    // wakes can reach it.
+                    return parent_result | (1 << Self::DEPTH);
                 }
-            } else {
-                // Task is idle - increment idle count, reset done count
-                *idle_and_done_count = (idle_and_done_count.0 + 1, 0);
+
+                // Create a Waker for this task's depth index. Uses the
+                // runtime match in get_multi_waker because Rust doesn't
+                // permit generic `Self` in anonymous const expressions.
+                // Since Self::DEPTH is a compile-time constant, LLVM
+                // constant-folds the match after monomorphisation.
+                let waker = get_multi_waker(waker, Self::DEPTH);
+
+                // SAFETY: The future lives inside ProcMachineInner, which
+                // is inside a Mutex inside an Arc. It is never moved once
+                // initialised, so the Pin invariant holds.
+                let p = unsafe { std::pin::Pin::new_unchecked(fut) };
+                let mut cx = Context::from_waker(&waker);
+
+                if p.poll(&mut cx).is_ready() {
+                    // Task completed — drop the future. Its bit is absent
+                    // from the returned mask, so it won't be polled again.
+                    self.fut = None;
+                    parent_result
+                } else {
+                    // Task still pending — include parent_result so sibling
+                    // tasks stay in alive_mask, and set this task's own bit
+                    // (matching the waker index from get_multi_waker).
+                    parent_result | (1 << Self::DEPTH)
+                }
             }
-        } else {
-            //task is done.  inc both counts
-            *idle_and_done_count = (idle_and_done_count.0 + 1, idle_and_done_count.1 + 1);
+        }
+    }
+}
+
+// ============================================================================
+// JOB BUILDER
+// ============================================================================
+//
+// ProcMachineJobs is the *builder* side: it collects task constructor
+// functions and, on .build(), allocates the ProcMachineImpl, creates the
+// futures, and performs the initial tick.
+//
+// Like ProcMachineFutures, it is a compile-time linked list
+// (ProcMachineJobsBase + ProcMachineJobsExtension).
+// ============================================================================
+
+/// Builder trait for assembling tasks into a [`ProcMachine`].
+///
+/// Start from [`PROC_MACHINE_JOBS_BASE`] and chain `.with(task_fn)` calls
+/// to add tasks, then call `.build(io)` to produce the final
+/// `Arc<dyn ProcMachine<IO>>`.
+pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
+    /// Number of tasks registered so far.
+    const DEPTH: u8;
+
+    /// The corresponding futures storage type.
+    type FUTURES: ProcMachineFutures;
+
+    /// Initialises the futures by calling each task's constructor with the
+    /// pinned IO reference.
+    fn init(&self, io: Pin<&'static IO>, futures: &mut Self::FUTURES);
+
+    /// Appends a new task and returns an extended builder.
+    fn with<FUT: Future<Output = TaskEnd> + 'static>(
+        self: Self,
+        proc: fn(Pin<&'static IO>) -> FUT,
+    ) -> impl ProcMachineJobs<IO>;
+
+    /// Consumes the builder, allocates the ProcMachine, and returns it.
+    fn build(self, io: IO) -> Arc<dyn ProcMachine<IO>>
+    where
+        Self: Sized + 'static,
+    {
+        ProcMachineImpl::new(io, self)
+    }
+}
+
+/// Empty builder — no tasks registered yet.
+///
+/// Use [`PROC_MACHINE_JOBS_BASE`] for the singleton instance.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcMachineJobsBase();
+
+impl<IO: Send + Debug + 'static> ProcMachineJobs<IO> for ProcMachineJobsBase {
+    const DEPTH: u8 = 0;
+    type FUTURES = ProcMachineFuturesBase;
+
+    fn init(&self, _io: Pin<&'static IO>, _futures: &mut Self::FUTURES) {}
+
+    fn with<FUT: Future<Output = TaskEnd> + 'static>(
+        self: Self,
+        proc: fn(Pin<&'static IO>) -> FUT,
+    ) -> impl ProcMachineJobs<IO> {
+        ProcMachineJobsExtension { prev: self, proc }
+    }
+}
+
+/// Builder with one additional task appended to a `PREV` builder.
+pub struct ProcMachineJobsExtension<
+    IO: Send + Debug + 'static,
+    PREV: ProcMachineJobs<IO>,
+    FUT: Future<Output = TaskEnd> + 'static,
+> {
+    prev: PREV,
+    /// Constructor function: given a pinned IO ref, returns the task future.
+    proc: fn(Pin<&'static IO>) -> FUT,
+}
+
+impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> + 'static>
+    ProcMachineJobs<IO> for ProcMachineJobsExtension<IO, PREV, FUT>
+{
+    const DEPTH: u8 = PREV::DEPTH + 1;
+    type FUTURES = ProcMachineFuturesExtension<PREV::FUTURES, FUT>;
+
+    fn init(&self, io: Pin<&'static IO>, futures: &mut Self::FUTURES) {
+        // Initialise all previous tasks first, then our own.
+        self.prev.init(io, &mut futures.prev);
+        futures.fut = Some((self.proc)(io));
+    }
+
+    fn with<FUT2: Future<Output = TaskEnd> + 'static>(
+        self: Self,
+        proc: fn(Pin<&'static IO>) -> FUT2,
+    ) -> impl ProcMachineJobs<IO> {
+        ProcMachineJobsExtension { prev: self, proc }
+    }
+}
+
+// ============================================================================
+// PROC MACHINE IMPLEMENTATION
+// ============================================================================
+//
+// ProcMachineInner holds the actual state: the IO struct, the futures, and
+// the alive_mask. It lives behind a parking_lot::Mutex inside an Arc.
+//
+// ProcMachineImpl is the Arc-allocated outer shell that also holds the
+// wake_mask (atomic, accessed outside the lock) and a raw self-pointer
+// (raw_arc) used to reconstruct an Arc<Self> in trait-object methods.
+// ============================================================================
+
+/// The mutex-protected interior: IO + futures + alive tracking.
+#[derive(Debug)]
+struct ProcMachineInner<IO: Send + Debug, FUTURES: ProcMachineFutures> {
+    futures: FUTURES,
+    io: IO,
+    /// Bitmask of tasks that have not yet completed. Bit `n` corresponds to
+    /// the task at depth `n`. Updated after every `poll` call.
+    alive_mask: u32,
+}
+
+impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
+    fn new(io: IO) -> Self {
+        Self {
+            io,
+            futures: FUTURES::new(),
+            alive_mask: 0,
         }
     }
 
-    /// Initialize this task with a waker and future.
+    /// Repeatedly polls tasks until no more wakes are pending.
     ///
-    /// Called once during ProcMachine creation.
-    /// Sets the signal flag so the task will be polled on the first tick.
-    pub fn init(&self, w: Waker, f: FUT) {
-        self.fut.lock().unwrap().replace((w, f));
-        // Set signal so task gets polled on first tick
-        self.sig.store(true, Ordering::SeqCst);
-    }
-
-    /// Signal this task to be polled again.
+    /// Each iteration atomically swaps `wake_mask` to 0 (claiming all
+    /// pending wakes), intersects with `alive_mask` to get the set of
+    /// tasks to poll, and polls them. If any task wakes another task
+    /// *synchronously* during its poll (e.g. by writing to an IoExchange),
+    /// the new wake bit lands in `wake_mask` and is picked up on the next
+    /// loop iteration.
     ///
-    /// Called by the waker when something wants this task to run.
-    fn wake(&self) {
-        self.sig.store(true, Ordering::SeqCst);
-    }
-}
-
-// ============================================================================
-// PROCEDURAL STATE MACHINE IMPLEMENTATIONS
-// ============================================================================
-//
-// Below are implementations for ProcMachine with 1-8 tasks.
-// They all follow the same pattern:
-//
-// 1. Struct definition with #[repr(align(8))] for pointer tagging support
-// 2. Debug impl (just prints the type name)
-// 3. MultiWake impl that dispatches wake(n) to the appropriate task
-// 4. create_proc_machineN() factory function
-// 5. ProcMachine::tick() impl
-//
-// The tick() implementation:
-// - Uses a (idle_count, done_count) tuple to track progress
-// - Loops, polling each task in sequence
-// - After polling all tasks, if idle_count >= N, all tasks are idle → return
-// - After all tasks complete, done_count >= N → return false
-// - Otherwise, keep looping until idle
-//
-// The pattern is repetitive because Rust doesn't have variadic generics.
-// A macro could reduce boilerplate, but explicit code is clearer.
-// ============================================================================
-
-// ============================================================================
-// PROCEDURAL STATE MACHINE WITH 8 TASKS
-// ============================================================================
-
-/// ProcMachine holding 8 async tasks.
-///
-/// Uses `#[repr(align(8))]` to ensure pointer tagging works correctly.
-#[repr(align(8))]
-struct ProcMachine8<A, B, C, D, E, F, G, H>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-    H: Future<Output = TaskEnd> + Send + 'static,
-{
-    a: ProcMachineTask<A>,
-    b: ProcMachineTask<B>,
-    c: ProcMachineTask<C>,
-    d: ProcMachineTask<D>,
-    e: ProcMachineTask<E>,
-    f: ProcMachineTask<F>,
-    g: ProcMachineTask<G>,
-    h: ProcMachineTask<H>,
-}
-
-impl<A, B, C, D, E, F, G, H> std::fmt::Debug for ProcMachine8<A, B, C, D, E, F, G, H>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-    H: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ProcMachine8>")
-    }
-}
-
-impl<A, B, C, D, E, F, G, H> MultiWake for ProcMachine8<A, B, C, D, E, F, G, H>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-    H: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn wake(&self, n: u8) {
-        match n {
-            0 => self.a.wake(),
-            1 => self.b.wake(),
-            2 => self.c.wake(),
-            3 => self.d.wake(),
-            4 => self.e.wake(),
-            5 => self.f.wake(),
-            6 => self.g.wake(),
-            7 => self.h.wake(),
-            _ => (),
-        }
-    }
-}
-/// Creates a ProcMachine with 8 async tasks.
-///
-/// Each task is initialized with its own waker (using pointer tagging) so that
-/// when code inside the task calls `.await`, the correct task gets woken.
-///
-/// # Returns
-///
-/// An `Arc<dyn ProcMachine>` that can be driven by calling `tick()`.
-pub fn create_proc_machine8<A, B, C, D, E, F, G, H>(
-    a: A,
-    b: B,
-    c: C,
-    d: D,
-    e: E,
-    f: F,
-    g: G,
-    h: H,
-) -> Arc<dyn ProcMachine>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-    H: Future<Output = TaskEnd> + Send + 'static,
-{
-    // Create the ProcMachine with empty task slots
-    let ret = Arc::new(ProcMachine8 {
-        a: ProcMachineTask::new(),
-        b: ProcMachineTask::new(),
-        c: ProcMachineTask::new(),
-        d: ProcMachineTask::new(),
-        e: ProcMachineTask::new(),
-        f: ProcMachineTask::new(),
-        g: ProcMachineTask::new(),
-        h: ProcMachineTask::new(),
-    });
-    // Initialize each task with its future and a tagged waker.
-    // The waker's tag (0-7) identifies which task to wake.
-    ret.a.init(get_multi_waker(&ret, 0), a);
-    ret.b.init(get_multi_waker(&ret, 1), b);
-    ret.c.init(get_multi_waker(&ret, 2), c);
-    ret.d.init(get_multi_waker(&ret, 3), d);
-    ret.e.init(get_multi_waker(&ret, 4), e);
-    ret.f.init(get_multi_waker(&ret, 5), f);
-    ret.g.init(get_multi_waker(&ret, 6), g);
-    ret.h.init(get_multi_waker(&ret, 7), h);
-    ret
-}
-
-impl<A, B, C, D, E, F, G, H> ProcMachine for ProcMachine8<A, B, C, D, E, F, G, H>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-    H: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn tick(&self) -> bool {
-        // counts.0 = consecutive idle task count (how many tasks in a row were idle)
-        // counts.1 = consecutive done task count (how many tasks in a row were completed)
-        //
-        // When counts.0 reaches 8, all tasks are idle → return to let caller wait for events
-        // When counts.1 reaches 8, all tasks are done → return false (machine complete)
-        let mut counts: (u8, u8) = (0, 0);
+    /// Returns `true` if any tasks are still alive.
+    fn tick<T: MultiWake + 'static>(&mut self, waker: &Arc<T>, wake_mask: &AtomicU32) -> bool {
+        // Set the ticking flag so wakes aren't counted as external
         loop {
-            // Poll each task. The tick() method updates counts based on task state.
-            // After each task, check if we've seen 8 consecutive idle tasks.
-            self.a.tick(&mut counts);
-            if counts.0 >= 8 {
-                break;
-            }
-            self.b.tick(&mut counts);
-            if counts.0 >= 8 {
-                break;
-            }
-            self.c.tick(&mut counts);
-            if counts.0 >= 8 {
-                break;
-            }
-            self.d.tick(&mut counts);
-            if counts.0 >= 8 {
-                break;
-            }
-            self.e.tick(&mut counts);
-            if counts.0 >= 8 {
-                break;
-            }
-            self.f.tick(&mut counts);
-            if counts.0 >= 8 {
-                break;
-            }
-            self.g.tick(&mut counts);
-            if counts.0 >= 8 {
-                break;
-            }
-            self.h.tick(&mut counts);
-            if counts.0 >= 8 {
-                break;
-            }
-            // Loop continues - some task made progress, keep polling
-        }
-        // Return true if any task is still running (done_count < 8)
-        counts.1 < 8
-    }
-}
-
-// ============================================================================
-// PROCEDURAL STATE MACHINE WITH 7 TASKS
-// ============================================================================
-// Same pattern as ProcMachine8, but with 7 tasks.
-
-#[repr(align(8))]
-struct ProcMachine7<A, B, C, D, E, F, G>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-{
-    a: ProcMachineTask<A>,
-    b: ProcMachineTask<B>,
-    c: ProcMachineTask<C>,
-    d: ProcMachineTask<D>,
-    e: ProcMachineTask<E>,
-    f: ProcMachineTask<F>,
-    g: ProcMachineTask<G>,
-}
-
-impl<A, B, C, D, E, F, G> std::fmt::Debug for ProcMachine7<A, B, C, D, E, F, G>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ProcMachine7>")
-    }
-}
-
-impl<A, B, C, D, E, F, G> MultiWake for ProcMachine7<A, B, C, D, E, F, G>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn wake(&self, n: u8) {
-        match n {
-            0 => self.a.wake(),
-            1 => self.b.wake(),
-            2 => self.c.wake(),
-            3 => self.d.wake(),
-            4 => self.e.wake(),
-            5 => self.f.wake(),
-            6 => self.g.wake(),
-            _ => (),
-        }
-    }
-}
-pub fn create_proc_machine7<A, B, C, D, E, F, G>(
-    a: A,
-    b: B,
-    c: C,
-    d: D,
-    e: E,
-    f: F,
-    g: G,
-) -> Arc<dyn ProcMachine>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-{
-    let ret = Arc::new(ProcMachine7 {
-        a: ProcMachineTask::new(),
-        b: ProcMachineTask::new(),
-        c: ProcMachineTask::new(),
-        d: ProcMachineTask::new(),
-        e: ProcMachineTask::new(),
-        f: ProcMachineTask::new(),
-        g: ProcMachineTask::new(),
-    });
-    ret.a.init(get_multi_waker(&ret, 0), a);
-    ret.b.init(get_multi_waker(&ret, 1), b);
-    ret.c.init(get_multi_waker(&ret, 2), c);
-    ret.d.init(get_multi_waker(&ret, 3), d);
-    ret.e.init(get_multi_waker(&ret, 4), e);
-    ret.f.init(get_multi_waker(&ret, 5), f);
-    ret.g.init(get_multi_waker(&ret, 6), g);
-    ret
-}
-
-impl<A, B, C, D, E, F, G> ProcMachine for ProcMachine7<A, B, C, D, E, F, G>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-    G: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn tick(&self) -> bool {
-        let mut counts: (u8, u8) = (0, 0);
-        loop {
-            self.a.tick(&mut counts);
-            if counts.0 >= 7 {
-                break;
-            }
-            self.b.tick(&mut counts);
-            if counts.0 >= 7 {
-                break;
-            }
-            self.c.tick(&mut counts);
-            if counts.0 >= 7 {
-                break;
-            }
-            self.d.tick(&mut counts);
-            if counts.0 >= 7 {
-                break;
-            }
-            self.e.tick(&mut counts);
-            if counts.0 >= 7 {
-                break;
-            }
-            self.f.tick(&mut counts);
-            if counts.0 >= 7 {
-                break;
-            }
-            self.g.tick(&mut counts);
-            if counts.0 >= 7 {
+            let mask = self.alive_mask & wake_mask.swap(0x80000000, Ordering::SeqCst) & 0x7FFFFFFF;
+            if mask != 0 {
+                self.alive_mask = self.futures.poll(waker, mask);
+            } else if wake_mask
+                .compare_exchange_weak(0x80000000, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
                 break;
             }
         }
-        counts.1 < 7
+        self.alive_mask != 0
     }
 }
 
-// ============================================================================
-// PROCEDURAL STATE MACHINE WITH 6 TASKS
-// ============================================================================
-// Same pattern as ProcMachine8, but with 6 tasks.
-
-#[repr(align(8))]
-struct ProcMachine6<A, B, C, D, E, F>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-{
-    a: ProcMachineTask<A>,
-    b: ProcMachineTask<B>,
-    c: ProcMachineTask<C>,
-    d: ProcMachineTask<D>,
-    e: ProcMachineTask<E>,
-    f: ProcMachineTask<F>,
-}
-
-impl<A, B, C, D, E, F> std::fmt::Debug for ProcMachine6<A, B, C, D, E, F>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ProcMachine6>")
-    }
-}
-
-impl<A, B, C, D, E, F> MultiWake for ProcMachine6<A, B, C, D, E, F>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn wake(&self, n: u8) {
-        match n {
-            0 => self.a.wake(),
-            1 => self.b.wake(),
-            2 => self.c.wake(),
-            3 => self.d.wake(),
-            4 => self.e.wake(),
-            5 => self.f.wake(),
-            _ => (),
-        }
-    }
-}
-pub fn create_proc_machine6<A, B, C, D, E, F>(
-    a: A,
-    b: B,
-    c: C,
-    d: D,
-    e: E,
-    f: F,
-) -> Arc<dyn ProcMachine>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-{
-    let ret = Arc::new(ProcMachine6 {
-        a: ProcMachineTask::new(),
-        b: ProcMachineTask::new(),
-        c: ProcMachineTask::new(),
-        d: ProcMachineTask::new(),
-        e: ProcMachineTask::new(),
-        f: ProcMachineTask::new(),
-    });
-    ret.a.init(get_multi_waker(&ret, 0), a);
-    ret.b.init(get_multi_waker(&ret, 1), b);
-    ret.c.init(get_multi_waker(&ret, 2), c);
-    ret.d.init(get_multi_waker(&ret, 3), d);
-    ret.e.init(get_multi_waker(&ret, 4), e);
-    ret.f.init(get_multi_waker(&ret, 5), f);
-    ret
-}
-
-impl<A, B, C, D, E, F> ProcMachine for ProcMachine6<A, B, C, D, E, F>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-    F: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn tick(&self) -> bool {
-        let mut counts: (u8, u8) = (0, 0);
-        loop {
-            self.a.tick(&mut counts);
-            if counts.0 >= 6 {
-                break;
-            }
-            self.b.tick(&mut counts);
-            if counts.0 >= 6 {
-                break;
-            }
-            self.c.tick(&mut counts);
-            if counts.0 >= 6 {
-                break;
-            }
-            self.d.tick(&mut counts);
-            if counts.0 >= 6 {
-                break;
-            }
-            self.e.tick(&mut counts);
-            if counts.0 >= 6 {
-                break;
-            }
-            self.f.tick(&mut counts);
-            if counts.0 >= 6 {
-                break;
-            }
-        }
-        counts.1 < 6
-    }
-}
-
-// ============================================================================
-// PROCEDURAL STATE MACHINE WITH 5 TASKS
-// ============================================================================
-// Same pattern as ProcMachine8, but with 5 tasks.
-
-#[repr(align(8))]
-struct ProcMachine5<A, B, C, D, E>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-{
-    a: ProcMachineTask<A>,
-    b: ProcMachineTask<B>,
-    c: ProcMachineTask<C>,
-    d: ProcMachineTask<D>,
-    e: ProcMachineTask<E>,
-}
-
-impl<A, B, C, D, E> std::fmt::Debug for ProcMachine5<A, B, C, D, E>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ProcMachine5>")
-    }
-}
-
-impl<A, B, C, D, E> MultiWake for ProcMachine5<A, B, C, D, E>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn wake(&self, n: u8) {
-        match n {
-            0 => self.a.wake(),
-            1 => self.b.wake(),
-            2 => self.c.wake(),
-            3 => self.d.wake(),
-            4 => self.e.wake(),
-            _ => (),
-        }
-    }
-}
-pub fn create_proc_machine5<A, B, C, D, E>(a: A, b: B, c: C, d: D, e: E) -> Arc<dyn ProcMachine>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-{
-    let ret = Arc::new(ProcMachine5 {
-        a: ProcMachineTask::new(),
-        b: ProcMachineTask::new(),
-        c: ProcMachineTask::new(),
-        d: ProcMachineTask::new(),
-        e: ProcMachineTask::new(),
-    });
-    ret.a.init(get_multi_waker(&ret, 0), a);
-    ret.b.init(get_multi_waker(&ret, 1), b);
-    ret.c.init(get_multi_waker(&ret, 2), c);
-    ret.d.init(get_multi_waker(&ret, 3), d);
-    ret.e.init(get_multi_waker(&ret, 4), e);
-    ret
-}
-
-impl<A, B, C, D, E> ProcMachine for ProcMachine5<A, B, C, D, E>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-    E: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn tick(&self) -> bool {
-        let mut counts: (u8, u8) = (0, 0);
-        loop {
-            self.a.tick(&mut counts);
-            if counts.0 >= 5 {
-                break;
-            }
-            self.b.tick(&mut counts);
-            if counts.0 >= 5 {
-                break;
-            }
-            self.c.tick(&mut counts);
-            if counts.0 >= 5 {
-                break;
-            }
-            self.d.tick(&mut counts);
-            if counts.0 >= 5 {
-                break;
-            }
-            self.e.tick(&mut counts);
-            if counts.0 >= 5 {
-                break;
-            }
-        }
-        counts.1 < 5
-    }
-}
-
-// ============================================================================
-// PROCEDURAL STATE MACHINE WITH 4 TASKS
-// ============================================================================
-// Same pattern as ProcMachine8, but with 4 tasks.
-
-#[repr(align(8))]
-struct ProcMachine4<A, B, C, D>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-{
-    a: ProcMachineTask<A>,
-    b: ProcMachineTask<B>,
-    c: ProcMachineTask<C>,
-    d: ProcMachineTask<D>,
-}
-
-impl<A, B, C, D> std::fmt::Debug for ProcMachine4<A, B, C, D>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ProcMachine4>")
-    }
-}
-
-impl<A, B, C, D> MultiWake for ProcMachine4<A, B, C, D>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn wake(&self, n: u8) {
-        match n {
-            0 => self.a.wake(),
-            1 => self.b.wake(),
-            2 => self.c.wake(),
-            3 => self.d.wake(),
-            _ => (),
-        }
-    }
-}
-pub fn create_proc_machine4<A, B, C, D>(a: A, b: B, c: C, d: D) -> Arc<dyn ProcMachine>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-{
-    let ret = Arc::new(ProcMachine4 {
-        a: ProcMachineTask::new(),
-        b: ProcMachineTask::new(),
-        c: ProcMachineTask::new(),
-        d: ProcMachineTask::new(),
-    });
-    ret.a.init(get_multi_waker(&ret, 0), a);
-    ret.b.init(get_multi_waker(&ret, 1), b);
-    ret.c.init(get_multi_waker(&ret, 2), c);
-    ret.d.init(get_multi_waker(&ret, 3), d);
-    ret
-}
-
-impl<A, B, C, D> ProcMachine for ProcMachine4<A, B, C, D>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-    D: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn tick(&self) -> bool {
-        let mut counts: (u8, u8) = (0, 0);
-        loop {
-            self.a.tick(&mut counts);
-            if counts.0 >= 4 {
-                break;
-            }
-            self.b.tick(&mut counts);
-            if counts.0 >= 4 {
-                break;
-            }
-            self.c.tick(&mut counts);
-            if counts.0 >= 4 {
-                break;
-            }
-            self.d.tick(&mut counts);
-            if counts.0 >= 4 {
-                break;
-            }
-        }
-        counts.1 < 4
-    }
-}
-
-// ============================================================================
-// PROCEDURAL STATE MACHINE WITH 3 TASKS
-// ============================================================================
-// Same pattern as ProcMachine8, but with 3 tasks.
-
-#[repr(align(8))]
-struct ProcMachine3<A, B, C>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-{
-    a: ProcMachineTask<A>,
-    b: ProcMachineTask<B>,
-    c: ProcMachineTask<C>,
-}
-
-impl<A, B, C> std::fmt::Debug for ProcMachine3<A, B, C>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ProcMachine3>")
-    }
-}
-
-impl<A, B, C> MultiWake for ProcMachine3<A, B, C>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn wake(&self, n: u8) {
-        match n {
-            0 => self.a.wake(),
-            1 => self.b.wake(),
-            2 => self.c.wake(),
-            _ => (),
-        }
-    }
-}
-pub fn create_proc_machine3<A, B, C>(a: A, b: B, c: C) -> Arc<dyn ProcMachine>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-{
-    let ret = Arc::new(ProcMachine3 {
-        a: ProcMachineTask::new(),
-        b: ProcMachineTask::new(),
-        c: ProcMachineTask::new(),
-    });
-    ret.a.init(get_multi_waker(&ret, 0), a);
-    ret.b.init(get_multi_waker(&ret, 1), b);
-    ret.c.init(get_multi_waker(&ret, 2), c);
-    ret
-}
-
-impl<A, B, C> ProcMachine for ProcMachine3<A, B, C>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-    C: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn tick(&self) -> bool {
-        let mut counts: (u8, u8) = (0, 0);
-        loop {
-            self.a.tick(&mut counts);
-            if counts.0 >= 3 {
-                break;
-            }
-            self.b.tick(&mut counts);
-            if counts.0 >= 3 {
-                break;
-            }
-            self.c.tick(&mut counts);
-            if counts.0 >= 3 {
-                break;
-            }
-        }
-        counts.1 < 3
-    }
-}
-
-// ============================================================================
-// PROCEDURAL STATE MACHINE WITH 2 TASKS
-// ============================================================================
-// Same pattern as ProcMachine8, but with 2 tasks.
-// This is the most commonly used variant (e.g., upload + download tasks).
-
-#[repr(align(8))]
-struct ProcMachine2<A, B>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-{
-    a: ProcMachineTask<A>,
-    b: ProcMachineTask<B>,
-}
-
-impl<A, B> std::fmt::Debug for ProcMachine2<A, B>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ProcMachine2>")
-    }
-}
-
-impl<A, B> MultiWake for ProcMachine2<A, B>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn wake(&self, n: u8) {
-        match n {
-            0 => self.a.wake(),
-            1 => self.b.wake(),
-            _ => (),
-        }
-    }
-}
-/// Creates a ProcMachine with 2 async tasks.
+/// Singleton starting point for the builder pattern.
 ///
-/// This is the most commonly used factory. For example, `TunnelProtocol` uses
-/// this to run the upload and download tasks concurrently.
-///
-/// # Example
-///
-/// ```ignore
-/// let machine = create_proc_machine2(
-///     upload_task(io.clone()),
-///     download_task(io.clone()),
-/// );
-///
-/// while machine.tick() {
-///     // Wait for I/O events, then tick again
-/// }
+/// ```rust,ignore
+/// let machine = PROC_MACHINE_JOBS_BASE
+///     .with(my_task)
+///     .build(MyIO::new());
 /// ```
-pub fn create_proc_machine2<A, B>(a: A, b: B) -> Arc<dyn ProcMachine>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
-{
-    let ret = Arc::new(ProcMachine2 {
-        a: ProcMachineTask::new(),
-        b: ProcMachineTask::new(),
-    });
-    ret.a.init(get_multi_waker(&ret, 0), a);
-    ret.b.init(get_multi_waker(&ret, 1), b);
-    ret
+pub static PROC_MACHINE_JOBS_BASE: ProcMachineJobsBase = ProcMachineJobsBase();
+
+/// The concrete `ProcMachine` implementation, allocated inside an `Arc`.
+///
+/// # Layout
+///
+/// - `inner`: Mutex-protected [`ProcMachineInner`] (IO + futures + alive_mask).
+/// - `wake_mask`: Atomic bitmask of pending wakes. Lives *outside* the mutex
+///   so that [`MultiWake::wake`] can set bits without acquiring the lock
+///   (wakes may fire from any thread or from inside a poll).
+/// - `raw_arc`: Raw self-pointer set once during construction. Used by
+///   trait-object methods ([`is_done`](ProcMachine::is_done),
+///   [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io)) to reconstruct
+///   a temporary `Arc<Self>` needed by [`tick`](ProcMachineInner::tick).
+///
+/// # Safety
+///
+/// `raw_arc` is a `*const Self` (not `Send`), hence the manual
+/// `unsafe impl Send + Sync`. This is sound because `raw_arc` is
+/// immutable after construction and always points to the Arc's own
+/// allocation, which is guaranteed to be alive while any `&self` exists.
+struct ProcMachineImpl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> {
+    inner: Mutex<ProcMachineInner<IO, FUTURES>>,
+    wake_mask: AtomicU32,
+    external_waker: AtomicWaker,
+    raw_arc: *const Self,
 }
 
-impl<A, B> ProcMachine for ProcMachine2<A, B>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-    B: Future<Output = TaskEnd> + Send + 'static,
+// SAFETY: All mutable state is behind the Mutex or is AtomicU32.
+// raw_arc is immutable after construction and points to the Arc's own
+// allocation (which is alive while any reference exists).
+unsafe impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Send
+    for ProcMachineImpl<IO, FUTURES>
 {
-    fn tick(&self) -> bool {
-        let mut counts: (u8, u8) = (0, 0);
-        loop {
-            self.a.tick(&mut counts);
-            if counts.0 >= 2 {
-                break;
-            }
-            self.b.tick(&mut counts);
-            if counts.0 >= 2 {
-                break;
-            }
-        }
-        counts.1 < 2
+}
+unsafe impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Sync
+    for ProcMachineImpl<IO, FUTURES>
+{
+}
+
+impl<IO: Send + Debug, FUTURES: ProcMachineFutures> core::fmt::Debug
+    for ProcMachineImpl<IO, FUTURES>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let guard = self.inner.lock();
+        f.debug_struct("ProcMachineImpl")
+            .field("io", &guard.io)
+            .field("alive_mask", &guard.alive_mask)
+            .finish()
     }
 }
 
-// ============================================================================
-// PROCEDURAL STATE MACHINE WITH 1 TASK
-// ============================================================================
-// Same pattern as ProcMachine8, but with just 1 task.
-// Useful when a single complex async state machine is sufficient.
-
-#[repr(align(8))]
-struct ProcMachine1<A>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-{
-    a: ProcMachineTask<A>,
-}
-
-impl<A> std::fmt::Debug for ProcMachine1<A>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ProcMachine1>")
-    }
-}
-
-impl<A> MultiWake for ProcMachine1<A>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
+/// [`MultiWake`] impl: sets the task's bit in `wake_mask` via CAS loop.
+///
+/// This is called from [`Waker::wake`] on any thread, potentially while
+/// the mutex is held (e.g. a task writes to an IoExchange, which wakes
+/// the reader's waker synchronously). Because `wake_mask` is atomic and
+/// lives outside the mutex, this never deadlocks.
+impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> MultiWake
+    for ProcMachineImpl<IO, FUTURES>
 {
     fn wake(&self, n: u8) {
-        match n {
-            0 => self.a.wake(),
-            _ => (),
+        loop {
+            let old = self.wake_mask.load(Ordering::SeqCst);
+            let new = old | (1 << n);
+            if new == old {
+                break; // Bit already set — nothing to do.
+            }
+            if self
+                .wake_mask
+                .compare_exchange(old, new, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                if (old & 0x80000000) == 0 {
+                    // We are not inside a locked context that will notice this wake, so
+                    // this wake is 'external', and need to notify the external task
+                    self.external_waker.wake();
+                }
+                break;
+            }
+            // CAS failed (another thread modified wake_mask) — retry.
         }
     }
 }
-pub fn create_proc_machine1<A>(a: A) -> Arc<dyn ProcMachine>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
+
+impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
+    ProcMachineImpl<IO, FUTURES>
 {
-    let ret = Arc::new(ProcMachine1 {
-        a: ProcMachineTask::new(),
-    });
-    ret.a.init(get_multi_waker(&ret, 0), a);
-    ret
+    /// Allocates the ProcMachine, initialises futures, and performs the
+    /// first tick.
+    ///
+    /// # Lifetime extension
+    ///
+    /// Task futures receive `Pin<&'static IO>`, but the IO actually lives
+    /// inside the Arc-held Mutex. This is sound because:
+    /// 1. The IO is only accessed through futures stored in the same struct.
+    /// 2. Futures are only polled while the mutex is held.
+    /// 3. The Arc ensures the allocation is never freed while references
+    ///    exist.
+    fn new<JOBS: ProcMachineJobs<IO, FUTURES = FUTURES>>(io: IO, jobs: JOBS) -> Arc<Self> {
+        let mut ret = Arc::new(Self {
+            inner: Mutex::new(ProcMachineInner::new(io)),
+            wake_mask: AtomicU32::new(0),
+            external_waker: AtomicWaker::new(),
+            raw_arc: std::ptr::null(),
+        });
+        // Store a raw self-pointer for later Arc reconstruction in
+        // trait-object methods. Safe because we are the sole owner
+        // (Arc::get_mut succeeds).
+        Arc::get_mut(&mut ret).unwrap().raw_arc = Arc::as_ptr(&ret);
+        {
+            let mut guard = ret.inner.lock();
+            let ProcMachineInner {
+                io,
+                futures,
+                alive_mask: _,
+            } = &mut *guard;
+            // SAFETY: Extend the IO lifetime to 'static. The IO lives
+            // inside the Arc and is only accessed by futures that are also
+            // inside the Arc, polled under the mutex. See doc comment above.
+            let io = unsafe { Pin::new_unchecked(&*(io as *const IO)) };
+            jobs.init(io, futures);
+            // Initial poll with all bits set to discover which tasks are
+            // alive, then tick to process any that were immediately ready.
+            guard.alive_mask = futures.poll(&ret, 0xFFFFFFFF);
+            guard.tick(&ret, &ret.wake_mask);
+        }
+        ret
+    }
 }
 
-impl<A> ProcMachine for ProcMachine1<A>
-where
-    A: Future<Output = TaskEnd> + Send + 'static,
+impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMachine<IO>
+    for ProcMachineImpl<IO, FUTURES>
 {
-    fn tick(&self) -> bool {
-        let mut counts: (u8, u8) = (0, 0);
-        loop {
-            self.a.tick(&mut counts);
-            if counts.0 >= 1 {
-                break;
+    fn is_done(&self) -> bool {
+        // Reconstruct a temporary Arc<Self> for tick(). The
+        // increment_strong_count / from_raw pair ensures the ref count
+        // nets to zero when the temporary is dropped at the end.
+        let arc: Arc<Self> = unsafe {
+            Arc::increment_strong_count(self.raw_arc);
+            Arc::from_raw(self.raw_arc)
+        };
+        let mut guard = self.inner.lock();
+        !guard.tick(&arc, &self.wake_mask)
+    }
+
+    unsafe fn unsafe_lock_io(&self) -> *mut IO {
+        // Acquire the raw mutex (not through MutexGuard, because we need
+        // to release it in a separate call — unsafe_unlock_io).
+        self.inner.raw().lock();
+        let inner_ptr = self.inner.data_ptr();
+        unsafe { &mut (*inner_ptr).io }
+    }
+
+    unsafe fn unsafe_unlock_io(&self) {
+        // Reconstruct a temporary Arc for tick (same pattern as is_done).
+        let arc: Arc<Self> = unsafe {
+            Arc::increment_strong_count(self.raw_arc);
+            Arc::from_raw(self.raw_arc)
+        };
+        // Tick while still holding the lock — this processes any wakes
+        // that occurred during the critical section.
+        let inner_ptr = self.inner.data_ptr();
+        (*inner_ptr).tick(&arc, &self.wake_mask);
+        // Now release the raw mutex.
+        self.inner.raw().unlock();
+    }
+
+    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.external_waker.register(cx.waker());
+        if (self.wake_mask.load(Ordering::Relaxed) & 0x7FFFFFFF) != 0 {
+            unsafe {
+                self.unsafe_lock_io();
+                self.unsafe_unlock_io();
             }
         }
-        counts.1 < 1
+        Poll::Pending
+    }
+}
+
+// ============================================================================
+// MULTI-WAKER SUPPORT
+// ============================================================================
+//
+// Each task needs its own Waker so that when an IO primitive (e.g.
+// IoExchange) calls wake(), only the relevant task is scheduled for
+// polling — not all of them.
+//
+// The naive approach (one Arc per waker) would mean extra allocations.
+// Instead, we use bytemuck's TransparentWrapper to reinterpret the
+// ProcMachineImpl Arc as an Arc<MultiwakeWrapper<_, N>> for each const
+// N. Because MultiwakeWrapper is #[repr(transparent)], this is a
+// zero-cost pointer cast. Each N gets its own Wake vtable that routes
+// to MultiWake::wake(N).
+//
+// The result: every task gets a distinct Waker backed by the same Arc
+// allocation, with no extra heap allocations.
+// ============================================================================
+
+/// Trait for types that can be woken by task index.
+///
+/// Implemented by [`ProcMachineImpl`] to set the corresponding bit in
+/// `wake_mask`.
+pub trait MultiWake: Send + Sync {
+    /// Signal that the task at index `n` (0–31) should be polled.
+    fn wake(&self, n: u8);
+}
+
+/// Zero-cost wrapper that routes [`Wake::wake`] to [`MultiWake::wake(N)`].
+///
+/// `#[repr(transparent)]` guarantees the same layout as `T`, so
+/// `Arc<MultiwakeWrapper<T, N>>` and `Arc<T>` are interchangeable via
+/// [`TransparentWrapperAlloc::wrap_arc`].
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
+struct MultiwakeWrapper<T: MultiWake, const N: u8>(T);
+
+impl<T, const N: u8> Wake for MultiwakeWrapper<T, N>
+where
+    T: MultiWake,
+{
+    fn wake(self: Arc<Self>) {
+        self.0.wake(N);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.wake(N);
+    }
+}
+
+impl<T: MultiWake + 'static, const N: u8> MultiwakeWrapper<T, N> {
+    /// Reinterprets `Arc<T>` as `Arc<MultiwakeWrapper<T, N>>` (zero-cost)
+    /// and converts it to a [`Waker`].
+    fn get_waker(target: Arc<T>) -> Waker {
+        let wrapper = Self::wrap_arc(target);
+        Waker::from(wrapper)
+    }
+}
+
+/// Maps a runtime task index to a statically-typed [`Waker`] backed by the
+/// corresponding `MultiwakeWrapper<T, N>`.
+///
+/// Each const generic `N` produces a distinct `MultiwakeWrapper` type with
+/// its own [`Wake`] impl, so every task index gets a unique vtable that
+/// routes [`Waker::wake()`] to [`MultiWake::wake(n)`] on the shared
+/// `Arc<T>`.
+///
+/// # Why a match instead of a const generic call?
+///
+/// Rust does not allow generic `Self` types in anonymous const expressions,
+/// so callers like [`ProcMachineFuturesExtension::poll`] cannot write
+/// `MultiwakeWrapper::<T, { Self::DEPTH }>` directly. This function bridges
+/// the gap: the caller passes the depth as a plain `u8`, and the match
+/// converts it to the corresponding const-generic instantiation.
+///
+/// Because every call site passes a value derived from an associated const
+/// (`Self::DEPTH`), LLVM sees through the match after monomorphisation and
+/// constant-folds it to a direct call — no branch at runtime. Only the arms
+/// actually used by a given ProcMachine are monomorphised into the binary.
+fn get_multi_waker<T: MultiWake + 'static>(target: &Arc<T>, n: u8) -> Waker {
+    match n {
+        0 => MultiwakeWrapper::<T, 0>::get_waker(target.clone()),
+        1 => MultiwakeWrapper::<T, 1>::get_waker(target.clone()),
+        2 => MultiwakeWrapper::<T, 2>::get_waker(target.clone()),
+        3 => MultiwakeWrapper::<T, 3>::get_waker(target.clone()),
+        4 => MultiwakeWrapper::<T, 4>::get_waker(target.clone()),
+        5 => MultiwakeWrapper::<T, 5>::get_waker(target.clone()),
+        6 => MultiwakeWrapper::<T, 6>::get_waker(target.clone()),
+        7 => MultiwakeWrapper::<T, 7>::get_waker(target.clone()),
+        8 => MultiwakeWrapper::<T, 8>::get_waker(target.clone()),
+        9 => MultiwakeWrapper::<T, 9>::get_waker(target.clone()),
+        10 => MultiwakeWrapper::<T, 10>::get_waker(target.clone()),
+        11 => MultiwakeWrapper::<T, 11>::get_waker(target.clone()),
+        12 => MultiwakeWrapper::<T, 12>::get_waker(target.clone()),
+        13 => MultiwakeWrapper::<T, 13>::get_waker(target.clone()),
+        14 => MultiwakeWrapper::<T, 14>::get_waker(target.clone()),
+        15 => MultiwakeWrapper::<T, 15>::get_waker(target.clone()),
+        16 => MultiwakeWrapper::<T, 16>::get_waker(target.clone()),
+        17 => MultiwakeWrapper::<T, 17>::get_waker(target.clone()),
+        18 => MultiwakeWrapper::<T, 18>::get_waker(target.clone()),
+        19 => MultiwakeWrapper::<T, 19>::get_waker(target.clone()),
+        20 => MultiwakeWrapper::<T, 20>::get_waker(target.clone()),
+        21 => MultiwakeWrapper::<T, 21>::get_waker(target.clone()),
+        22 => MultiwakeWrapper::<T, 22>::get_waker(target.clone()),
+        23 => MultiwakeWrapper::<T, 23>::get_waker(target.clone()),
+        24 => MultiwakeWrapper::<T, 24>::get_waker(target.clone()),
+        25 => MultiwakeWrapper::<T, 25>::get_waker(target.clone()),
+        26 => MultiwakeWrapper::<T, 26>::get_waker(target.clone()),
+        27 => MultiwakeWrapper::<T, 27>::get_waker(target.clone()),
+        28 => MultiwakeWrapper::<T, 28>::get_waker(target.clone()),
+        29 => MultiwakeWrapper::<T, 29>::get_waker(target.clone()),
+        30 => MultiwakeWrapper::<T, 30>::get_waker(target.clone()),
+        _ => panic!("Task index {n} out of range (max 30, limited by u32 wake_mask)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::task::Poll;
+
+    // -----------------------------------------------------------------------
+    // Test IO struct
+    // -----------------------------------------------------------------------
+    //
+    // Tasks suspend by checking a per-slot "gate" flag. External code
+    // opens the gate and wakes the stored waker — the next poll sees the
+    // open gate and returns Ready, allowing the task to proceed.
+
+    /// Minimal IO struct for testing ProcMachine task scheduling.
+    #[derive(Debug)]
+    struct TestIO {
+        /// Counter incremented by tasks to prove they ran.
+        counter: AtomicU32,
+        /// Bitfield: bit N is set when task N has completed.
+        completed: AtomicU32,
+        /// Per-slot gate + waker state.  Protected by the ProcMachine
+        /// mutex (accessed through Pin<&TestIO>, which is only valid
+        /// while the mutex is held).
+        slots: std::sync::Mutex<Vec<Slot>>,
+    }
+
+    /// Per-task suspend/resume state.
+    #[derive(Default, Debug)]
+    struct Slot {
+        /// When `true`, the next poll of this slot's gate returns `Ready`.
+        open: bool,
+        /// Waker stored by the task so external code can schedule it.
+        waker: Option<Waker>,
+    }
+
+    impl TestIO {
+        fn new(num_slots: usize) -> Self {
+            let mut slots = Vec::with_capacity(num_slots);
+            slots.resize_with(num_slots, Slot::default);
+            Self {
+                counter: AtomicU32::new(0),
+                completed: AtomicU32::new(0),
+                slots: std::sync::Mutex::new(slots),
+            }
+        }
+
+        fn counter(&self) -> u32 {
+            self.counter.load(Ordering::SeqCst)
+        }
+
+        fn completed(&self) -> u32 {
+            self.completed.load(Ordering::SeqCst)
+        }
+
+        /// Called by a task inside a `poll_fn` to suspend until the gate
+        /// is opened.  Returns `Ready` if the gate is already open
+        /// (consuming it), or `Pending` after storing the waker.
+        fn poll_gate(&self, n: usize, cx: &std::task::Context<'_>) -> Poll<()> {
+            let mut slots = self.slots.lock().unwrap();
+            if slots[n].open {
+                slots[n].open = false; // consume the gate
+                Poll::Ready(())
+            } else {
+                slots[n].waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+
+        /// Called by external code (while holding the IoGuard) to open the
+        /// gate and wake the corresponding task.
+        fn open_gate(&self, n: usize) {
+            let mut slots = self.slots.lock().unwrap();
+            slots[n].open = true;
+            if let Some(w) = slots[n].waker.take() {
+                w.wake();
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task functions
+    // -----------------------------------------------------------------------
+
+    /// Increments counter once and completes immediately.
+    async fn task_immediate(io: Pin<&'static TestIO>) -> TaskEnd {
+        io.counter.fetch_add(1, Ordering::SeqCst);
+        io.completed.fetch_or(1 << 0, Ordering::SeqCst);
+        TaskEnd()
+    }
+
+    /// Increments counter, suspends on gate 0, increments again, completes.
+    async fn task_suspend_slot0(io: Pin<&'static TestIO>) -> TaskEnd {
+        io.counter.fetch_add(1, Ordering::SeqCst);
+        poll_fn(|cx| io.poll_gate(0, cx)).await;
+        io.counter.fetch_add(1, Ordering::SeqCst);
+        io.completed.fetch_or(1 << 0, Ordering::SeqCst);
+        TaskEnd()
+    }
+
+    /// Adds 10, suspends on gate 1, adds 10, completes.
+    async fn task_suspend_slot1(io: Pin<&'static TestIO>) -> TaskEnd {
+        io.counter.fetch_add(10, Ordering::SeqCst);
+        poll_fn(|cx| io.poll_gate(1, cx)).await;
+        io.counter.fetch_add(10, Ordering::SeqCst);
+        io.completed.fetch_or(1 << 1, Ordering::SeqCst);
+        TaskEnd()
+    }
+
+    /// Suspends 3 times on gate 0, incrementing counter each time.
+    async fn task_multi_suspend(io: Pin<&'static TestIO>) -> TaskEnd {
+        for _ in 0..3 {
+            io.counter.fetch_add(1, Ordering::SeqCst);
+            poll_fn(|cx| io.poll_gate(0, cx)).await;
+        }
+        io.counter.fetch_add(1, Ordering::SeqCst);
+        io.completed.fetch_or(1 << 0, Ordering::SeqCst);
+        TaskEnd()
+    }
+
+    /// Suspends on gate 0, then opens gate 1 (cross-task wake), completes.
+    async fn task_wakes_other(io: Pin<&'static TestIO>) -> TaskEnd {
+        io.counter.fetch_add(1, Ordering::SeqCst);
+        poll_fn(|cx| io.poll_gate(0, cx)).await;
+        // Synchronously wake the other task.
+        io.open_gate(1);
+        io.counter.fetch_add(1, Ordering::SeqCst);
+        io.completed.fetch_or(1 << 0, Ordering::SeqCst);
+        TaskEnd()
+    }
+
+    /// Completes immediately without touching IO.
+    async fn task_noop(_io: Pin<&'static TestIO>) -> TaskEnd {
+        TaskEnd()
+    }
+
+    // -----------------------------------------------------------------------
+    // Construction and basic lifecycle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_single_task_machine() {
+        let _machine: Arc<dyn ProcMachine<TestIO>> = PROC_MACHINE_JOBS_BASE
+            .with(task_immediate)
+            .build(TestIO::new(1));
+    }
+
+    #[test]
+    fn build_two_task_machine() {
+        let _machine: Arc<dyn ProcMachine<TestIO>> = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .with(task_suspend_slot1)
+            .build(TestIO::new(2));
+    }
+
+    #[test]
+    fn immediate_task_runs_during_build() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_immediate)
+            .build(TestIO::new(1));
+
+        let guard = machine.lock();
+        assert_eq!(guard.counter(), 1);
+        assert_eq!(guard.completed(), 1);
+    }
+
+    #[test]
+    fn immediate_task_is_done() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_immediate)
+            .build(TestIO::new(1));
+
+        assert!(machine.is_done());
+    }
+
+    // -----------------------------------------------------------------------
+    // Single task with suspend/resume
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn suspended_task_is_not_done() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .build(TestIO::new(1));
+
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 1); // first half ran
+            assert_eq!(guard.completed(), 0);
+        }
+        assert!(!machine.is_done());
+    }
+
+    #[test]
+    fn wake_and_resume_single_task() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .build(TestIO::new(1));
+
+        // Open the gate and wake the task.
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 1);
+            guard.open_gate(0);
+        }
+        // Guard drop → tick → task sees open gate → resumes.
+
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 2);
+            assert_eq!(guard.completed(), 1);
+        }
+        assert!(machine.is_done());
+    }
+
+    #[test]
+    fn multiple_suspend_resume_cycles() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_multi_suspend)
+            .build(TestIO::new(1));
+
+        // Initial: first increment + suspend.
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 1);
+        }
+
+        // Resume 3 times (the task loops 3 times with a suspend each).
+        for expected in [2, 3, 4] {
+            {
+                let guard = machine.lock();
+                guard.open_gate(0);
+            }
+            {
+                let guard = machine.lock();
+                assert_eq!(guard.counter(), expected);
+            }
+        }
+
+        // After 3 resumes, the loop ends and the task completes.
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.completed(), 1);
+        }
+        assert!(machine.is_done());
+    }
+
+    // -----------------------------------------------------------------------
+    // Two-task interaction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_tasks_run_independently() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .with(task_suspend_slot1)
+            .build(TestIO::new(2));
+
+        // Both tasks ran their first half: 1 + 10 = 11.
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 11);
+            assert_eq!(guard.completed(), 0);
+        }
+
+        // Wake only task 0.
+        {
+            let guard = machine.lock();
+            guard.open_gate(0);
+        }
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 12); // +1 from task 0
+            assert_eq!(guard.completed(), 1); // only task 0 done
+        }
+
+        // Wake task 1.
+        {
+            let guard = machine.lock();
+            guard.open_gate(1);
+        }
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 22); // +10 from task 1
+            assert_eq!(guard.completed(), 3); // both done
+        }
+        assert!(machine.is_done());
+    }
+
+    #[test]
+    fn wake_both_tasks_simultaneously() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .with(task_suspend_slot1)
+            .build(TestIO::new(2));
+
+        {
+            let guard = machine.lock();
+            guard.open_gate(0);
+            guard.open_gate(1);
+        }
+
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 22);
+            assert_eq!(guard.completed(), 3);
+        }
+        assert!(machine.is_done());
+    }
+
+    #[test]
+    fn cross_task_synchronous_wake() {
+        // task_wakes_other: suspends on gate 0, then opens gate 1.
+        // task_suspend_slot1: suspends on gate 1.
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_wakes_other)
+            .with(task_suspend_slot1)
+            .build(TestIO::new(2));
+
+        // Both ran their first half: 1 + 10 = 11.
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 11);
+        }
+
+        // Open gate 0: task_wakes_other resumes, opens gate 1
+        // synchronously. The tick loop picks up the wake for task 1
+        // and polls it too, so both complete in one tick cycle.
+        {
+            let guard = machine.lock();
+            guard.open_gate(0);
+        }
+
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 22); // 1+1 + 10+10
+            assert_eq!(guard.completed(), 3);
+        }
+        assert!(machine.is_done());
+    }
+
+    // -----------------------------------------------------------------------
+    // IoGuard behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn guard_deref_provides_io_access() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_immediate)
+            .build(TestIO::new(1));
+
+        let guard = machine.lock();
+        assert_eq!(guard.counter(), 1);
+    }
+
+    #[test]
+    fn guard_deref_mut_provides_mutable_access() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_immediate)
+            .build(TestIO::new(1));
+
+        {
+            let guard = machine.lock();
+            guard.counter.store(42, Ordering::SeqCst);
+        }
+
+        let guard = machine.lock();
+        assert_eq!(guard.counter(), 42);
+    }
+
+    #[test]
+    fn guard_drop_ticks_machine() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .build(TestIO::new(1));
+
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 1);
+            guard.open_gate(0);
+            // Task is woken but hasn't run — we still hold the lock.
+            assert_eq!(guard.counter(), 1);
+        }
+        // Guard dropped → tick → task resumes.
+
+        let guard = machine.lock();
+        assert_eq!(guard.counter(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_done semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_done_false_while_tasks_pending() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .with(task_suspend_slot1)
+            .build(TestIO::new(2));
+
+        assert!(!machine.is_done());
+
+        // Complete one task — still not done.
+        {
+            let guard = machine.lock();
+            guard.open_gate(0);
+        }
+        assert!(!machine.is_done());
+
+        // Complete the other.
+        {
+            let guard = machine.lock();
+            guard.open_gate(1);
+        }
+        assert!(machine.is_done());
+    }
+
+    #[test]
+    fn is_done_ticks_before_answering() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .build(TestIO::new(1));
+
+        {
+            let guard = machine.lock();
+            guard.open_gate(0);
+        }
+        // is_done calls tick internally before checking.
+        assert!(machine.is_done());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-waker unit tests
+    // -----------------------------------------------------------------------
+
+    /// Standalone MultiWake impl for testing get_multi_waker in isolation.
+    struct TestMultiWaker {
+        woken: AtomicU32,
+    }
+
+    impl TestMultiWaker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                woken: AtomicU32::new(0),
+            })
+        }
+        fn woken_mask(&self) -> u32 {
+            self.woken.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MultiWake for TestMultiWaker {
+        fn wake(&self, n: u8) {
+            self.woken.fetch_or(1 << n, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn multi_waker_routes_to_correct_index() {
+        let mw = TestMultiWaker::new();
+
+        let w0 = get_multi_waker(&mw, 0);
+        let w3 = get_multi_waker(&mw, 3);
+        let w7 = get_multi_waker(&mw, 7);
+
+        w0.wake_by_ref();
+        assert_eq!(mw.woken_mask(), 1 << 0);
+
+        w3.wake_by_ref();
+        assert_eq!(mw.woken_mask(), (1 << 0) | (1 << 3));
+
+        w7.wake_by_ref();
+        assert_eq!(mw.woken_mask(), (1 << 0) | (1 << 3) | (1 << 7));
+    }
+
+    #[test]
+    fn multi_waker_high_indices() {
+        let mw = TestMultiWaker::new();
+
+        let w31 = get_multi_waker(&mw, 30);
+        w31.wake_by_ref();
+        assert_eq!(mw.woken_mask(), 1 << 30);
+
+        let w16 = get_multi_waker(&mw, 16);
+        w16.wake_by_ref();
+        assert_eq!(mw.woken_mask(), (1 << 30) | (1 << 16));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn multi_waker_index_32_panics() {
+        let mw = TestMultiWaker::new();
+        let _w = get_multi_waker(&mw, 32);
+    }
+
+    #[test]
+    fn multi_waker_wake_is_idempotent() {
+        let mw = TestMultiWaker::new();
+        let w = get_multi_waker(&mw, 5);
+        w.wake_by_ref();
+        w.wake_by_ref();
+        w.wake_by_ref();
+        assert_eq!(mw.woken_mask(), 1 << 5);
+    }
+
+    #[test]
+    fn multi_waker_different_indices_independent() {
+        let mw = TestMultiWaker::new();
+        for i in 0..8 {
+            let w = get_multi_waker(&mw, i);
+            w.wake_by_ref();
+        }
+        assert_eq!(mw.woken_mask(), 0xFF);
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_work_task_completes_at_build() {
+        let machine = PROC_MACHINE_JOBS_BASE.with(task_noop).build(TestIO::new(0));
+
+        assert!(machine.is_done());
+        let guard = machine.lock();
+        assert_eq!(guard.counter(), 0);
+    }
+
+    #[test]
+    fn mix_immediate_and_suspended_tasks() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_immediate)
+            .with(task_suspend_slot1)
+            .build(TestIO::new(2));
+
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 11); // 1 + 10
+            assert_eq!(guard.completed(), 1); // only task 0
+        }
+        assert!(!machine.is_done());
+
+        {
+            let guard = machine.lock();
+            guard.open_gate(1);
+        }
+        {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 21);
+            assert_eq!(guard.completed(), 3);
+        }
+        assert!(machine.is_done());
+    }
+
+    #[test]
+    fn repeated_lock_unlock_without_wakes() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .build(TestIO::new(1));
+
+        for _ in 0..10 {
+            let guard = machine.lock();
+            assert_eq!(guard.counter(), 1); // no change
+        }
+        assert!(!machine.is_done());
+    }
+
+    #[test]
+    fn debug_format_shows_io_and_alive_mask() {
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_suspend_slot0)
+            .build(TestIO::new(1));
+
+        let dbg = format!("{:?}", machine);
+        assert!(dbg.contains("ProcMachineImpl"));
+        assert!(dbg.contains("alive_mask"));
     }
 }
