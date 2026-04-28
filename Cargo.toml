@@ -71,3 +71,8 @@ parking_lot = "0.12.5"
 
 [dev-dependencies]
 tokio-test = "0.4"
+rand = "0.8"
+
+[[example]]
+name = "live_test"
+path = "examples/live_test/main.rs"
