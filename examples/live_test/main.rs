@@ -27,9 +27,7 @@ mod test_recycle;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
-use smallware_tunnel::{
-    forward_tunnel_tcp, JwtManager, TunnelConfig, TunnelError, TunnelListener,
-};
+use smallware_tunnel::{forward_tunnel_tcp, JwtManager, TunnelConfig, TunnelError, TunnelListener};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,14 +100,18 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("Failed to install crypto provider");
 
-    let log_level = if args.verbose { Level::DEBUG } else { Level::INFO };
+    let log_level = if args.verbose {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
     tracing_subscriber::fmt()
         .with_max_level(log_level)
         .with_target(false)
         .init();
 
-    let auth = JwtManager::from_access_key(&args.key)
-        .map_err(|_| anyhow!("Malformed access key"))?;
+    let auth =
+        JwtManager::from_access_key(&args.key).map_err(|_| anyhow!("Malformed access key"))?;
     let auth = Arc::new(auth);
 
     let mut config = TunnelConfig::new(args.domain.clone());
@@ -174,11 +176,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_selected_test(
-    test: Test,
-    domain: &str,
-    trust_ca: Option<&PathBuf>,
-) -> Result<()> {
+async fn run_selected_test(test: Test, domain: &str, trust_ca: Option<&PathBuf>) -> Result<()> {
     match test {
         Test::FiveGet => test_5get::run(domain, trust_ca).await,
         Test::Recycle => test_recycle::run(domain, trust_ca).await,

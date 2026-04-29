@@ -9,8 +9,8 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::io_sink::IoSink;
-use crate::io_stream::IoStream;
+use procmachines::{IoSink, IoStream};
+
 use crate::tunnel_protocol::ServerLinks;
 use crate::{StatCounter, STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP};
 
@@ -91,7 +91,7 @@ impl IoSink for WsServerLinks {
     type Error = ();
     type Item = Message;
 
-    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+    fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let mut sink = self.sink.borrow_mut();
         let Some(sink) = sink.as_mut() else {
             tracing::error!("Websocket check write after done");
@@ -100,7 +100,7 @@ impl IoSink for WsServerLinks {
         Pin::new(sink).poll_ready(cx).map_err(|_| ())
     }
 
-    fn poll_send(&self, cx: &mut Context<'_>, item: &mut Option<Message>) -> Poll<Result<(), ()>> {
+    fn prod_poll_send(&self, cx: &mut Context<'_>, item: &mut Option<Message>) -> Poll<Result<(), ()>> {
         if item.is_none() {
             return Poll::Ready(Ok(()));
         }
@@ -136,7 +136,7 @@ impl IoSink for WsServerLinks {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let mut sink = self.sink.borrow_mut();
         let Some(sink) = sink.as_mut() else {
             return Poll::Ready(Ok(()));
@@ -148,7 +148,7 @@ impl IoSink for WsServerLinks {
         ret
     }
 
-    fn poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let mut sink_ref = self.sink.borrow_mut();
         let Some(sink) = sink_ref.as_mut() else {
             return Poll::Ready(Ok(()));
@@ -165,7 +165,7 @@ impl IoSink for WsServerLinks {
 }
 
 impl IoStream<Message> for WsServerLinks {
-    fn check_read(&self, cx: &mut Context<'_>) -> Poll<bool> {
+    fn con_check_read(&self, cx: &mut Context<'_>) -> Poll<bool> {
         if self.buffered.borrow().is_some() {
             return Poll::Ready(true);
         }
@@ -187,7 +187,7 @@ impl IoStream<Message> for WsServerLinks {
         }
     }
 
-    fn poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Message>> {
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Message>> {
         if let Some(msg) = self.buffered.borrow_mut().take() {
             return Poll::Ready(Some(msg));
         }

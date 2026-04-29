@@ -19,11 +19,7 @@ pub async fn run(domain: &str, trust_ca: Option<&PathBuf>) -> Result<()> {
     run_with_wait(domain, trust_ca, Duration::from_secs(2)).await
 }
 
-pub async fn run_with_wait(
-    domain: &str,
-    trust_ca: Option<&PathBuf>,
-    wait: Duration,
-) -> Result<()> {
+pub async fn run_with_wait(domain: &str, trust_ca: Option<&PathBuf>, wait: Duration) -> Result<()> {
     let connector = build_tls_connector(trust_ca)?;
     let server_name = make_server_name(domain)?;
 

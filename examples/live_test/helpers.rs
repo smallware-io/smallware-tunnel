@@ -85,9 +85,7 @@ pub async fn https_get(
     spill: &mut Vec<u8>,
     label: &str,
 ) -> Result<()> {
-    let req = format!(
-        "GET /{len} HTTP/1.1\r\nHost: {domain}\r\nConnection: keep-alive\r\n\r\n"
-    );
+    let req = format!("GET /{len} HTTP/1.1\r\nHost: {domain}\r\nConnection: keep-alive\r\n\r\n");
     tls.write_all(req.as_bytes()).await?;
     tls.flush().await?;
 
@@ -126,9 +124,7 @@ pub async fn https_get(
         let want = (cl - total_body).min(tmp.len());
         let n = tls.read(&mut tmp[..want]).await?;
         if n == 0 {
-            bail!(
-                "connection closed mid-body on request {label}: got {total_body} of {cl} bytes"
-            );
+            bail!("connection closed mid-body on request {label}: got {total_body} of {cl} bytes");
         }
         total_body += n;
     }
@@ -144,9 +140,7 @@ pub fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn parse_content_length(headers: &str) -> Option<usize> {

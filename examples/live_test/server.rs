@@ -90,9 +90,8 @@ async fn handle_test_http_conn(mut sock: TcpStream) -> Result<()> {
             }
         };
 
-        let resp_header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: keep-alive\r\n\r\n"
-        );
+        let resp_header =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: keep-alive\r\n\r\n");
         sock.write_all(resp_header.as_bytes()).await?;
 
         // Body: just `n` 'A' bytes, written in chunks.

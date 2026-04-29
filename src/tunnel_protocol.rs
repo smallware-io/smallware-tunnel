@@ -79,11 +79,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Message;
 
+use procmachines::{ExchangeWriteError, IoExchange, IoSink, IoStream};
+use procmachines::{LockableIo, ProcMachine, ProcMachineJobs, TaskEnd, PROC_MACHINE_JOBS_BASE};
+
 use crate::alarm_clock::{AlarmClock, ClockAlarm};
-use crate::io_exchange::{ExchangeWriteError, IoExchange};
-use crate::io_sink::IoSink;
-use crate::io_stream::IoStream;
-use crate::proc_machines::*;
 use crate::watchable_value::{ValueWatch, WatchableValue};
 
 // ============================================================================
@@ -319,7 +318,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
         let is_ok = poll_fn(|cx| {
             if to_send.is_some() {
                 (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
-                match sink.poll_send(cx, &mut to_send) {
+                match sink.prod_poll_send(cx, &mut to_send) {
                     Poll::Ready(Ok(_)) => {}
                     Poll::Ready(Err(_)) => {
                         tracing::info!("Up stream aborting: Error sending");
@@ -381,7 +380,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             // If we don't have a status message to send, try to read app data
             if to_send.is_none() {
                 (&*read_alarm).set(read_timeout);
-                let data: Option<Bytes> = match io.up_in.poll_read(cx) {
+                let data: Option<Bytes> = match io.up_in.con_poll_read(cx) {
                     Poll::Ready(item) => {
                         // We successfully read data or EOF
                         // If we're in shutdown mode, extend the timeout
@@ -398,7 +397,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                     }
                     Poll::Pending => {
                         // No data available yet. Check if output is still valid before yielding.
-                        match sink.poll_send_ready(cx) {
+                        match sink.prod_poll_ready(cx) {
                             Poll::Ready(Err(_)) => {
                                 tracing::error!(
                                     "Up stream aborting: output channel closed while waiting"
@@ -432,7 +431,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             if to_send.is_some() {
                 cx.waker().wake_by_ref();
             } else if need_flush {
-                if sink.poll_flush(cx).is_ready() {
+                if sink.prod_poll_flush(cx).is_ready() {
                     need_flush = false;
                 }
             }
@@ -452,7 +451,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                 Some(io.now() + SEND_TIMEOUT)
             ));
             poll_fn(|cx| {
-                if sink.poll_flush(cx).is_ready() {
+                if sink.prod_poll_flush(cx).is_ready() {
                     Poll::Ready(())
                 } else {
                     flush_alarm.poll_ref(cx)
@@ -476,7 +475,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             Some(io.now() + SEND_TIMEOUT)
         ));
         poll_fn(|cx| {
-            if sink.poll_close(cx).is_ready() {
+            if sink.prod_poll_close(cx).is_ready() {
                 Poll::Ready(())
             } else {
                 flush_alarm.poll_ref(cx)
@@ -550,7 +549,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             if to_send.is_some() {
                 // We've got some data that we're trying to send
                 (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
-                match sink.poll_send(cx, &mut to_send) {
+                match sink.prod_poll_send(cx, &mut to_send) {
                     Poll::Pending => {
                         return Poll::Pending;
                     }
@@ -576,7 +575,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
 
             // Try to read a WebSocket message
             (*read_alarm).set(read_timeout);
-            let msg: Result<Option<Message>, ()> = match stream.poll_read(cx) {
+            let msg: Result<Option<Message>, ()> = match stream.con_poll_read(cx) {
                 Poll::Ready(msg) => Ok(msg),
                 Poll::Pending => {
                     if read_alarm.poll_ref(cx).is_ready() {
@@ -584,7 +583,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         return false.into();
                     }
                     if need_flush {
-                        if sink.poll_flush(cx).is_ready() {
+                        if sink.prod_poll_flush(cx).is_ready() {
                             need_flush = false;
                             cx.waker().wake_by_ref();
                         }
@@ -650,7 +649,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                     }
                 }
                 // Other message types (Ping, Pong, etc.) - ignore
-                _ => None
+                _ => None,
             };
 
             // If we're discarding (can't write to app), skip the write
@@ -672,7 +671,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             ClockAlarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
         let mut flush_timeout = pin!(flush_timeout);
         poll_fn(|cx| {
-            if sink.poll_close(cx).is_ready() {
+            if sink.prod_poll_close(cx).is_ready() {
                 return Poll::Ready(());
             }
             if flush_timeout.as_mut().poll(cx).is_ready() {
@@ -748,14 +747,14 @@ impl Sink<Bytes> for TunnelSink {
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let guard = self.inner.lock();
-        guard.up_in.poll_send_ready(cx)
+        guard.up_in.prod_poll_ready(cx)
     }
 
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
         let mut cx = Context::from_waker(noop_waker_ref());
         let guard = self.inner.lock();
         let mut to_send = Some(item);
-        match guard.up_in.poll_send(&mut cx, &mut to_send) {
+        match guard.up_in.prod_poll_send(&mut cx, &mut to_send) {
             Poll::Ready(res) => res,
             Poll::Pending => Err(ExchangeWriteError::InvalidState),
         }
@@ -763,12 +762,12 @@ impl Sink<Bytes> for TunnelSink {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let guard = self.inner.lock();
-        guard.up_in.poll_flush(cx)
+        guard.up_in.prod_poll_flush(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let guard = self.inner.lock();
-        guard.up_in.poll_close(cx)
+        guard.up_in.prod_poll_close(cx)
     }
 }
 
@@ -776,7 +775,7 @@ impl Drop for TunnelSink {
     fn drop(&mut self) {
         let guard = self.inner.lock();
         let mut cx = Context::from_waker(noop_waker_ref());
-        let _ = guard.up_in.poll_close(&mut cx);
+        let _ = guard.up_in.prod_poll_close(&mut cx);
     }
 }
 
@@ -808,7 +807,7 @@ impl Stream for TunnelStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let guard = self.inner.lock();
-        guard.down_out.poll_read(cx)
+        guard.down_out.con_poll_read(cx)
     }
 }
 
@@ -822,9 +821,7 @@ impl Drop for TunnelStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io_sink::IoSink;
-    use crate::io_stream::IoStream;
-    use crate::proc_machines::LockableIo;
+    use procmachines::{IoSink, IoStream, LockableIo};
     use coarsetime::Instant;
     use futures::task::noop_waker_ref;
 
@@ -841,25 +838,25 @@ mod tests {
     fn exchange_send<T: Send>(exch: &IoExchange<T>, item: T) -> bool {
         let mut cx = Context::from_waker(noop_waker_ref());
         let mut opt = Some(item);
-        matches!(exch.poll_send(&mut cx, &mut opt), Poll::Ready(Ok(())))
+        matches!(exch.prod_poll_send(&mut cx, &mut opt), Poll::Ready(Ok(())))
     }
 
     /// Reads an item from an IoExchange (reader/stream side).
     fn exchange_read<T: Send>(exch: &IoExchange<T>) -> Poll<Option<T>> {
         let mut cx = Context::from_waker(noop_waker_ref());
-        exch.poll_read(&mut cx)
+        exch.con_poll_read(&mut cx)
     }
 
     /// Initiates close on the writer side of an IoExchange.
     fn exchange_close<T: Send>(exch: &IoExchange<T>) -> Poll<Result<(), ExchangeWriteError>> {
         let mut cx = Context::from_waker(noop_waker_ref());
-        exch.poll_close(&mut cx)
+        exch.prod_poll_close(&mut cx)
     }
 
     /// Calls check_read on an IoExchange to acknowledge flush.
     fn exchange_check<T: Send>(exch: &IoExchange<T>) -> Poll<bool> {
         let mut cx = Context::from_waker(noop_waker_ref());
-        exch.check_read(&mut cx)
+        exch.con_check_read(&mut cx)
     }
 
     /// Drives the protocol by locking/unlocking (which triggers a tick).
@@ -1326,11 +1323,13 @@ mod tests {
     fn download_aborts_when_upload_fails() {
         let proto = make_proto();
 
-        // Make the upload task fail by closing up_out (the consumer side).
-        // The upload task will see poll_send_ready return Err and abort.
+        // Make the upload task fail by closing up_out (the consumer side)
+        // and feeding it some input data so it tries to write.
+        // The upload task will see prod_poll_send return Err and abort.
         {
             let guard = proto.lock();
             guard.server_links.up_out.drop_read();
+            assert!(exchange_send(&guard.up_in, Bytes::from("trigger")));
         }
 
         // Tick to let the upload task detect the error and set up_result=Some(false)

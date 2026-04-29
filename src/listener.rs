@@ -26,7 +26,7 @@
 
 use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
-use crate::proc_machines::LockableIo;
+use procmachines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
 use crate::tunnel_protocol::{
     create_tunnel_protocol, DownloadStatus, TunnelProtocol, TunnelSink, TunnelStream, UploadStatus,
