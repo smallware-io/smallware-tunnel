@@ -100,7 +100,11 @@ impl IoSink for WsServerLinks {
         Pin::new(sink).poll_ready(cx).map_err(|_| ())
     }
 
-    fn prod_poll_send(&self, cx: &mut Context<'_>, item: &mut Option<Message>) -> Poll<Result<(), ()>> {
+    fn prod_poll_send(
+        &self,
+        cx: &mut Context<'_>,
+        item: &mut Option<Message>,
+    ) -> Poll<Result<(), ()>> {
         if item.is_none() {
             return Poll::Ready(Ok(()));
         }

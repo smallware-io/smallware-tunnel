@@ -26,7 +26,6 @@
 
 use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
-use procmachines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
 use crate::tunnel_protocol::{
     create_tunnel_protocol, DownloadStatus, TunnelProtocol, TunnelSink, TunnelStream, UploadStatus,
@@ -38,6 +37,7 @@ use crate::{
 use bytes::Bytes;
 use derivative::Derivative;
 use futures::{SinkExt, StreamExt};
+use procmachines::LockableIo;
 use std::future::poll_fn;
 use std::net::IpAddr;
 use std::path::PathBuf;

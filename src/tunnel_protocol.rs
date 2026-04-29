@@ -396,16 +396,6 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         item
                     }
                     Poll::Pending => {
-                        // No data available yet. Check if output is still valid before yielding.
-                        match sink.prod_poll_ready(cx) {
-                            Poll::Ready(Err(_)) => {
-                                tracing::error!(
-                                    "Up stream aborting: output channel closed while waiting"
-                                );
-                                return false.into();
-                            }
-                            _ => (),
-                        };
                         if read_alarm.poll_ref(cx).is_ready() {
                             tracing::error!(
                                 "Up stream aborting.  Read timed out after down stream shut down"
@@ -821,9 +811,9 @@ impl Drop for TunnelStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use procmachines::{IoSink, IoStream, LockableIo};
     use coarsetime::Instant;
     use futures::task::noop_waker_ref;
+    use procmachines::{IoSink, IoStream, LockableIo};
 
     // -----------------------------------------------------------------------
     // Test helpers
