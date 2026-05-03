@@ -80,7 +80,9 @@ use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Message;
 
 use procmachines::{ExchangeWriteError, IoExchange, IoSink, IoStream};
-use procmachines::{LockableIo, ProcMachine, ProcMachineJobs, TaskEnd, PROC_MACHINE_JOBS_BASE};
+use procmachines::{
+    ProcMachine, ProcMachineHolder, ProcMachineJobs, TaskEnd, PROC_MACHINE_JOBS_BASE,
+};
 
 use crate::alarm_clock::{AlarmClock, ClockAlarm};
 use crate::watchable_value::{ValueWatch, WatchableValue};
@@ -126,8 +128,8 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 // ============================================================================
 
 pub trait ServerLinks: Send {
-    fn sink(&self) -> &(impl IoSink<Item = Message> + ?Sized);
-    fn stream(&self) -> &(impl IoStream<Message> + ?Sized);
+    fn sink(&self) -> &(impl IoSink<Message> + ?Sized);
+    fn stream(&self) -> &(impl IoStream<Item = Message> + ?Sized);
 }
 
 /// A [`ServerLinks`] implementation backed by [`IoExchange`] channels.
@@ -153,10 +155,10 @@ impl ExchangeServerLinks {
 }
 
 impl ServerLinks for ExchangeServerLinks {
-    fn sink(&self) -> &(impl IoSink<Item = Message> + ?Sized) {
+    fn sink(&self) -> &(impl IoSink<Message> + ?Sized) {
         &self.up_out
     }
-    fn stream(&self) -> &(impl IoStream<Message> + ?Sized) {
+    fn stream(&self) -> &(impl IoStream<Item = Message> + ?Sized) {
         &self.down_in
     }
 }
@@ -813,7 +815,7 @@ mod tests {
     use super::*;
     use coarsetime::Instant;
     use futures::task::noop_waker_ref;
-    use procmachines::{IoSink, IoStream, LockableIo};
+    use procmachines::{IoSink, IoStream, ProcMachineHolder};
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -841,12 +843,6 @@ mod tests {
     fn exchange_close<T: Send>(exch: &IoExchange<T>) -> Poll<Result<(), ExchangeWriteError>> {
         let mut cx = Context::from_waker(noop_waker_ref());
         exch.prod_poll_close(&mut cx)
-    }
-
-    /// Calls check_read on an IoExchange to acknowledge flush.
-    fn exchange_check<T: Send>(exch: &IoExchange<T>) -> Poll<bool> {
-        let mut cx = Context::from_waker(noop_waker_ref());
-        exch.con_check_read(&mut cx)
     }
 
     /// Drives the protocol by locking/unlocking (which triggers a tick).
@@ -955,11 +951,6 @@ mod tests {
         {
             let guard = proto.lock();
             let _ = exchange_close(&guard.up_in);
-        }
-        // May need check_read to complete the close handshake
-        {
-            let guard = proto.lock();
-            let _ = exchange_check(&guard.up_in);
         }
 
         // The upload task should send an empty Binary (EOF marker)
@@ -1485,6 +1476,6 @@ mod tests {
     fn protocol_is_not_immediately_done() {
         let proto = make_proto();
         // Both tasks should be alive initially
-        assert!(!proto.is_done());
+        assert!(!proto.get_pin().is_done());
     }
 }

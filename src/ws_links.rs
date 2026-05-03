@@ -79,17 +79,16 @@ impl fmt::Debug for WsServerLinks {
 unsafe impl Send for WsServerLinks {}
 
 impl ServerLinks for WsServerLinks {
-    fn sink(&self) -> &(impl IoSink<Item = Message> + ?Sized) {
+    fn sink(&self) -> &(impl IoSink<Message> + ?Sized) {
         self
     }
-    fn stream(&self) -> &(impl IoStream<Message> + ?Sized) {
+    fn stream(&self) -> &(impl IoStream<Item = Message> + ?Sized) {
         self
     }
 }
 
-impl IoSink for WsServerLinks {
+impl IoSink<Message> for WsServerLinks {
     type Error = ();
-    type Item = Message;
 
     fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let mut sink = self.sink.borrow_mut();
@@ -168,29 +167,8 @@ impl IoSink for WsServerLinks {
     }
 }
 
-impl IoStream<Message> for WsServerLinks {
-    fn con_check_read(&self, cx: &mut Context<'_>) -> Poll<bool> {
-        if self.buffered.borrow().is_some() {
-            return Poll::Ready(true);
-        }
-        let mut stream_ref = self.stream.borrow_mut();
-        let result = match stream_ref.as_mut() {
-            None => return Poll::Ready(false),
-            Some(stream) => Pin::new(stream).poll_next(cx),
-        };
-        match result {
-            Poll::Ready(Some(Ok(msg))) => {
-                *self.buffered.borrow_mut() = Some(msg);
-                Poll::Ready(true)
-            }
-            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                *stream_ref = None;
-                Poll::Ready(false)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
+impl IoStream for WsServerLinks {
+    type Item = Message;
     fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Message>> {
         if let Some(msg) = self.buffered.borrow_mut().take() {
             return Poll::Ready(Some(msg));
