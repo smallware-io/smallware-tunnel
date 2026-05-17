@@ -26,7 +26,6 @@
 
 use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
-use crate::proc_machines::LockableIo;
 use crate::trace_id::{next_trace_id, TraceId};
 use crate::tunnel_protocol::{
     create_tunnel_protocol, DownloadStatus, TunnelProtocol, TunnelSink, TunnelStream, UploadStatus,
@@ -38,6 +37,7 @@ use crate::{
 use bytes::Bytes;
 use derivative::Derivative;
 use futures::{SinkExt, StreamExt};
+use procmachines::ProcMachineHolder;
 use std::future::poll_fn;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -659,7 +659,7 @@ impl TunnelListener {
         // TODO signal shutdown
         poll_fn(|cx| {
             // Process external wakes (ticks the protocol internally)
-            let _ = protocol.poll_external(cx);
+            let _ = protocol.get_pin().poll_external(cx);
 
             // Advance clock
             {
@@ -667,7 +667,7 @@ impl TunnelListener {
                 g.clock.advance(coarsetime::Instant::now());
             }
             // Check if all protocol tasks have completed
-            if protocol.is_done() {
+            if protocol.get_pin().is_done() {
                 return Poll::Ready(());
             }
 

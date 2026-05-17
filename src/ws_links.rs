@@ -9,8 +9,8 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::io_sink::IoSink;
-use crate::io_stream::IoStream;
+use procmachines::{IoError, IoSink, IoStream};
+
 use crate::tunnel_protocol::ServerLinks;
 use crate::{StatCounter, STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP};
 
@@ -79,19 +79,18 @@ impl fmt::Debug for WsServerLinks {
 unsafe impl Send for WsServerLinks {}
 
 impl ServerLinks for WsServerLinks {
-    fn sink(&self) -> &(impl IoSink<Item = Message> + ?Sized) {
+    fn sink(&self) -> &(impl IoSink<Message> + ?Sized) {
         self
     }
-    fn stream(&self) -> &(impl IoStream<Message> + ?Sized) {
+    fn stream(&self) -> &(impl IoStream<Item = Message> + ?Sized) {
         self
     }
 }
 
-impl IoSink for WsServerLinks {
+impl IoSink<Message> for WsServerLinks {
     type Error = ();
-    type Item = Message;
 
-    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+    fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let mut sink = self.sink.borrow_mut();
         let Some(sink) = sink.as_mut() else {
             tracing::error!("Websocket check write after done");
@@ -100,7 +99,11 @@ impl IoSink for WsServerLinks {
         Pin::new(sink).poll_ready(cx).map_err(|_| ())
     }
 
-    fn poll_send(&self, cx: &mut Context<'_>, item: &mut Option<Message>) -> Poll<Result<(), ()>> {
+    fn prod_poll_send(
+        &self,
+        cx: &mut Context<'_>,
+        item: &mut Option<Message>,
+    ) -> Poll<Result<(), ()>> {
         if item.is_none() {
             return Poll::Ready(Ok(()));
         }
@@ -136,7 +139,7 @@ impl IoSink for WsServerLinks {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let mut sink = self.sink.borrow_mut();
         let Some(sink) = sink.as_mut() else {
             return Poll::Ready(Ok(()));
@@ -148,7 +151,7 @@ impl IoSink for WsServerLinks {
         ret
     }
 
-    fn poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let mut sink_ref = self.sink.borrow_mut();
         let Some(sink) = sink_ref.as_mut() else {
             return Poll::Ready(Ok(()));
@@ -164,36 +167,17 @@ impl IoSink for WsServerLinks {
     }
 }
 
-impl IoStream<Message> for WsServerLinks {
-    fn check_read(&self, cx: &mut Context<'_>) -> Poll<bool> {
-        if self.buffered.borrow().is_some() {
-            return Poll::Ready(true);
-        }
-        let mut stream_ref = self.stream.borrow_mut();
-        let result = match stream_ref.as_mut() {
-            None => return Poll::Ready(false),
-            Some(stream) => Pin::new(stream).poll_next(cx),
-        };
-        match result {
-            Poll::Ready(Some(Ok(msg))) => {
-                *self.buffered.borrow_mut() = Some(msg);
-                Poll::Ready(true)
-            }
-            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                *stream_ref = None;
-                Poll::Ready(false)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
+impl IoStream for WsServerLinks {
+    type Item = Message;
+    type Error = IoError;
 
-    fn poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Message>> {
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Message>, IoError>> {
         if let Some(msg) = self.buffered.borrow_mut().take() {
-            return Poll::Ready(Some(msg));
+            return Poll::Ready(Ok(Some(msg)));
         }
         let mut stream_ref = self.stream.borrow_mut();
         let result = match stream_ref.as_mut() {
-            None => return Poll::Ready(None),
+            None => return Poll::Ready(Ok(None)),
             Some(stream) => Pin::new(stream).poll_next(cx),
         };
         match result {
@@ -211,17 +195,17 @@ impl IoStream<Message> for WsServerLinks {
                     }
                     _ => {}
                 }
-                Poll::Ready(Some(msg))
+                Poll::Ready(Ok(Some(msg)))
             }
             Poll::Ready(None) => {
                 *stream_ref = None;
                 tracing::debug!("WS DOWN CLOSE");
-                Poll::Ready(None)
+                Poll::Ready(Ok(None))
             }
             Poll::Ready(Some(Err(_))) => {
                 *stream_ref = None;
                 tracing::error!("Websocket read error");
-                Poll::Ready(None)
+                Poll::Ready(Ok(None))
             }
             Poll::Pending => Poll::Pending,
         }

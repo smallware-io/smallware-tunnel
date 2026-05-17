@@ -21,53 +21,38 @@ name = "smallware-tunnel"
 path = "src/bin/main.rs"
 
 [dependencies]
-# Async runtime
-tokio = { version = "1.41", features = ["full"] }
+anyhow = "1.0"
+base64 = "0.22"
+bytemuck = {version ="1.25.0", features = ["derive", "extern_crate_alloc"]}
+bytes = "1.5"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+coarsetime = "0.1.37"
 derivative = "2.2.0"
-
-# WebSocket client
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
-
-# TLS support for custom CA certificates
-rustls = {version = "0.23", features=["ring"]}
-tokio-rustls = "0.26"
-rustls-pemfile = "2"
-webpki-roots = "0.26"
-
-# HTTP types
-http = "1.1"
-
-# Async utilities
+flume = "0.11"
 futures = { version = "0.3", features = ["bilock", "unstable"] }
 futures-util = "0.3"
-bytes = "1.5"
-flume = "0.11"
-pin-project-lite = "0.2"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Error handling
-anyhow = "1.0"
-thiserror = "1.0"
-
-# CLI argument parsing
-clap = { version = "4.5", features = ["derive", "env"] }
-
-# JWT generation
+http = "1.1"
 jsonwebtoken = "9.3"
-base64 = "0.22"
-
-# Serialization
+parking_lot = "0.12.5"
+pin-project-lite = "0.2"
+procmachines = { git = "https://github.com/smallware-io/procmachines" }
+rustls = {version = "0.23", features=["ring"]}
+rustls-pemfile = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Date/time
-chrono = "0.4"
-coarsetime = "0.1.37"
-bytemuck = {version ="1.25.0", features = ["derive", "extern_crate_alloc"]}
-parking_lot = "0.12.5"
+thiserror = "1.0"
+tokio = { version = "1.41", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webpki-roots = "0.26"
 
 [dev-dependencies]
 tokio-test = "0.4"
+rand = "0.8"
+
+[[example]]
+name = "live_test"
+path = "examples/live_test/main.rs"
