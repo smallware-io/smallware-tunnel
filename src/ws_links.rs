@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use procmachines::{IoSink, IoStream};
+use procmachines::{IoError, IoSink, IoStream};
 
 use crate::tunnel_protocol::ServerLinks;
 use crate::{StatCounter, STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP};
@@ -169,13 +169,15 @@ impl IoSink<Message> for WsServerLinks {
 
 impl IoStream for WsServerLinks {
     type Item = Message;
-    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Message>> {
+    type Error = IoError;
+
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Message>, IoError>> {
         if let Some(msg) = self.buffered.borrow_mut().take() {
-            return Poll::Ready(Some(msg));
+            return Poll::Ready(Ok(Some(msg)));
         }
         let mut stream_ref = self.stream.borrow_mut();
         let result = match stream_ref.as_mut() {
-            None => return Poll::Ready(None),
+            None => return Poll::Ready(Ok(None)),
             Some(stream) => Pin::new(stream).poll_next(cx),
         };
         match result {
@@ -193,17 +195,17 @@ impl IoStream for WsServerLinks {
                     }
                     _ => {}
                 }
-                Poll::Ready(Some(msg))
+                Poll::Ready(Ok(Some(msg)))
             }
             Poll::Ready(None) => {
                 *stream_ref = None;
                 tracing::debug!("WS DOWN CLOSE");
-                Poll::Ready(None)
+                Poll::Ready(Ok(None))
             }
             Poll::Ready(Some(Err(_))) => {
                 *stream_ref = None;
                 tracing::error!("Websocket read error");
-                Poll::Ready(None)
+                Poll::Ready(Ok(None))
             }
             Poll::Pending => Poll::Pending,
         }
