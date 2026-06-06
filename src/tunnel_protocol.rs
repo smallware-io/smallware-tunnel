@@ -70,23 +70,25 @@
 
 use bytes::Bytes;
 use coarsetime::{Duration, Instant};
-use futures::task::noop_waker_ref;
+use futures::future::BoxFuture;
 use futures::{future::poll_fn, Future};
-use futures::{Sink, Stream};
+use parking_lot::{Mutex, RawMutex};
+use std::cell::Cell;
 use std::fmt::Debug;
+use std::net::IpAddr;
 use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Message;
 
 use procmachines::{
-    ConnectableIoReader, ConnectableIoWriter, IoBytesExchange, IoError, IoExchange, IoReader, IoSink, IoStream, IoWriter
+    AlarmClock, ClockAlarm, IoError, IoPort, IoReader, IoSink, IoStream, IoWriter,
+    ProcMachineFutures, ProcMachineImpl, RefLockable,
 };
-use procmachines::{
-    ProcMachine, ProcMachineHolder, ProcMachineJobs, TaskEnd, PROC_MACHINE_JOBS_BASE,
-};
+use procmachines::{ProcMachine, ProcMachineJobs, TaskEnd, PROC_MACHINE_BUILDER};
 
-use crate::alarm_clock::{AlarmClock, ClockAlarm};
+use crate::error::TunnelError;
+use crate::trace_id::TraceId;
 use crate::watchable_value::{ValueWatch, WatchableValue};
 
 // ============================================================================
@@ -129,45 +131,10 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 // the upload and download tasks.
 // ============================================================================
 
-pub trait ServerLinks: Send {
+pub(crate) trait ServerLinks: Send {
     fn sink(&self) -> &(impl IoSink<Message> + ?Sized);
     fn stream(&self) -> &(impl IoStream<Item = Message> + ?Sized);
 }
-
-/// A [`ServerLinks`] implementation backed by [`IoExchange`] channels.
-///
-/// This is the default used by [`create_tunnel_protocol`] and the listener.
-/// External code writes incoming WebSocket messages into `down_in` and reads
-/// outgoing WebSocket messages from `up_out`.
-#[derive(Debug)]
-pub struct ExchangeServerLinks {
-    /// WebSocket messages coming in (external → download task).
-    pub down_in: IoExchange<Message>,
-    /// WebSocket messages going out (upload task → external).
-    pub up_out: IoExchange<Message>,
-}
-
-impl ExchangeServerLinks {
-    pub fn new() -> Self {
-        Self {
-            down_in: IoExchange::new(),
-            up_out: IoExchange::new(),
-        }
-    }
-}
-
-impl ServerLinks for ExchangeServerLinks {
-    fn sink(&self) -> &(impl IoSink<Message> + ?Sized) {
-        &self.up_out
-    }
-    fn stream(&self) -> &(impl IoStream<Item = Message> + ?Sized) {
-        &self.down_in
-    }
-}
-
-/// The default [`ServerLinks`] implementation used by [`TunnelSink`] and
-/// [`TunnelStream`].
-pub type StandardServerLinks = crate::ws_links::WsServerLinks;
 
 /// Shared I/O state for the tunnel protocol.
 ///
@@ -189,10 +156,13 @@ pub type StandardServerLinks = crate::ws_links::WsServerLinks;
 /// | up_out    | Upload task          | External (to WS)     |
 /// | down_in   | External (from WS)   | Download task        |
 /// | down_out  | Download task        | External (to app)    |
-pub struct TunnelIO<SLINKS: ServerLinks> {
+pub(crate) struct TunnelIO<SLINKS: ServerLinks> {
     /// Current timestamp as ticks (for timeout checking).
     /// Updated by external code via `update_clock()`.
-    pub clock: AlarmClock<Instant>,
+    pub clock: AlarmClock<RawMutex, Instant>,
+
+    /// Information about the connected client
+    pub client_info: TunnelClientInfo,
 
     /// Server-side links (WebSocket sink and stream).
     pub server_links: SLINKS,
@@ -200,11 +170,13 @@ pub struct TunnelIO<SLINKS: ServerLinks> {
     /// Application data going out (download task → external).
     /// Download task writes Bytes extracted from Messages here.
     /// Connected externally to an [`IoWriter`] (e.g. an [`IoBytesExchange`]).
-    pub down_out: ConnectableIoWriter<Arc<dyn IoWriter<Error = IoError> + Send + Sync>>,
+    pub down_out: IoPort<Arc<Mutex<dyn IoWriter<Error = IoError> + Send>>>,
 
     /// Application data coming in (external → upload task).
     /// Connected externally to an [`IoReader`] (e.g. an [`IoBytesExchange`]).
-    pub up_in: ConnectableIoReader<Arc<dyn IoReader<Error = IoError> + Send + Sync>>,
+    pub up_in: IoPort<Arc<Mutex<dyn IoReader<Error = IoError> + Send>>>,
+    pub bytes_uploaded: Cell<u64>,
+    pub bytes_downloaded: Cell<u64>,
 
     /// Status of the download process
     pub down_status: WatchableValue<DownloadStatus>,
@@ -226,12 +198,15 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
     /// Creates a new TunnelIO with the given initial timestamp.
     ///
     /// All channels start in the `Waiting` state (ready to receive).
-    pub fn new(now: Instant, server_links: SLINKS) -> Self {
+    pub fn new(now: Instant, server_links: SLINKS, client_info: TunnelClientInfo) -> Self {
         Self {
             clock: AlarmClock::new(now),
             server_links,
-            down_out: ConnectableIoWriter::new(),
-            up_in: ConnectableIoReader::new(),
+            client_info,
+            down_out: IoPort::new(),
+            up_in: IoPort::new(),
+            bytes_downloaded: Cell::new(0),
+            bytes_uploaded: Cell::new(0),
             up_status: WatchableValue::new(UploadStatus::Active),
             down_status: WatchableValue::new(DownloadStatus::Active),
         }
@@ -244,18 +219,6 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
         self.clock.get()
     }
 
-    /// Update the clock and check for expired timeouts.
-    ///
-    /// This should be called at the start of each `tick()` with the current time.
-    /// If any channel has a timeout that has expired, it will be failed.
-    ///
-    /// # Arguments
-    ///
-    /// * `now` - The current timestamp
-    pub fn update_clock(&self, now: Instant) {
-        self.clock.advance(now);
-    }
-
     /// Returns a pinned reference to the internal [`AlarmClock`].
     ///
     /// Used by protocol tasks to create [`ClockAlarm`] futures for timeouts.
@@ -264,7 +227,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
     ///
     /// This is safe because `TunnelIO` is stored inside a `ProcMachine` which
     /// keeps it at a stable address (behind an `Arc`-held mutex).
-    pub fn pin_clock<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a AlarmClock<Instant>> {
+    pub fn pin_clock<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a AlarmClock<RawMutex, Instant>> {
         unsafe { Pin::new_unchecked(&self.clock) }
     }
     pub fn pin_up_status<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a WatchableValue<UploadStatus>> {
@@ -276,14 +239,14 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum UploadStatus {
+pub(crate) enum UploadStatus {
     Active,
     Done,
     Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DownloadStatus {
+pub(crate) enum DownloadStatus {
     Active,
     Discarding,
     Done,
@@ -291,6 +254,12 @@ pub enum DownloadStatus {
 }
 
 impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
+    fn get_stats(&self) -> TunnelConnectionStats {
+        TunnelConnectionStats {
+            bytes_downloaded: self.bytes_downloaded.get(),
+            bytes_uploaded: self.bytes_uploaded.get(),
+        }
+    }
     // ========================================================================
     // UPLOAD PROCESS
     // ========================================================================
@@ -338,7 +307,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         return false.into();
                     }
                     Poll::Pending => {
-                        if send_alarm.poll_ref(cx).is_ready() {
+                        if send_alarm.alarm_poll(cx).is_ready() {
                             return Poll::Ready(false);
                         }
                         return Poll::Pending;
@@ -390,14 +359,14 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                 }
             }
 
-            (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
+            (*send_alarm).set_alarm(Some(io.now() + SEND_TIMEOUT));
             if to_send.is_some() {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
 
             // We don't have a status message to send, so try to read app data
-            (&*read_alarm).set(read_timeout);
+            (*read_alarm).set_alarm(read_timeout);
             let data: Option<Bytes> = match io.up_in.con_poll_read(cx, 65536) {
                 Poll::Ready(Ok(item)) => {
                     // We successfully read data or EOF
@@ -407,13 +376,13 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
                     }
                     if item.is_none() {
-                    // EOF from app - send EOF to WebSocket
-                    if read_timeout.is_some() {
-                        read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
+                        // EOF from app - send EOF to WebSocket
+                        if read_timeout.is_some() {
+                            read_timeout = Some(io.now() + SHUTDOWN_READ_TIMEOUT);
+                        }
+                        got_eof = true;
+                        to_send = Some(Message::Binary(Bytes::new()));
                     }
-                    got_eof = true;
-                    to_send = Some(Message::Binary(Bytes::new()));
-                }
                     item
                 }
                 Poll::Ready(Err(_)) => {
@@ -421,7 +390,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                     return false.into();
                 }
                 Poll::Pending => {
-                    if read_alarm.poll_ref(cx).is_ready() {
+                    if read_alarm.alarm_poll(cx).is_ready() {
                         tracing::error!(
                             "Up stream aborting.  Read timed out after down stream shut down"
                         );
@@ -444,10 +413,8 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             }
             if to_send.is_some() {
                 cx.waker().wake_by_ref();
-            } else if need_flush {
-                if sink.prod_poll_flush(cx).is_ready() {
-                    need_flush = false;
-                }
+            } else if need_flush && sink.prod_poll_flush(cx).is_ready() {
+                need_flush = false;
             }
             Poll::Pending
         })
@@ -468,7 +435,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                 if sink.prod_poll_flush(cx).is_ready() {
                     Poll::Ready(())
                 } else {
-                    flush_alarm.poll_ref(cx)
+                    flush_alarm.alarm_poll(cx)
                 }
             })
             .await;
@@ -492,7 +459,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             if sink.prod_poll_close(cx).is_ready() {
                 Poll::Ready(())
             } else {
-                flush_alarm.poll_ref(cx)
+                flush_alarm.alarm_poll(cx)
             }
         })
         .await;
@@ -564,7 +531,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                 // We've got some data that we're trying to send
                 match writer.prod_poll_write(cx, &mut send_bytes) {
                     Poll::Pending => {
-                        if send_alarm.poll_ref(cx).is_ready() {
+                        if send_alarm.alarm_poll(cx).is_ready() {
                             tracing::info!("Down stream discarding due to send timeout");
                             down_discarding = true;
                             io.down_status.set(DownloadStatus::Discarding);
@@ -584,7 +551,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         if send_bytes.is_empty() {
                             need_flush = true;
                         } else {
-                            (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
+                            (*send_alarm).set_alarm(Some(io.now() + SEND_TIMEOUT));
                             cx.waker().wake_by_ref();
                             return Poll::Pending;
                         }
@@ -597,7 +564,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
             }
 
             // Try to read a WebSocket message
-            (*read_alarm).set(read_timeout);
+            (*read_alarm).set_alarm(read_timeout);
             let msg: Result<Option<Message>, ()> = match stream.con_poll_read(cx) {
                 Poll::Ready(Ok(msg)) => Ok(msg),
                 Poll::Ready(Err(_)) => {
@@ -605,15 +572,13 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                     return false.into();
                 }
                 Poll::Pending => {
-                    if read_alarm.poll_ref(cx).is_ready() {
+                    if read_alarm.alarm_poll(cx).is_ready() {
                         tracing::info!("Down stream aborted: read error");
                         return false.into();
                     }
-                    if need_flush {
-                        if writer.prod_poll_flush(cx).is_ready() {
-                            need_flush = false;
-                            cx.waker().wake_by_ref();
-                        }
+                    if need_flush && writer.prod_poll_flush(cx).is_ready() {
+                        need_flush = false;
+                        cx.waker().wake_by_ref();
                     }
                     return Poll::Pending;
                 }
@@ -673,11 +638,11 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                     }
                 }
                 // Other message types (Ping, Pong, etc.) - ignore
-                _ => {},
+                _ => {}
             };
 
             // Since we processed a message, loop around to the next iteration to send it or get more
-            (*send_alarm).set(Some(io.now() + SEND_TIMEOUT));
+            (*send_alarm).set_alarm(Some(io.now() + SEND_TIMEOUT));
             cx.waker().wake_by_ref();
             Poll::Pending
         })
@@ -688,7 +653,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
         }
 
         // Wait for any pending output to be consumed by the app
-        let flush_timeout: ClockAlarm<Instant> =
+        let flush_timeout: ClockAlarm<RawMutex, Instant> =
             ClockAlarm::new(io.pin_clock(), Some(io.now() + SEND_TIMEOUT));
         let mut flush_timeout = pin!(flush_timeout);
         poll_fn(|cx| {
@@ -715,13 +680,49 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
 // PUBLIC API
 // ============================================================================
 
-/// Handle to a running tunnel protocol instance.
-///
-/// The protocol runs as two cooperative tasks inside a [`ProcMachine`]:
-/// upload (`up_connected`) and download (`down_connected`). External code
-/// drives the machine by calling [`.lock()`](LockableIo::lock) to access
-/// the [`TunnelIO`] channels, then dropping the guard to let the tasks tick.
-pub type TunnelProtocol<SLINKS> = Arc<dyn ProcMachine<TunnelIO<SLINKS>>>;
+/// Information about a remote connected client
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct TunnelClientInfo {
+    pub ip_addr: Option<IpAddr>,
+    pub connection_id: TraceId,
+}
+
+/// Statistics from a completed tunnel forwarding session.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct TunnelConnectionStats {
+    /// Bytes received from the tunnel and sent to the local service
+    pub bytes_downloaded: u64,
+    /// Bytes received from the local service and sent to the tunnel
+    pub bytes_uploaded: u64,
+}
+
+/// A connection to a tunnel client.  When a caller receives one of these, it
+/// is in a state that is waiting for I/O to be connected to the input and output
+/// ports.  The caller MUST connect I/O, or the protocol will not finish until
+/// it times out.
+pub trait TunnelConnection: Send + Sync {
+    fn client_info(&self) -> &TunnelClientInfo;
+
+    /// Connect the protocol's I/O channels to the given reader and writer.
+    fn connect_io(
+        &self,
+        download: Arc<Mutex<dyn IoWriter<Error = IoError> + Send>>,
+        upload: Arc<Mutex<dyn IoReader<Error = IoError> + Send>>,
+    ) -> Result<(), TunnelError>;
+    fn get_stats(&self) -> TunnelConnectionStats;
+    fn join(self: Arc<Self>) -> BoxFuture<'static, TunnelConnectionStats>;
+}
+
+pub(crate) trait TunnelConnectionImpl<SLINKS: ServerLinks + Debug + 'static>:
+    TunnelConnection
+{
+    fn as_arc_connection(self: Arc<Self>) -> Arc<dyn TunnelConnection>;
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<()>;
+    fn can_recycle(&self) -> bool;
+    fn get_io(&self) -> &TunnelIO<SLINKS>;
+}
 
 /// Creates a new tunnel protocol instance and starts its internal tasks.
 ///
@@ -733,189 +734,155 @@ pub type TunnelProtocol<SLINKS> = Arc<dyn ProcMachine<TunnelIO<SLINKS>>>;
 ///
 /// * `now` — the current timestamp, used to seed the internal [`AlarmClock`].
 /// * `server_links` — the server-side sink and stream implementation.
-pub fn create_tunnel_protocol<SLINKS: ServerLinks + Debug + 'static>(
+pub(crate) fn create_tunnel_protocol<SLINKS: ServerLinks + Debug + 'static>(
     now: Instant,
     server_links: SLINKS,
-) -> TunnelProtocol<SLINKS> {
-    PROC_MACHINE_JOBS_BASE
+    client_info: TunnelClientInfo,
+) -> Arc<dyn TunnelConnectionImpl<SLINKS>> {
+    let conn: Arc<ProcMachineImpl<RawMutex, TunnelIO<SLINKS>, _>> = PROC_MACHINE_BUILDER
         .with(TunnelIO::<SLINKS>::up_connected)
         .with(TunnelIO::<SLINKS>::down_connected)
-        .build(TunnelIO::new(now, server_links))
+        .build_std(TunnelIO::new(now, server_links, client_info));
+    conn
 }
 
-/// A [`futures::Sink`] adapter for writing application data into the tunnel.
-///
-/// Owns an [`IoBytesExchange`] connected to the protocol's `up_in` so that
-/// the upload task picks bytes up, wraps them in `Message::Binary`, and
-/// delivers them to the WebSocket.
-///
-/// Dropping the sink closes the exchange, which causes the upload task to
-/// send an EOF (`Message::Binary(empty)`) to the WebSocket.
-#[derive(Debug)]
-pub struct TunnelSink {
-    inner: TunnelProtocol<StandardServerLinks>,
-    exchange: Arc<IoBytesExchange>,
-    pending: Bytes,
+async fn do_join<SLINKS, F>(
+    pm: Arc<ProcMachineImpl<RawMutex, TunnelIO<SLINKS>, F>>,
+) -> TunnelConnectionStats
+where
+    SLINKS: ServerLinks + Debug + 'static,
+    F: ProcMachineFutures + 'static,
+{
+    let (p_down_stat, p_up_stat) = {
+        let pd: *const WatchableValue<DownloadStatus> = &pm.get_io().down_status;
+        let pu: *const WatchableValue<UploadStatus> = &pm.get_io().up_status;
+        (pd, pu)
+    };
+    let down_status_watch = pin!(ValueWatch::new(unsafe {
+        Pin::new_unchecked(&*p_down_stat)
+    }));
+    let up_status_watch = pin!(ValueWatch::new(unsafe { Pin::new_unchecked(&*p_up_stat) }));
+    poll_fn(|cx| match down_status_watch.poll_ref(cx) {
+        Poll::Ready(DownloadStatus::Done)
+        | Poll::Ready(DownloadStatus::Discarding)
+        | Poll::Ready(DownloadStatus::Failed) => Poll::Ready(()),
+        _ => Poll::Pending,
+    })
+    .await;
+    poll_fn(|cx| match up_status_watch.poll_ref(cx) {
+        Poll::Ready(UploadStatus::Done) | Poll::Ready(UploadStatus::Failed) => Poll::Ready(()),
+        _ => Poll::Pending,
+    })
+    .await;
+    pm.get_io().get_stats()
 }
 
-impl TunnelSink {
-    /// Creates a new sink backed by the given protocol instance.
-    ///
-    /// Allocates a fresh [`IoBytesExchange`] and connects it to the protocol's
-    /// `up_in` reader so the upload task can consume the bytes written here.
-    pub fn new(proto: TunnelProtocol<StandardServerLinks>) -> Self {
-        let exchange = Arc::new(IoBytesExchange::new());
+impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static> TunnelConnection
+    for ProcMachineImpl<RawMutex, TunnelIO<SLINKS>, F>
+{
+    fn client_info(&self) -> &TunnelClientInfo {
+        let ptr: *const TunnelClientInfo = &self.lock_ref().client_info;
+        // SAFETY: All instances of Self are held by an Arc and never moved, so the address of client_info is stable.
+        unsafe { &*ptr }
+    }
+
+    fn connect_io(
+        &self,
+        download: Arc<Mutex<dyn IoWriter<Error = IoError> + Send>>,
+        upload: Arc<Mutex<dyn IoReader<Error = IoError> + Send>>,
+    ) -> Result<(), TunnelError> {
+        let mut guard = self.lock_ref();
+        guard
+            .down_out
+            .connect(download)
+            .map_err(|()| TunnelError::InvalidState)?;
+        guard
+            .up_in
+            .connect(upload)
+            .map_err(|()| TunnelError::InvalidState)?;
+        Ok(())
+    }
+
+    fn get_stats(&self) -> TunnelConnectionStats {
+        let guard = self.lock_ref();
+        guard.get_stats()
+    }
+
+    fn join(self: Arc<Self>) -> BoxFuture<'static, TunnelConnectionStats> {
+        // SAFETY: All instances of Self are held by an Arc and never moved, so the address of client_info is stable.
+        let a = self.clone();
+        Box::pin(do_join(a))
+    }
+}
+
+impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static>
+    TunnelConnectionImpl<SLINKS> for ProcMachineImpl<RawMutex, TunnelIO<SLINKS>, F>
+{
+    fn as_arc_connection(self: Arc<Self>) -> Arc<dyn TunnelConnection> {
+        self
+    }
+
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
         {
-            let mut guard = proto.lock();
-            guard.up_in.connect(exchange.clone());
+            let g = self.lock_ref();
+            g.clock.advance(coarsetime::Instant::now());
         }
-        Self {
-            inner: proto,
-            exchange,
-            pending: Bytes::new(),
-        }
-    }
-}
-
-impl Sink<Bytes> for TunnelSink {
-    type Error = IoError;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = self.get_mut();
-        let _guard = this.inner.lock();
-        if this.pending.is_empty() {
-            return Poll::Ready(Ok(()));
-        }
-        match this.exchange.prod_poll_write(cx, &mut this.pending) {
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            _ => {
-                if this.pending.is_empty() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
+        self.external_poll(cx)
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        let this = self.get_mut();
-        let _guard = this.inner.lock();
-        let mut data = item;
-        let mut cx = Context::from_waker(noop_waker_ref());
-        let res = this.exchange.prod_poll_write(&mut cx, &mut data);
-        if !data.is_empty() {
-            // Slot was occupied; buffer locally and let poll_ready/poll_flush
-            // drain on a subsequent call.
-            this.pending = data;
-        }
-        match res {
-            Poll::Ready(Err(e)) => Err(e),
-            _ => Ok(()),
-        }
+    fn can_recycle(&self) -> bool {
+        let g = self.lock_ref();
+        g.up_status.get() == UploadStatus::Done && g.down_status.get() == DownloadStatus::Done
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = self.get_mut();
-        let _guard = this.inner.lock();
-        if !this.pending.is_empty() {
-            match this.exchange.prod_poll_write(cx, &mut this.pending) {
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                _ => {}
-            }
-            if !this.pending.is_empty() {
-                return Poll::Pending;
-            }
-        }
-        this.exchange.prod_poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = self.get_mut();
-        let _guard = this.inner.lock();
-        if !this.pending.is_empty() {
-            match this.exchange.prod_poll_write(cx, &mut this.pending) {
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                _ => {}
-            }
-            if !this.pending.is_empty() {
-                return Poll::Pending;
-            }
-        }
-        this.exchange.prod_poll_close(cx)
-    }
-}
-
-impl Drop for TunnelSink {
-    fn drop(&mut self) {
-        let _guard = self.inner.lock();
-        let mut cx = Context::from_waker(noop_waker_ref());
-        let _ = self.exchange.prod_poll_close(&mut cx);
-    }
-}
-
-/// A [`futures::Stream`] adapter for reading application data from the tunnel.
-///
-/// Owns an [`IoBytesExchange`] connected to the protocol's `down_out` writer
-/// so that the download task can place bytes extracted from incoming
-/// WebSocket `Message::Binary` frames into the exchange.
-///
-/// The stream yields `None` when the download task closes the exchange
-/// (either because it received an EOF or a `DROP:` message from the server).
-///
-/// Dropping the stream calls [`IoReader::drop_read`] on the exchange,
-/// which causes the download task to enter discarding mode.
-#[derive(Debug)]
-pub struct TunnelStream {
-    inner: TunnelProtocol<StandardServerLinks>,
-    exchange: Arc<IoBytesExchange>,
-}
-
-impl TunnelStream {
-    /// Creates a new stream backed by the given protocol instance.
-    ///
-    /// Allocates a fresh [`IoBytesExchange`] and connects it to the protocol's
-    /// `down_out` writer so the download task can deliver bytes here.
-    pub fn new(proto: TunnelProtocol<StandardServerLinks>) -> Self {
-        let exchange = Arc::new(IoBytesExchange::new());
-        {
-            let mut guard = proto.lock();
-            guard.down_out.connect(exchange.clone());
-        }
-        Self {
-            inner: proto,
-            exchange,
-        }
-    }
-}
-
-impl Stream for TunnelStream {
-    type Item = Bytes;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let _guard = self.inner.lock();
-        match self.exchange.con_poll_read(cx, usize::MAX) {
-            Poll::Ready(Ok(opt)) => Poll::Ready(opt),
-            Poll::Pending => Poll::Pending,
-            // ConnectableIoReader<Arc<IoBytesExchange>>::Error is Infallible.
-            Poll::Ready(Err(_)) => unreachable!(),
-        }
-    }
-}
-
-impl Drop for TunnelStream {
-    fn drop(&mut self) {
-        let _guard = self.inner.lock();
-        IoReader::drop_read(&*self.exchange);
+    fn get_io(&self) -> &TunnelIO<SLINKS> {
+        let g = self.lock_ref();
+        let ptr: *const TunnelIO<SLINKS> = &*g;
+        // SAFETY: The ProcMachine guarantees that the TunnelIO is at a stable address and that the lock_ref() guard keeps it alive while we're using the pointer.
+        unsafe { &*ptr }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::task::Context;
+    type TunnelProtocol<SLINKS> = Arc<dyn ProcMachine<IO = TunnelIO<SLINKS>>>;
+
+    /// A [`ServerLinks`] implementation backed by [`IoExchange`] channels.
+    ///
+    /// This is the default used by [`create_tunnel_protocol`] and the listener.
+    /// External code writes incoming WebSocket messages into `down_in` and reads
+    /// outgoing WebSocket messages from `up_out`.
+    #[derive(Debug)]
+    pub(crate) struct ExchangeServerLinks {
+        /// WebSocket messages coming in (external → download task).
+        pub down_in: IoExchange<Message>,
+        /// WebSocket messages going out (upload task → external).
+        pub up_out: IoExchange<Message>,
+    }
+
+    impl ExchangeServerLinks {
+        pub fn new() -> Self {
+            Self {
+                down_in: IoExchange::new(),
+                up_out: IoExchange::new(),
+            }
+        }
+    }
+
+    impl ServerLinks for ExchangeServerLinks {
+        fn sink(&self) -> &(impl IoSink<Message> + ?Sized) {
+            &self.up_out
+        }
+        fn stream(&self) -> &(impl IoStream<Item = Message> + ?Sized) {
+            &self.down_in
+        }
+    }
+
     use super::*;
     use coarsetime::Instant;
     use futures::task::noop_waker_ref;
-    use procmachines::{IoSink, IoStream, ProcMachineHolder};
+    use procmachines::{IoBytesExchange, IoExchange, IoSink, IoStream, RefLockable};
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -924,19 +891,35 @@ mod tests {
     /// The exchanges connected to a protocol for the duration of a test.
     struct TestRig {
         proto: TunnelProtocol<ExchangeServerLinks>,
-        up_in: Arc<IoBytesExchange>,
-        down_out: Arc<IoBytesExchange>,
+        up_in: Arc<Mutex<IoBytesExchange>>,
+        down_out: Arc<Mutex<IoBytesExchange>>,
     }
 
     /// Creates a protocol and connects exchanges for `up_in` and `down_out`.
+    ///
+    /// Builds the protocol as a concrete [`ProcMachine`] (rather than going
+    /// through [`create_tunnel_protocol`], which returns an opaque
+    /// [`TunnelConnection`]) so the tests can `lock_ref()` to inspect the
+    /// internal [`TunnelIO`] channels.
     fn make_proto() -> TestRig {
-        let proto = create_tunnel_protocol(Instant::now(), ExchangeServerLinks::new());
-        let up_in = Arc::new(IoBytesExchange::new());
-        let down_out = Arc::new(IoBytesExchange::new());
+        let client_info = TunnelClientInfo {
+            connection_id: "test_client".into(),
+            ip_addr: None,
+        };
+        let proto: TunnelProtocol<ExchangeServerLinks> = PROC_MACHINE_BUILDER
+            .with(TunnelIO::<ExchangeServerLinks>::up_connected)
+            .with(TunnelIO::<ExchangeServerLinks>::down_connected)
+            .build_std(TunnelIO::new(
+                Instant::now(),
+                ExchangeServerLinks::new(),
+                client_info,
+            ));
+        let up_in = Arc::new(Mutex::new(IoBytesExchange::new()));
+        let down_out = Arc::new(Mutex::new(IoBytesExchange::new()));
         {
-            let mut guard = proto.lock();
-            guard.up_in.connect(up_in.clone());
-            guard.down_out.connect(down_out.clone());
+            let mut guard = proto.lock_ref();
+            guard.up_in.connect(up_in.clone()).unwrap();
+            guard.down_out.connect(down_out.clone()).unwrap();
         }
         TestRig {
             proto,
@@ -954,20 +937,22 @@ mod tests {
 
     /// Writes Bytes into an IoBytesExchange (writer side). Returns true if the
     /// full payload was accepted.
-    fn bytes_send(exch: &IoBytesExchange, item: Bytes) -> bool {
+    fn bytes_send<T: RefLockable<Target = IoBytesExchange>>(exch: &T, item: Bytes) -> bool {
         let mut cx = Context::from_waker(noop_waker_ref());
         let mut data = item;
         let was_len = data.len();
-        match IoWriter::prod_poll_write(exch, &mut cx, &mut data) {
+        let guard = exch.lock_ref();
+        match guard.prod_poll_write(&mut cx, &mut data) {
             Poll::Ready(Ok(n)) => n == was_len && data.is_empty(),
             _ => false,
         }
     }
 
     /// Reads a chunk of Bytes from an IoBytesExchange (reader side).
-    fn bytes_read(exch: &IoBytesExchange) -> Poll<Option<Bytes>> {
+    fn bytes_read<T: RefLockable<Target = IoBytesExchange>>(exch: &T) -> Poll<Option<Bytes>> {
         let mut cx = Context::from_waker(noop_waker_ref());
-        match IoReader::con_poll_read(exch, &mut cx, usize::MAX) {
+        let guard = exch.lock_ref();
+        match guard.con_poll_read(&mut cx, usize::MAX) {
             Poll::Ready(Ok(opt)) => Poll::Ready(opt),
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(_)) => unreachable!(),
@@ -975,14 +960,16 @@ mod tests {
     }
 
     /// Initiates close on the writer side of an IoBytesExchange.
-    fn bytes_close(exch: &IoBytesExchange) -> Poll<Result<(), IoError>> {
+    fn bytes_close<T: RefLockable<Target = IoBytesExchange>>(
+        exch: &T,
+    ) -> Poll<Result<(), IoError>> {
         let mut cx = Context::from_waker(noop_waker_ref());
-        IoWriter::prod_poll_close(exch, &mut cx)
+        exch.lock_ref().prod_poll_close(&mut cx)
     }
 
     /// Drives the protocol by locking/unlocking (which triggers a tick).
     fn tick(proto: &TunnelProtocol<ExchangeServerLinks>) {
-        let _guard = proto.lock();
+        let _guard = proto.lock_ref();
         // guard drop triggers tick
     }
 
@@ -992,12 +979,12 @@ mod tests {
         proto: &TunnelProtocol<ExchangeServerLinks>,
         get_exchange: impl Fn(&TunnelIO<ExchangeServerLinks>) -> &IoExchange<Message>,
         max_ticks: usize,
-    ) -> Poll<Result<Option<Message>,IoError>> {
+    ) -> Poll<Result<Option<Message>, IoError>> {
         for _ in 0..max_ticks {
-            let guard = proto.lock();
+            let guard = proto.lock_ref();
             let result = {
                 let mut cx = Context::from_waker(noop_waker_ref());
-                get_exchange(&*guard).con_poll_read(&mut cx)
+                get_exchange(&guard).con_poll_read(&mut cx)
             };
             if result.is_ready() {
                 return result;
@@ -1009,13 +996,13 @@ mod tests {
 
     /// Repeatedly ticks the protocol and tries to read bytes from the given
     /// `IoBytesExchange` until we get a Ready result or exhaust attempts.
-    fn read_bytes_with_ticks(
+    fn read_bytes_with_ticks<T: RefLockable<Target = IoBytesExchange>>(
         proto: &TunnelProtocol<ExchangeServerLinks>,
-        exch: &IoBytesExchange,
+        exch: &T,
         max_ticks: usize,
     ) -> Poll<Option<Bytes>> {
         for _ in 0..max_ticks {
-            let _guard = proto.lock();
+            let _guard = proto.lock_ref();
             let result = bytes_read(exch);
             if result.is_ready() {
                 return result;
@@ -1115,7 +1102,7 @@ mod tests {
 
         // Write a WS message into down_in
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::from("world"))
@@ -1139,7 +1126,7 @@ mod tests {
 
         for payload in &payloads {
             {
-                let guard = rig.proto.lock();
+                let guard = rig.proto.lock_ref();
                 assert!(exchange_send(
                     &guard.server_links.down_in,
                     Message::Binary(Bytes::from(*payload))
@@ -1162,7 +1149,7 @@ mod tests {
 
         // Send EOF (empty Binary)
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::new())
@@ -1184,7 +1171,7 @@ mod tests {
 
         // Send a DROP message
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Text("DROP:connection_limit".into())
@@ -1206,7 +1193,7 @@ mod tests {
 
         // Send data
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::from("payload"))
@@ -1218,7 +1205,7 @@ mod tests {
 
         // Send EOF
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::new())
@@ -1235,7 +1222,7 @@ mod tests {
 
         // Send a WebSocket Close frame
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Close(None)
@@ -1257,7 +1244,7 @@ mod tests {
 
         // Send a CONNECT message (shouldn't happen post-handshake)
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Text("CONNECT:some_id".into())
@@ -1279,7 +1266,7 @@ mod tests {
 
         // Send a Ping (should be ignored by protocol)
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Ping(vec![1, 2, 3].into())
@@ -1288,7 +1275,7 @@ mod tests {
 
         // Then send actual data
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::from("after_ping"))
@@ -1308,7 +1295,7 @@ mod tests {
         let rig = make_proto();
 
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Pong(vec![].into())
@@ -1316,7 +1303,7 @@ mod tests {
         }
 
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::from("after_pong"))
@@ -1336,7 +1323,7 @@ mod tests {
 
         // Send unrecognized text (should be ignored)
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Text("UNKNOWN_COMMAND".into())
@@ -1345,7 +1332,7 @@ mod tests {
 
         // Then send actual data
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::from("real_data"))
@@ -1378,7 +1365,7 @@ mod tests {
 
         // Download: WS → app
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::from("down_data"))
@@ -1399,7 +1386,7 @@ mod tests {
 
         // Complete the download by sending EOF
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::new())
@@ -1420,7 +1407,9 @@ mod tests {
         for _ in 0..20 {
             let msg = read_message_with_ticks(&rig.proto, |io| &io.server_links.up_out, 3);
             match msg {
-                Poll::Ready(Ok(Some(Message::Text(ref t)))) if AsRef::<str>::as_ref(t) == "RDSD" => {
+                Poll::Ready(Ok(Some(Message::Text(ref t))))
+                    if AsRef::<str>::as_ref(t) == "RDSD" =>
+                {
                     saw_rdsd = true;
                 }
                 Poll::Ready(Ok(Some(Message::Binary(ref b)))) if !b.is_empty() => {
@@ -1444,7 +1433,7 @@ mod tests {
         // and feeding it some input data so it tries to write.
         // The upload task will see prod_poll_send return Err and abort.
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             guard.server_links.up_out.drop_read();
         }
         assert!(bytes_send(&rig.up_in, Bytes::from("trigger")));
@@ -1456,7 +1445,7 @@ mod tests {
 
         // Send data to down_in. This should fail because the download process is done
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(!exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::from("may_pass_through"))
@@ -1488,7 +1477,7 @@ mod tests {
 
         // Make the download task fail by sending a Close frame
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Close(None)
@@ -1529,7 +1518,7 @@ mod tests {
 
         // Send download EOF
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Binary(Bytes::new())
@@ -1542,7 +1531,7 @@ mod tests {
         }
 
         // Check the coordination state via the public accessor
-        let guard = rig.proto.lock();
+        let guard = rig.proto.lock_ref();
         assert_eq!(guard.down_status.get(), DownloadStatus::Done);
     }
 
@@ -1552,7 +1541,7 @@ mod tests {
 
         // Trigger download abort via Close frame
         {
-            let guard = rig.proto.lock();
+            let guard = rig.proto.lock_ref();
             assert!(exchange_send(
                 &guard.server_links.down_in,
                 Message::Close(None)
@@ -1563,7 +1552,7 @@ mod tests {
             tick(&rig.proto);
         }
 
-        let guard = rig.proto.lock();
+        let guard = rig.proto.lock_ref();
         assert_eq!(guard.down_status.get(), DownloadStatus::Failed);
     }
 
@@ -1574,25 +1563,37 @@ mod tests {
     #[test]
     fn tunnel_io_now_returns_initial_time() {
         let now = Instant::now();
-        let io = TunnelIO::new(now, ExchangeServerLinks::new());
+        let client_info = TunnelClientInfo {
+            connection_id: "test_client".into(),
+            ip_addr: None,
+        };
+        let io = TunnelIO::new(now, ExchangeServerLinks::new(), client_info);
         assert_eq!(io.now(), now);
     }
 
     #[test]
     fn tunnel_io_update_clock_advances() {
         let now = Instant::now();
-        let io = TunnelIO::new(now, ExchangeServerLinks::new());
+        let client_info = TunnelClientInfo {
+            connection_id: "test_client".into(),
+            ip_addr: None,
+        };
+        let io = TunnelIO::new(now, ExchangeServerLinks::new(), client_info);
         let later = now + Duration::from_secs(10);
-        io.update_clock(later);
+        io.clock.advance(later);
         assert_eq!(io.now(), later);
     }
 
     #[test]
     fn tunnel_io_update_clock_does_not_go_backwards() {
         let now = Instant::now();
-        let io = TunnelIO::new(now, ExchangeServerLinks::new());
+        let client_info = TunnelClientInfo {
+            connection_id: "test_client".into(),
+            ip_addr: None,
+        };
+        let io = TunnelIO::new(now, ExchangeServerLinks::new(), client_info);
         let earlier = Instant::now(); // same or earlier
-        io.update_clock(earlier);
+        io.clock.advance(earlier);
         // advance() only goes forward, so the clock should still be `now`
         // (or possibly `earlier` if it's actually later due to timing)
         // The key invariant: it never goes backward from `now`
@@ -1612,6 +1613,6 @@ mod tests {
     fn protocol_is_not_immediately_done() {
         let rig = make_proto();
         // Both tasks should be alive initially
-        assert!(!rig.proto.get_pin().is_done());
+        assert!(!rig.proto.is_done());
     }
 }

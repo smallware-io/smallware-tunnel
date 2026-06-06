@@ -189,25 +189,26 @@ async fn run_selected_test(test: Test, domain: &str, trust_ca: Option<&PathBuf>)
 async fn run_tunnel_loop(listener: TunnelListener, local_addr: SocketAddr) {
     loop {
         match listener.accept().await {
-            Ok((sink, stream, client_info)) => {
+            Ok(conn) => {
+                let connection_id = conn.client_info().connection_id.clone();
                 tokio::spawn(
                     async move {
-                        match forward_tunnel_tcp(sink, stream, local_addr).await {
-                            Ok(stats) => {
-                                debug!(
-                                    downloaded = stats.bytes_downloaded,
-                                    uploaded = stats.bytes_uploaded,
-                                    "Tunnel connection completed"
-                                );
-                            }
+                        match forward_tunnel_tcp(conn.clone(), local_addr).await {
+                            Ok(_) => {}
                             Err(e) => {
                                 warn!(error = %e, "Tunnel forward error");
                             }
-                        }
+                        };
+                        let stats = conn.join().await;
+                        debug!(
+                            downloaded = stats.bytes_downloaded,
+                            uploaded = stats.bytes_uploaded,
+                            "Tunnel connection completed"
+                        );
                     }
                     .instrument(tracing::info_span!(
                         "proxy",
-                        connid = %client_info.connection_id
+                        connid = %connection_id
                     )),
                 );
             }

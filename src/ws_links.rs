@@ -182,18 +182,15 @@ impl IoStream for WsServerLinks {
         };
         match result {
             Poll::Ready(Some(Ok(msg))) => {
-                match &msg {
-                    Message::Binary(bytes) => {
-                        let len = bytes.len();
-                        if len == 0 {
-                            tracing::debug!("WS DOWN EOS");
-                        } else {
-                            self.stat_counter
-                                .stat_count(STAT_COUNT_BYTES_DOWN, len as i32);
-                            tracing::debug!("WS DOWN {}", len);
-                        }
+                if let Message::Binary(bytes) = &msg {
+                    let len = bytes.len();
+                    if len == 0 {
+                        tracing::debug!("WS DOWN EOS");
+                    } else {
+                        self.stat_counter
+                            .stat_count(STAT_COUNT_BYTES_DOWN, len as i32);
+                        tracing::debug!("WS DOWN {}", len);
                     }
-                    _ => {}
                 }
                 Poll::Ready(Ok(Some(msg)))
             }

@@ -98,7 +98,7 @@ impl<T: Clone> WatchNodeValue<T> {
             WatchNodeValue::Node { waker, .. } => match &mut *waker.get() {
                 None => *waker.get() = Some(new_waker.clone()),
                 Some(old_waker) => {
-                    if !new_waker.will_wake(&old_waker) {
+                    if !new_waker.will_wake(old_waker) {
                         *waker.get() = Some(new_waker.clone());
                     }
                 }
@@ -212,7 +212,7 @@ pub struct ValueWatch<'a, T: Clone> {
 impl<'a, T: Clone> ValueWatch<'a, T> {
     /// Creates a new watch against the given pinned watchable value.
     pub fn new(value: Pin<&'a WatchableValue<T>>) -> Self {
-        let head_ref = unsafe { &*Pin::into_inner_unchecked(value) };
+        let head_ref = unsafe { Pin::into_inner_unchecked(value) };
         Self {
             node: IntrusiveListNode::new(WatchNodeValue::new_node(
                 &head_ref.head as *const IntrusiveListNode<WatchNodeValue<T>>,

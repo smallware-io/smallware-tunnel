@@ -129,8 +129,8 @@ impl JwtManager {
     /// # Arguments
     /// * `combined_key` - The combined access key string.
     /// # Returns
-    /// * `Result<Self, ()>` - Ok with JwtManager if parsing is successful, Err if the key is malformed.
-    pub fn from_access_key(combined_key: &str) -> Result<Self, ()> {
+    /// * `Result<Self, TunnelError>` - Ok with JwtManager if parsing is successful, Err if the key is malformed.
+    pub fn from_access_key(combined_key: &str) -> Result<Self, TunnelError> {
         let (customer_id, key_id, secret) = parse_access_key(combined_key)?;
         Ok(Self::new(
             customer_id.as_str(),
@@ -229,11 +229,11 @@ impl Clone for JwtManager {
 
 /// Parse an access key in the format `<customer_id>.<key_id>.<secret>` form into its components.
 /// Whitespace within the key is removed
-pub fn parse_access_key(combined_key: &str) -> Result<(String, String, String), ()> {
+pub fn parse_access_key(combined_key: &str) -> Result<(String, String, String), TunnelError> {
     let div1 = combined_key.find('.').unwrap_or(0);
     let div2 = combined_key.rfind('.').unwrap_or(0);
     if div1 == 0 || div2 == 0 || div1 >= div2 {
-        return Err(());
+        return Err(TunnelError::InvalidKeyFormat);
     }
     let mut customer_id = combined_key[..div1].to_string();
     customer_id.retain(|c| !c.is_whitespace());
@@ -242,7 +242,7 @@ pub fn parse_access_key(combined_key: &str) -> Result<(String, String, String), 
     let mut secret = combined_key[div2 + 1..].to_string();
     secret.retain(|c| !c.is_whitespace());
 
-    return Ok((customer_id, key_id, secret));
+    Ok((customer_id, key_id, secret))
 }
 
 /// Extracts the customer ID from a tunnel domain.

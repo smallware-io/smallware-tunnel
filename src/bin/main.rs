@@ -146,24 +146,26 @@ async fn main() -> Result<()> {
     // Accept and handle connections
     loop {
         match listener.accept().await {
-            Ok((sink, stream, client_info)) => {
+            Ok(conn) => {
+                let connection_id = conn.client_info().connection_id.clone();
                 // Spawn a task to handle this connection
                 tokio::spawn(
                     async move {
-                        match forward_tunnel_tcp(sink, stream, local_addr).await {
-                            Ok(stats) => {
-                                info!(
-                                    downloaded = stats.bytes_downloaded,
-                                    uploaded = stats.bytes_uploaded,
-                                    "Connection completed"
-                                );
-                            }
+                        match forward_tunnel_tcp(conn.clone(), local_addr).await {
+                            Ok(_) => {}
                             Err(e) => {
                                 warn!(error = %e, "Connection handler error");
+                                return;
                             }
-                        }
+                        };
+                        let stats = conn.join().await;
+                        info!(
+                            downloaded = stats.bytes_downloaded,
+                            uploaded = stats.bytes_uploaded,
+                            "Connection completed"
+                        );
                     }
-                    .instrument(tracing::info_span!("proxy", connid=%client_info.connection_id)),
+                    .instrument(tracing::info_span!("proxy", connid=%connection_id)),
                 );
             }
             Err(TunnelError::ListenerClosed) => {

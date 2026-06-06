@@ -184,7 +184,7 @@ impl From<tokio_tungstenite::tungstenite::Error> for TunnelError {
                 if code == 402 {
                     return TunnelError::NoCredits;
                 }
-                if code >= 400 && code < 500 && code != 429 {
+                if (400..500).contains(&code) && code != 429 {
                     return TunnelError::BadRequest(err.to_string().into());
                 }
                 TunnelError::ServerError {

@@ -2,10 +2,10 @@ use std::sync::{Arc, LazyLock};
 
 use derivative::Derivative;
 
-pub const STAT_COUNT_ACCEPTS_WAITING: &'static str = "acc_waiting";
-pub const STAT_COUNT_CONNECTIONS: &'static str = "connections";
-pub const STAT_COUNT_BYTES_UP: &'static str = "up_bytes";
-pub const STAT_COUNT_BYTES_DOWN: &'static str = "down_bytes";
+pub const STAT_COUNT_ACCEPTS_WAITING: &str = "acc_waiting";
+pub const STAT_COUNT_CONNECTIONS: &str = "connections";
+pub const STAT_COUNT_BYTES_UP: &str = "up_bytes";
+pub const STAT_COUNT_BYTES_DOWN: &str = "down_bytes";
 
 pub trait StatCounter: Send + Sync {
     fn stat_count(&self, stat: &'static str, delta: i32);

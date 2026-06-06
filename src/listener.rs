@@ -28,7 +28,7 @@ use crate::error::TunnelError;
 use crate::jwt::{extract_customer_id, JwtManager};
 use crate::trace_id::{next_trace_id, TraceId};
 use crate::tunnel_protocol::{
-    create_tunnel_protocol, DownloadStatus, TunnelProtocol, TunnelSink, TunnelStream, UploadStatus,
+    create_tunnel_protocol, TunnelClientInfo, TunnelConnection, TunnelConnectionImpl,
 };
 use crate::ws_links::{WsBaseStream, WsRawSink, WsServerLinks};
 use crate::{
@@ -37,9 +37,7 @@ use crate::{
 use bytes::Bytes;
 use derivative::Derivative;
 use futures::{SinkExt, StreamExt};
-use procmachines::ProcMachineHolder;
 use std::future::poll_fn;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -120,8 +118,8 @@ impl TunnelConfig {
         let shard = domain.as_str().split('.').nth(1).unwrap_or("x");
         let server_url = format!("wss://api.{shard}.smallware.io/tunnels");
         Self {
-            domain: domain,
-            server_url: server_url,
+            domain,
+            server_url,
             trust_ca: None,
         }
     }
@@ -168,14 +166,6 @@ struct RecycledConnection {
 #[derive(Clone, Debug)]
 pub struct TunnelListener {
     shared: Arc<ListenerShared>,
-}
-
-/// Information about a remote connected client
-#[non_exhaustive]
-#[derive(Clone, Debug)]
-pub struct TunnelClientInfo {
-    pub ip_addr: Option<IpAddr>,
-    pub connection_id: TraceId,
 }
 
 #[derive(Derivative)]
@@ -331,9 +321,7 @@ impl TunnelListener {
     /// - [`TunnelError::ConnectionFailed`] if the WebSocket connection fails
     /// - [`TunnelError::ConnectionClosed`] if the server closes the connection
     /// - [`TunnelError::WebSocketError`] for other WebSocket-level errors
-    pub async fn accept(
-        &self,
-    ) -> Result<(TunnelSink, TunnelStream, TunnelClientInfo), TunnelError> {
+    pub async fn accept(&self) -> Result<Arc<dyn TunnelConnection>, TunnelError> {
         let trace_id = next_trace_id();
         let shared = self.shared.clone();
         let mut waiting_stat: Option<ScopeStat> = None;
@@ -424,13 +412,13 @@ impl TunnelListener {
                     // Only one caller waits for CONNECT at a time until we succeed.
                     tracing::info!("Waiting for connect (blocking)");
                     match self.wait_for_connection(ws_tx, ws_rx).await {
-                        Ok((sink, stream, client_info)) => {
+                        Ok(conn) => {
                             // Success! Server is healthy. Allow concurrent attempts again.
                             shared
                                 .last_success
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             retry_state.next_start_millis = now_millis;
-                            return Ok((sink, stream, client_info));
+                            return Ok(conn);
                         }
                         Err(e) => {
                             shared
@@ -451,8 +439,8 @@ impl TunnelListener {
                 drop(retry_state);
                 tracing::info!("Waiting for connect (parallel)");
                 match self.wait_for_connection(ws_tx, ws_rx).await {
-                    Ok((sink, stream, client_info)) => {
-                        return Ok((sink, stream, client_info));
+                    Ok(conn) => {
+                        return Ok(conn);
                     }
                     Err(e) => {
                         // Failed while in concurrent mode. Mark as failed so the next
@@ -540,7 +528,7 @@ impl TunnelListener {
         &self,
         mut ws_tx: WsRawSink,
         mut ws_rx: WsBaseStream,
-    ) -> Result<(TunnelSink, TunnelStream, TunnelClientInfo), TunnelError> {
+    ) -> Result<Arc<dyn TunnelConnection>, TunnelError> {
         let mut client_ip: Option<std::net::IpAddr> = None;
         let mut conn_id: Option<TraceId> = None;
         let shared = self.shared.clone();
@@ -605,21 +593,23 @@ impl TunnelListener {
         let conn_id = conn_id.unwrap_or_else(|| "?".into());
 
         // Create the sans-io protocol state machine with direct WebSocket access
-        let protocol = create_tunnel_protocol(
+        let client_info = TunnelClientInfo {
+            connection_id: conn_id.clone(),
+            ip_addr: client_ip,
+        };
+
+        let connection = create_tunnel_protocol(
             coarsetime::Instant::now(),
             WsServerLinks::new(ws_tx, ws_rx, self.shared.stat_counter.clone()),
+            client_info,
         );
-
-        // Create sink and stream that interface with the protocol
-        let sink = TunnelSink::new(protocol.clone());
-        let stream = TunnelStream::new(protocol.clone());
 
         // Spawn the bridge task that drives the protocol
         let recycle_tx = shared.recycle_tx.clone();
         let shutdown_rx = shared.shutdown_rx.clone();
         tokio::spawn(
             Self::protocol_bridge_task(
-                protocol,
+                connection.clone(),
                 self.shared.stat_counter.clone(),
                 recycle_tx,
                 shutdown_rx,
@@ -627,14 +617,7 @@ impl TunnelListener {
             .instrument(tracing::info_span!("connection", conn = %conn_id)),
         );
 
-        Ok((
-            sink,
-            stream,
-            TunnelClientInfo {
-                connection_id: conn_id,
-                ip_addr: client_ip,
-            },
-        ))
+        Ok(connection.as_arc_connection())
     }
 
     /// Background task that drives the tunnel protocol.
@@ -646,7 +629,7 @@ impl TunnelListener {
     ///    wakes from the WebSocket's async runtime
     /// 3. When the protocol completes, offer the connection for recycling
     async fn protocol_bridge_task(
-        protocol: TunnelProtocol<WsServerLinks>,
+        protocol: Arc<dyn TunnelConnectionImpl<WsServerLinks>>,
         stat_counter: Arc<dyn StatCounter>,
         recycle_tx: flume::Sender<RecycledConnection>,
         shutdown_rx: watch::Receiver<bool>,
@@ -658,19 +641,9 @@ impl TunnelListener {
 
         // TODO signal shutdown
         poll_fn(|cx| {
-            // Process external wakes (ticks the protocol internally)
-            let _ = protocol.get_pin().poll_external(cx);
-
-            // Advance clock
-            {
-                let g = protocol.lock();
-                g.clock.advance(coarsetime::Instant::now());
-            }
-            // Check if all protocol tasks have completed
-            if protocol.get_pin().is_done() {
+            if protocol.poll(cx).is_ready() {
                 return Poll::Ready(());
             }
-
             // Periodic wakeup to advance the clock for timeout detection
             let _ = ticker.poll_tick(cx);
 
@@ -680,20 +653,14 @@ impl TunnelListener {
 
         // Check whether the protocol completed cleanly (both directions done,
         // not failed) — only then can we recycle the WebSocket.
-        let can_recycle = {
-            let g = protocol.lock();
-            g.up_status.get() == UploadStatus::Done && g.down_status.get() == DownloadStatus::Done
-        };
+        let can_recycle = protocol.can_recycle();
 
         if !can_recycle {
             return;
         }
 
         // Extract the WebSocket halves from the protocol for recycling
-        let (ws_tx, ws_rx) = {
-            let g = protocol.lock();
-            g.server_links.take()
-        };
+        let (ws_tx, ws_rx) = { protocol.get_io().server_links.take() };
 
         if let (Some(ws_tx), Some(ws_rx)) = (ws_tx, ws_rx) {
             // Offer the recycled connection (with 5-second timeout)

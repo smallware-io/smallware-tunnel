@@ -36,7 +36,7 @@ http = "1.1"
 jsonwebtoken = "9.3"
 parking_lot = "0.12.5"
 pin-project-lite = "0.2"
-procmachines = { git = "https://github.com/smallware-io/procmachines" }
+procmachines = "^1.0.0"
 rustls = {version = "0.23", features=["ring"]}
 rustls-pemfile = "2"
 serde = { version = "1.0", features = ["derive"] }

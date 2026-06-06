@@ -29,10 +29,10 @@ static NEXT_INC: AtomicU64 = AtomicU64::new(1);
 /// Generates the next unique request ID.
 pub(crate) fn next_trace_id() -> TraceId {
     let mut inc = NEXT_INC.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    while inc < ((1 as u64) << 63) {
+    while inc < (1_u64 << 63) {
         let mut ts = Utc::now().timestamp_millis() as u64;
         ts = ts.wrapping_mul(0x3ab287cefcf83) % 0x00ff_ffff_ffff_ffff;
-        ts |= (1 as u64) << 63;
+        ts |= 1_u64 << 63;
         let _ = NEXT_INC.compare_exchange(
             inc + 1,
             ts,

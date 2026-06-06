@@ -8,65 +8,125 @@
 //! - [`forward_tunnel`]: Forward tunnel traffic to any `AsyncRead + AsyncWrite` stream
 //! - [`forward_tunnel_tcp`]: Convenience function to forward to a TCP socket address
 
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use bytes::{Bytes, BytesMut};
+use parking_lot::Mutex;
+use procmachines::{
+    CyclicBufProvider, IoError, IoReader, IoWriter, ReaderIoReader, WriterIoWriter,
+};
 use std::net::SocketAddr;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::{TunnelError, TunnelSink, TunnelStream};
+use crate::tunnel_protocol::TunnelConnection;
+use crate::{connect_to_error, TunnelError};
 
-/// Statistics from a completed tunnel forwarding session.
-#[derive(Debug, Clone, Copy)]
-pub struct ForwardStats {
-    /// Bytes received from the tunnel and sent to the local service
-    pub bytes_downloaded: u64,
-    /// Bytes received from the local service and sent to the tunnel
-    pub bytes_uploaded: u64,
+type StandardBufProvider = CyclicBufProvider<2, fn() -> BytesMut>;
+
+pub struct TunnelIoTermination<W, R>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    writer: WriterIoWriter<W>,
+    reader: ReaderIoReader<R, StandardBufProvider>,
+}
+
+impl<W, R> TunnelIoTermination<W, R>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    pub fn new(writer: W, reader: R) -> Self {
+        let buf_provider = StandardBufProvider::new(|| BytesMut::with_capacity(32768));
+        Self {
+            writer: WriterIoWriter::new(writer),
+            reader: ReaderIoReader::new(reader, buf_provider),
+        }
+    }
+}
+
+impl<W, R> IoReader for TunnelIoTermination<W, R>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    type Error = IoError;
+
+    #[inline(always)]
+    fn con_poll_read(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        max_len: usize,
+    ) -> std::task::Poll<Result<Option<Bytes>, Self::Error>> {
+        self.reader.con_poll_read(cx, max_len)
+    }
+
+    #[inline(always)]
+    fn drop_read(&self) {
+        self.reader.drop_read();
+    }
+}
+
+impl<W, R> IoWriter for TunnelIoTermination<W, R>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    type Error = IoError;
+
+    #[inline(always)]
+    fn prod_poll_write(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bytes: &mut Bytes,
+    ) -> std::task::Poll<Result<usize, Self::Error>> {
+        self.writer.prod_poll_write(cx, bytes)
+    }
+
+    #[inline(always)]
+    fn prod_poll_flush(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.writer.prod_poll_flush(cx)
+    }
+
+    #[inline(always)]
+    fn prod_poll_close(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.writer.prod_poll_close(cx)
+    }
 }
 
 /// Forwards tunnel traffic to a local TCP socket address.
 ///
 /// This is a convenience function that connects to the given address and then
-/// calls [`forward_tunnel`] to handle the bidirectional data transfer.
+/// calls [`forward_tunnel`] to tunnel a connection to it.
 ///
 /// # Arguments
 ///
-/// * `sink` - The tunnel sink for sending data to the remote client
-/// * `stream` - The tunnel stream for receiving data from the remote client
+/// * `conn` - The tunnel connection for sending data to the remote client
 /// * `addr` - The local socket address to forward traffic to
 ///
 /// # Returns
 ///
 /// Returns statistics about the forwarding session, or an error if the
 /// connection to the local address failed.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use smallware_tunnel::{TunnelSink, TunnelStream, forward_tunnel_tcp};
-/// use std::net::SocketAddr;
-///
-/// async fn handle(sink: TunnelSink, stream: TunnelStream) {
-///     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-///     match forward_tunnel_tcp(sink, stream, addr).await {
-///         Ok(stats) => println!("Transferred {} down, {} up", stats.bytes_downloaded, stats.bytes_uploaded),
-///         Err(e) => eprintln!("Error: {}", e),
-///     }
-/// }
-/// ```
 pub async fn forward_tunnel_tcp(
-    sink: TunnelSink,
-    stream: TunnelStream,
+    conn: Arc<dyn TunnelConnection>,
     addr: SocketAddr,
-) -> Result<ForwardStats, TunnelError> {
+) -> Result<(), TunnelError> {
     tracing::info!("Forwarding to {}", &addr);
     let local_stream = TcpStream::connect(addr).await.map_err(|e| {
-        TunnelError::IoError(format!("Failed to connect to {}: {}", addr, e).into())
+        let ret = TunnelError::IoError(format!("Failed to connect to {}: {}", addr, e).into());
+        connect_to_error(conn.clone(), e.into());
+        ret
     })?;
-
     let (local_read, local_write) = local_stream.into_split();
-    forward_tunnel(sink, stream, local_write, local_read).await
+    forward_tunnel(conn, local_write, local_read).await
 }
 
 /// Forwards tunnel traffic to any async read/write stream.
@@ -81,119 +141,22 @@ pub async fn forward_tunnel_tcp(
 ///
 /// # Arguments
 ///
-/// * `sink` - The tunnel sink for sending data to the remote client
-/// * `stream` - The tunnel stream for receiving data from the remote client
+/// * `conn` - The tunnel connection for sending data to the remote client
 /// * `local_read` - The read half of the local connection
 /// * `local_write` - The write half of the local connection
-///
-/// # Returns
-///
-/// Returns statistics about the forwarding session.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use smallware_tunnel::{TunnelSink, TunnelStream, forward_tunnel};
-/// use tokio::net::TcpStream;
-///
-/// async fn handle(sink: TunnelSink, stream: TunnelStream, local: TcpStream) {
-///     let (read, write) = local.into_split();
-///     let stats = forward_tunnel(sink, stream, write, read).await.unwrap();
-///     println!("Downloaded: {}, Uploaded: {}", stats.bytes_downloaded, stats.bytes_uploaded);
-/// }
-/// ```
 pub async fn forward_tunnel<R, W>(
-    sink: TunnelSink,
-    stream: TunnelStream,
+    conn: Arc<dyn TunnelConnection>,
     local_write: W,
     local_read: R,
-) -> Result<ForwardStats, TunnelError>
+) -> Result<(), TunnelError>
 where
     W: AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
 {
-    // Spawn tasks for bidirectional proxy
-    // tunnel -> local (download: data from remote client to local service)
-    let download_handle = tokio::spawn(proxy_tunnel_to_local(stream, local_write));
-
-    // local -> tunnel (upload: data from local service to remote client)
-    let upload_handle = tokio::spawn(proxy_local_to_tunnel(local_read, sink));
-
-    // Wait for both to complete
-    let (download_result, upload_result) = tokio::join!(download_handle, upload_handle);
-
-    let bytes_downloaded = download_result
-        .map_err(|e| TunnelError::IoError(format!("Download task panicked: {}", e).into()))?;
-    let bytes_uploaded = upload_result
-        .map_err(|e| TunnelError::IoError(format!("Upload task panicked: {}", e).into()))?;
-
-    Ok(ForwardStats {
-        bytes_downloaded,
-        bytes_uploaded,
-    })
-}
-
-/// Proxies data from the tunnel to the local service.
-async fn proxy_tunnel_to_local<W>(mut tunnel: TunnelStream, mut local: W) -> u64
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut total_bytes = 0u64;
-
-    while let Some(data) = tunnel.next().await {
-        if data.is_empty() {
-            // EOF from tunnel
-            tracing::debug!("EOF from tunnel");
-            break;
-        }
-        total_bytes += data.len() as u64;
-        if let Err(e) = local.write_all(&data).await {
-            tracing::warn!(error = %e, "Error writing to local service");
-            break;
-        }
-        if let Err(e) = local.flush().await {
-            tracing::warn!(error = %e, "Error flushing to local service");
-            break;
-        }
-    }
-
-    // Shutdown the write half to signal EOF to local service
-    let _ = local.shutdown().await;
-
-    total_bytes
-}
-
-/// Proxies data from the local service to the tunnel.
-async fn proxy_local_to_tunnel<R>(mut local: R, mut tunnel: TunnelSink) -> u64
-where
-    R: AsyncRead + Unpin,
-{
-    let mut total_bytes = 0u64;
-    let mut buf = vec![0u8; 16 * 1024];
-
-    loop {
-        match local.read(&mut buf).await {
-            Ok(0) => {
-                // EOF from local
-                tracing::info!("EOF from local service");
-                break;
-            }
-            Ok(n) => {
-                total_bytes += n as u64;
-                if let Err(e) = tunnel.send(Bytes::copy_from_slice(&buf[..n])).await {
-                    tracing::warn!(error = %e, "Error writing to tunnel");
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Error reading from local service");
-                break;
-            }
-        }
-    }
-
-    // Close the sink to signal EOF
-    let _ = tunnel.close().await;
-
-    total_bytes
+    let termination = Arc::new(Mutex::new(TunnelIoTermination::new(
+        local_write,
+        local_read,
+    )));
+    let t2 = termination.clone();
+    conn.connect_io(termination, t2)
 }
