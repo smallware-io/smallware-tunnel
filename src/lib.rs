@@ -67,5 +67,5 @@ pub use forward::{forward_tunnel, forward_tunnel_tcp};
 pub use jwt::JwtManager;
 pub use listener::{TunnelConfig, TunnelListener};
 pub use stat_counter::*;
-pub use tunnel_protocol::{TunnelClientInfo, TunnelConnectionStats};
+pub use tunnel_protocol::{TunnelClientInfo, TunnelConnection, TunnelConnectionStats};
 pub use ws_links::WsServerLinks;
