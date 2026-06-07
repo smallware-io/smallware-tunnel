@@ -70,7 +70,6 @@
 
 use bytes::Bytes;
 use coarsetime::{Duration, Instant};
-use futures::future::BoxFuture;
 use futures::{future::poll_fn, Future};
 use parking_lot::{Mutex, RawMutex};
 use std::cell::Cell;
@@ -712,15 +711,20 @@ pub trait TunnelConnection: Send + Sync {
         upload: Arc<Mutex<dyn IoReader<Error = IoError> + Send>>,
     ) -> Result<(), TunnelError>;
     fn get_stats(&self) -> TunnelConnectionStats;
-    fn join(self: Arc<Self>) -> BoxFuture<'static, TunnelConnectionStats>;
+    fn join(self: Arc<Self>) -> TunnelConnectionJoin;
 }
 
-pub(crate) trait TunnelConnectionImpl<SLINKS: ServerLinks + Debug + 'static>:
-    TunnelConnection
-{
+pub(crate) trait TunnelConnectionPrivate: TunnelConnection {
     fn as_arc_connection(self: Arc<Self>) -> Arc<dyn TunnelConnection>;
     fn poll(&self, cx: &mut Context<'_>) -> Poll<()>;
     fn can_recycle(&self) -> bool;
+    fn get_up_status(&self) -> &WatchableValue<UploadStatus>;
+    fn get_down_status(&self) -> &WatchableValue<DownloadStatus>;
+}
+
+pub(crate) trait TunnelConnectionImpl<SLINKS: ServerLinks + Debug + 'static>:
+    TunnelConnectionPrivate
+{
     fn get_io(&self) -> &TunnelIO<SLINKS>;
 }
 
@@ -746,35 +750,39 @@ pub(crate) fn create_tunnel_protocol<SLINKS: ServerLinks + Debug + 'static>(
     conn
 }
 
-async fn do_join<SLINKS, F>(
-    pm: Arc<ProcMachineImpl<RawMutex, TunnelIO<SLINKS>, F>>,
-) -> TunnelConnectionStats
-where
-    SLINKS: ServerLinks + Debug + 'static,
-    F: ProcMachineFutures + 'static,
-{
-    let (p_down_stat, p_up_stat) = {
-        let pd: *const WatchableValue<DownloadStatus> = &pm.get_io().down_status;
-        let pu: *const WatchableValue<UploadStatus> = &pm.get_io().up_status;
-        (pd, pu)
-    };
-    let down_status_watch = pin!(ValueWatch::new(unsafe {
-        Pin::new_unchecked(&*p_down_stat)
-    }));
-    let up_status_watch = pin!(ValueWatch::new(unsafe { Pin::new_unchecked(&*p_up_stat) }));
-    poll_fn(|cx| match down_status_watch.poll_ref(cx) {
-        Poll::Ready(DownloadStatus::Done)
-        | Poll::Ready(DownloadStatus::Discarding)
-        | Poll::Ready(DownloadStatus::Failed) => Poll::Ready(()),
-        _ => Poll::Pending,
-    })
-    .await;
-    poll_fn(|cx| match up_status_watch.poll_ref(cx) {
-        Poll::Ready(UploadStatus::Done) | Poll::Ready(UploadStatus::Failed) => Poll::Ready(()),
-        _ => Poll::Pending,
-    })
-    .await;
-    pm.get_io().get_stats()
+pub struct TunnelConnectionJoin {
+    d_watch: ValueWatch<'static, DownloadStatus>,
+    u_watch: ValueWatch<'static, UploadStatus>,
+    // MUST DROP AFTER WATCHES
+    pm: Arc<dyn TunnelConnectionPrivate>,
+    progress: Cell<u32>,
+}
+
+impl Future for TunnelConnectionJoin {
+    type Output = TunnelConnectionStats;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        if this.progress.get() < 1 {
+            let p = unsafe { Pin::new_unchecked(&mut this.d_watch) };
+            match p.poll_ref(cx) {
+                Poll::Ready(DownloadStatus::Done)
+                | Poll::Ready(DownloadStatus::Discarding)
+                | Poll::Ready(DownloadStatus::Failed) => {}
+                _ => return Poll::Pending,
+            }
+            this.progress.set(1);
+        }
+        if this.progress.get() < 2 {
+            let p = unsafe { Pin::new_unchecked(&mut this.u_watch) };
+            match p.poll_ref(cx) {
+                Poll::Pending | Poll::Ready(UploadStatus::Active) => return Poll::Pending,
+                _ => {}
+            }
+            this.progress.set(2);
+        }
+        Poll::Ready(this.pm.get_stats())
+    }
 }
 
 impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static> TunnelConnection
@@ -808,20 +816,35 @@ impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static> Tun
         guard.get_stats()
     }
 
-    fn join(self: Arc<Self>) -> BoxFuture<'static, TunnelConnectionStats> {
-        // SAFETY: All instances of Self are held by an Arc and never moved, so the address of client_info is stable.
+    fn join(self: Arc<Self>) -> TunnelConnectionJoin {
         let a = self.clone();
-        Box::pin(do_join(a))
+        // SAFETY: All instances of Self are held by an Arc and never moved, and
+        // TunnelConnectionJoin will hold the arc longer than the pin
+        let pd = unsafe {
+            let p: *const WatchableValue<DownloadStatus> = self.get_down_status();
+            Pin::new_unchecked(&*p)
+        };
+        // SAFETY: All instances of Self are held by an Arc and never moved, and
+        // TunnelConnectionJoin will hold the arc longer than the pin
+        let pu = unsafe {
+            let p: *const WatchableValue<UploadStatus> = self.get_up_status();
+            Pin::new_unchecked(&*p)
+        };
+        TunnelConnectionJoin {
+            d_watch: ValueWatch::new(pd),
+            u_watch: ValueWatch::new(pu),
+            progress: Cell::new(0),
+            pm: a,
+        }
     }
 }
 
-impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static>
-    TunnelConnectionImpl<SLINKS> for ProcMachineImpl<RawMutex, TunnelIO<SLINKS>, F>
+impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static> TunnelConnectionPrivate
+    for ProcMachineImpl<RawMutex, TunnelIO<SLINKS>, F>
 {
     fn as_arc_connection(self: Arc<Self>) -> Arc<dyn TunnelConnection> {
         self
     }
-
     fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
         {
             let g = self.lock_ref();
@@ -829,12 +852,27 @@ impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static>
         }
         self.external_poll(cx)
     }
-
     fn can_recycle(&self) -> bool {
         let g = self.lock_ref();
         g.up_status.get() == UploadStatus::Done && g.down_status.get() == DownloadStatus::Done
     }
 
+    fn get_up_status(&self) -> &WatchableValue<UploadStatus> {
+        let ptr: *const TunnelIO<SLINKS> = &*self.lock_ref();
+        // SAFETY: All instances in held by Arc
+        unsafe { &(*ptr).up_status }
+    }
+
+    fn get_down_status(&self) -> &WatchableValue<DownloadStatus> {
+        let ptr: *const TunnelIO<SLINKS> = &*self.lock_ref();
+        // SAFETY: All instances in held by Arc
+        unsafe { &(*ptr).down_status }
+    }
+}
+
+impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static>
+    TunnelConnectionImpl<SLINKS> for ProcMachineImpl<RawMutex, TunnelIO<SLINKS>, F>
+{
     fn get_io(&self) -> &TunnelIO<SLINKS> {
         let g = self.lock_ref();
         let ptr: *const TunnelIO<SLINKS> = &*g;
