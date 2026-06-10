@@ -12,7 +12,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use procmachines::{IoError, IoSink, IoStream};
 
 use crate::tunnel_protocol::ServerLinks;
-use crate::{StatCounter, STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP};
+use crate::{STAT_COUNT_BYTES_DOWN, STAT_COUNT_BYTES_UP, StatCounter};
 
 /// The underlying WebSocket sink type (write half after split).
 pub type WsRawSink =

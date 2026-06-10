@@ -6,7 +6,7 @@
 //! The same scenario with a longer wait is exposed as `keep_long`, which
 //! is expected to fall outside the recycle window.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rand::Rng;
 use std::path::PathBuf;
 use std::time::Duration;

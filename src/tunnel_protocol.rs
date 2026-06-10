@@ -70,25 +70,24 @@
 
 use bytes::Bytes;
 use coarsetime::{Duration, Instant};
-use futures::{future::poll_fn, Future};
+use futures::{Future, future::poll_fn};
 use parking_lot::{Mutex, RawMutex};
 use std::cell::Cell;
 use std::fmt::Debug;
 use std::net::IpAddr;
-use std::pin::{pin, Pin};
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Message;
 
 use procmachines::{
     AlarmClock, ClockAlarm, IoError, IoPort, IoReader, IoSink, IoStream, IoWriter,
-    ProcMachineFutures, ProcMachineImpl, RefLockable,
+    ProcMachineFutures, ProcMachineImpl, RefLockable, ValueWatch, WatchableValue,
 };
-use procmachines::{ProcMachine, ProcMachineJobs, TaskEnd, PROC_MACHINE_BUILDER};
+use procmachines::{PROC_MACHINE_BUILDER, ProcMachine, ProcMachineJobs, TaskEnd};
 
 use crate::error::TunnelError;
 use crate::trace_id::TraceId;
-use crate::watchable_value::{ValueWatch, WatchableValue};
 
 // ============================================================================
 // TIMEOUT CONSTANTS
@@ -178,9 +177,9 @@ pub(crate) struct TunnelIO<SLINKS: ServerLinks> {
     pub bytes_downloaded: Cell<u64>,
 
     /// Status of the download process
-    pub down_status: WatchableValue<DownloadStatus>,
+    pub down_status: WatchableValue<RawMutex, DownloadStatus>,
     // Status of the upload process
-    pub up_status: WatchableValue<UploadStatus>,
+    pub up_status: WatchableValue<RawMutex, UploadStatus>,
 }
 
 impl<SLINKS: ServerLinks + Debug> Debug for TunnelIO<SLINKS> {
@@ -229,10 +228,14 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
     pub fn pin_clock<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a AlarmClock<RawMutex, Instant>> {
         unsafe { Pin::new_unchecked(&self.clock) }
     }
-    pub fn pin_up_status<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a WatchableValue<UploadStatus>> {
+    pub fn pin_up_status<'a>(
+        self: &'a Pin<&'a Self>,
+    ) -> Pin<&'a WatchableValue<RawMutex, UploadStatus>> {
         unsafe { Pin::new_unchecked(&self.up_status) }
     }
-    pub fn pin_down_status<'a>(self: &'a Pin<&'a Self>) -> Pin<&'a WatchableValue<DownloadStatus>> {
+    pub fn pin_down_status<'a>(
+        self: &'a Pin<&'a Self>,
+    ) -> Pin<&'a WatchableValue<RawMutex, DownloadStatus>> {
         unsafe { Pin::new_unchecked(&self.down_status) }
     }
 }
@@ -316,7 +319,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                 to_send = None;
                 cx.waker().wake_by_ref();
             }
-            if let Poll::Ready(ds) = down_status_alarm.poll_ref(cx) {
+            if let Poll::Ready(ds) = down_status_alarm.watch_poll(cx) {
                 down_status = ds;
                 cx.waker().wake_by_ref();
             };
@@ -406,6 +409,8 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                     // If data is empty, just skip it
                     // (We can't send empty Binary - that looks like EOF!)
                     if !bin.is_empty() {
+                        io.bytes_uploaded
+                            .set(io.bytes_uploaded.get() + (bin.len() as u64));
                         to_send = Some(Message::Binary(bin));
                     }
                 }
@@ -510,7 +515,7 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
         // Main loop: transfer data from WebSocket to app
         let is_ok = poll_fn(|cx| {
             if read_timeout.is_none() {
-                match up_status_alarm.poll_ref(cx) {
+                match up_status_alarm.watch_poll(cx) {
                     Poll::Ready(UploadStatus::Done) => {
                         tracing::info!(
                             "Down stream starting shutdown timer after up stream finished."
@@ -632,6 +637,8 @@ impl<SLINKS: ServerLinks> TunnelIO<SLINKS> {
                         got_eof = true;
                         tracing::info!("Down stream done: EOF");
                     } else if !down_discarding {
+                        io.bytes_downloaded
+                            .set(io.bytes_downloaded.get() + (bytes.len() as u64));
                         // Actual data to forward to app
                         send_bytes = bytes;
                     }
@@ -718,8 +725,8 @@ pub(crate) trait TunnelConnectionPrivate: TunnelConnection {
     fn as_arc_connection(self: Arc<Self>) -> Arc<dyn TunnelConnection>;
     fn poll(&self, cx: &mut Context<'_>) -> Poll<()>;
     fn can_recycle(&self) -> bool;
-    fn get_up_status(&self) -> &WatchableValue<UploadStatus>;
-    fn get_down_status(&self) -> &WatchableValue<DownloadStatus>;
+    fn get_up_status(&self) -> &WatchableValue<RawMutex, UploadStatus>;
+    fn get_down_status(&self) -> &WatchableValue<RawMutex, DownloadStatus>;
 }
 
 pub(crate) trait TunnelConnectionImpl<SLINKS: ServerLinks + Debug + 'static>:
@@ -751,8 +758,8 @@ pub(crate) fn create_tunnel_protocol<SLINKS: ServerLinks + Debug + 'static>(
 }
 
 pub struct TunnelConnectionJoin {
-    d_watch: ValueWatch<'static, DownloadStatus>,
-    u_watch: ValueWatch<'static, UploadStatus>,
+    d_watch: ValueWatch<'static, RawMutex, DownloadStatus>,
+    u_watch: ValueWatch<'static, RawMutex, UploadStatus>,
     // MUST DROP AFTER WATCHES
     pm: Arc<dyn TunnelConnectionPrivate>,
     progress: Cell<u32>,
@@ -765,7 +772,7 @@ impl Future for TunnelConnectionJoin {
         let this = unsafe { self.get_unchecked_mut() };
         if this.progress.get() < 1 {
             let p = unsafe { Pin::new_unchecked(&mut this.d_watch) };
-            match p.poll_ref(cx) {
+            match p.watch_poll(cx) {
                 Poll::Ready(DownloadStatus::Done)
                 | Poll::Ready(DownloadStatus::Discarding)
                 | Poll::Ready(DownloadStatus::Failed) => {}
@@ -775,7 +782,7 @@ impl Future for TunnelConnectionJoin {
         }
         if this.progress.get() < 2 {
             let p = unsafe { Pin::new_unchecked(&mut this.u_watch) };
-            match p.poll_ref(cx) {
+            match p.watch_poll(cx) {
                 Poll::Pending | Poll::Ready(UploadStatus::Active) => return Poll::Pending,
                 _ => {}
             }
@@ -821,13 +828,13 @@ impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static> Tun
         // SAFETY: All instances of Self are held by an Arc and never moved, and
         // TunnelConnectionJoin will hold the arc longer than the pin
         let pd = unsafe {
-            let p: *const WatchableValue<DownloadStatus> = self.get_down_status();
+            let p: *const WatchableValue<RawMutex, DownloadStatus> = self.get_down_status();
             Pin::new_unchecked(&*p)
         };
         // SAFETY: All instances of Self are held by an Arc and never moved, and
         // TunnelConnectionJoin will hold the arc longer than the pin
         let pu = unsafe {
-            let p: *const WatchableValue<UploadStatus> = self.get_up_status();
+            let p: *const WatchableValue<RawMutex, UploadStatus> = self.get_up_status();
             Pin::new_unchecked(&*p)
         };
         TunnelConnectionJoin {
@@ -857,13 +864,13 @@ impl<SLINKS: ServerLinks + Debug + 'static, F: ProcMachineFutures + 'static> Tun
         g.up_status.get() == UploadStatus::Done && g.down_status.get() == DownloadStatus::Done
     }
 
-    fn get_up_status(&self) -> &WatchableValue<UploadStatus> {
+    fn get_up_status(&self) -> &WatchableValue<RawMutex, UploadStatus> {
         let ptr: *const TunnelIO<SLINKS> = &*self.lock_ref();
         // SAFETY: All instances in held by Arc
         unsafe { &(*ptr).up_status }
     }
 
-    fn get_down_status(&self) -> &WatchableValue<DownloadStatus> {
+    fn get_down_status(&self) -> &WatchableValue<RawMutex, DownloadStatus> {
         let ptr: *const TunnelIO<SLINKS> = &*self.lock_ref();
         // SAFETY: All instances in held by Arc
         unsafe { &(*ptr).down_status }

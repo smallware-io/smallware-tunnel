@@ -25,22 +25,24 @@
 //! to waiting `accept()` calls.
 
 use crate::error::TunnelError;
-use crate::jwt::{extract_customer_id, JwtManager};
-use crate::trace_id::{next_trace_id, TraceId};
+use crate::jwt::{JwtManager, extract_customer_id};
+use crate::trace_id::{TraceId, next_trace_id};
 use crate::tunnel_protocol::{
-    create_tunnel_protocol, TunnelClientInfo, TunnelConnection, TunnelConnectionImpl,
+    TunnelClientInfo, TunnelConnection, TunnelConnectionImpl, create_tunnel_protocol,
 };
 use crate::ws_links::{WsBaseStream, WsRawSink, WsServerLinks};
 use crate::{
-    noop_stat_counter, ScopeStat, StatCounter, STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_CONNECTIONS,
+    STAT_COUNT_ACCEPTS_WAITING, STAT_COUNT_CONNECTIONS, ScopeStat, StatCounter, noop_stat_counter,
 };
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use derivative::Derivative;
 use futures::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use std::future::poll_fn;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -151,6 +153,30 @@ impl TunnelConfig {
     }
 }
 
+/// Information provided in periodic status reports
+///
+/// This struct is marked `#[non_exhaustive]`, meaning new fields may be added
+/// in future versions without a breaking change. Clients should never construct these
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct StatReport {
+    pub query_time: DateTime<Utc>,
+    pub net_credits: i64,
+}
+
+impl Default for StatReport {
+    fn default() -> Self {
+        Self {
+            query_time: Utc::now(),
+            net_credits: 0_i64,
+        }
+    }
+}
+
+pub trait StatReportListener: Send + Sync {
+    fn on_stat_report(&self, report: &StatReport);
+}
+
 /// A recycled connection ready for reuse.
 struct RecycledConnection {
     ws_tx: WsRawSink,
@@ -174,6 +200,8 @@ struct ListenerShared {
     auth: Arc<JwtManager>,
     #[derivative(Debug = "ignore")]
     stat_counter: Arc<dyn StatCounter>,
+    #[derivative(Debug = "ignore")]
+    stat_report_listeners: Mutex<Vec<Arc<dyn StatReportListener>>>,
     config: TunnelConfig,
     /// Rendezvous channel sink to recycle connections
     recycle_tx: flume::Sender<RecycledConnection>,
@@ -251,6 +279,7 @@ impl TunnelListener {
                 Some(x) => x,
                 None => noop_stat_counter(),
             },
+            stat_report_listeners: Mutex::new(Vec::new()),
             config,
             recycle_tx,
             recycle_rx,
@@ -268,6 +297,12 @@ impl TunnelListener {
         Self {
             shared: Arc::new(shared),
         }
+    }
+
+    /// Add a status report listener
+    pub fn add_stat_report_listener(&self, listener: Arc<dyn StatReportListener>) {
+        let mut g = self.shared.stat_report_listeners.lock();
+        g.push(listener);
     }
 
     /// Shuts down the listener.  Existing proxy connections will
@@ -533,6 +568,10 @@ impl TunnelListener {
         let mut conn_id: Option<TraceId> = None;
         let shared = self.shared.clone();
         let mut shutdown_rx = shared.shutdown_rx.clone();
+        let want_stats = {
+            let g = self.shared.stat_report_listeners.lock();
+            !g.is_empty()
+        };
 
         loop {
             tokio::select! {
@@ -542,7 +581,10 @@ impl TunnelListener {
                 // send a ping every minute if we're not already busy sending something else
                 _ = time::sleep(time::Duration::from_secs(60)) => {
                     // send keep-alive
-                    let ping_msg = Message::Ping(Bytes::new());
+                    let ping_msg = match want_stats {
+                        false =>Message::Ping(Bytes::new()),
+                        true => Message::Text("STAT".into())
+                    };
                     ws_tx.send(ping_msg).await.map_err(TunnelError::from)?;
                     tracing::debug!("WAIT PING");
                 },
@@ -562,6 +604,29 @@ impl TunnelListener {
                                 }
                                 break;
                             } else if text_str.starts_with("DROP: ") {
+                            } else if text_str.starts_with("STAT:") {
+                                let g = self.shared.stat_report_listeners.lock();
+                                if !g.is_empty() {
+                                    let json_part = &text_str["STAT: ".len()..];
+                                    let report_result = serde_json::from_str::<serde_json::Value>(json_part).ok()
+                                        .and_then(|parsed| {
+                                            let credits_result = parsed["credits"].as_i64();
+                                            let ts_result=parsed["ts"].as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.to_utc());
+                                            if let Some(credits) = credits_result && let Some(result) = ts_result {
+                                                Some(StatReport {
+                                                    query_time: result,
+                                                    net_credits: credits,
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                    if let Some(report) = report_result {
+                                        for listener in &*g {
+                                            listener.on_stat_report(&report);
+                                        }
+                                    }
+                                }
                             }
                             // Since we haven't got a connect message, any other messages refer to the previous connection on the websocket
                             // Ignore other text messages

@@ -34,10 +34,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use smallware_tunnel::{forward_tunnel_tcp, JwtManager, TunnelConfig, TunnelError, TunnelListener};
+use smallware_tunnel::listener::StatReportListener;
+use smallware_tunnel::{JwtManager, TunnelConfig, TunnelError, TunnelListener, forward_tunnel_tcp};
 use std::path::PathBuf;
 use std::{net::SocketAddr, sync::Arc};
-use tracing::{error, info, warn, Instrument, Level};
+use tracing::{Instrument, Level, error, info, warn};
 
 /// Smallware Tunnel CLI - Expose local services through secure tunnels
 #[derive(Parser, Debug)]
@@ -85,6 +86,16 @@ struct Args {
     /// Shows detailed debug information about connections and data transfer.
     #[arg(short, long)]
     verbose: bool,
+}
+
+struct StatReporter {}
+impl StatReportListener for StatReporter {
+    fn on_stat_report(&self, report: &smallware_tunnel::listener::StatReport) {
+        info!(
+            "STAT: query_time={}, credits={}",
+            report.query_time, report.net_credits
+        );
+    }
 }
 
 #[tokio::main]
@@ -137,6 +148,7 @@ async fn main() -> Result<()> {
 
     // Create the tunnel listener
     let listener = TunnelListener::new(auth, config, None);
+    listener.add_stat_report_listener(Arc::new(StatReporter {}));
 
     info!(
         "Tunnel active! Requests to https://{} will be forwarded to {}",

@@ -52,13 +52,11 @@
 pub mod connect_to_error;
 pub mod error;
 pub mod forward;
-pub(crate) mod intrusive_list;
 pub mod jwt;
 pub mod listener;
 mod stat_counter;
 pub mod trace_id;
 pub mod tunnel_protocol;
-pub mod watchable_value;
 pub mod ws_links;
 
 pub use connect_to_error::connect_to_error;

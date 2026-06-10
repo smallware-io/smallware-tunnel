@@ -25,15 +25,15 @@ mod test_keep_recycle;
 mod test_no_recycle;
 mod test_recycle;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
-use smallware_tunnel::{forward_tunnel_tcp, JwtManager, TunnelConfig, TunnelError, TunnelListener};
+use smallware_tunnel::{JwtManager, TunnelConfig, TunnelError, TunnelListener, forward_tunnel_tcp};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::{debug, error, info, warn, Instrument, Level};
+use tracing::{Instrument, Level, debug, error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "live_test", about = "Live end-to-end test of the tunnel")]

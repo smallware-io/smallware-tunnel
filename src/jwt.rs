@@ -22,7 +22,7 @@
 
 use crate::error::TunnelError;
 use chrono::{Duration, Utc};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
@@ -151,13 +151,13 @@ impl JwtManager {
     /// A valid JWT token string, or an error if token generation fails.
     pub fn get_token(&self) -> Result<String, TunnelError> {
         // Fast path: check if we have a valid cached token
-        if let Ok(cache) = self.cached_token.read() {
-            if let Some(cached) = cache.as_ref() {
-                let now = Utc::now();
-                let remaining = cached.expires_at.signed_duration_since(now);
-                if remaining > Duration::minutes(REFRESH_THRESHOLD_MINUTES) {
-                    return Ok(cached.token.clone());
-                }
+        if let Ok(cache) = self.cached_token.read()
+            && let Some(cached) = cache.as_ref()
+        {
+            let now = Utc::now();
+            let remaining = cached.expires_at.signed_duration_since(now);
+            if remaining > Duration::minutes(REFRESH_THRESHOLD_MINUTES) {
+                return Ok(cached.token.clone());
             }
         }
 

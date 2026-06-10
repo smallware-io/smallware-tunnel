@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 use crate::tunnel_protocol::TunnelConnection;
-use crate::{connect_to_error, TunnelError};
+use crate::{TunnelError, connect_to_error};
 
 type StandardBufProvider = CyclicBufProvider<2, fn() -> BytesMut>;
 

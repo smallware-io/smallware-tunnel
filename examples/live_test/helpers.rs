@@ -2,7 +2,7 @@
 //! HTTPS connect with retry, and a single keep-alive `GET /<len>` exchange
 //! that verifies the response.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
